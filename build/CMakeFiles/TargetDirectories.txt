@@ -1,0 +1,12 @@
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/orthoseg_core.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/orthoseg.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/test_seg.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/test.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/edit_cache.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/rebuild_cache.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/orthoseg_core_autogen_timestamp_deps.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/orthoseg_core_autogen.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/orthoseg_autogen_timestamp_deps.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/orthoseg_autogen.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/test_seg_autogen_timestamp_deps.dir
+/home/suman/agentic_coding/orthoseg/build/CMakeFiles/test_seg_autogen.dir

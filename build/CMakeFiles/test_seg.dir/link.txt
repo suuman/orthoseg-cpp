@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/test_seg.dir/link.d CMakeFiles/test_seg.dir/test_seg_autogen/mocs_compilation.cpp.o CMakeFiles/test_seg.dir/tests/test_seg.cpp.o -o test_seg  liborthoseg_core.a /usr/lib/x86_64-linux-gnu/libopencv_imgcodecs.so.4.10.0 /usr/lib/x86_64-linux-gnu/libopencv_imgproc.so.4.10.0 /usr/lib/x86_64-linux-gnu/libopencv_core.so.4.10.0

@@ -1,0 +1,2 @@
+/usr/bin/ar qc liborthoseg_core.a CMakeFiles/orthoseg_core.dir/orthoseg_core_autogen/mocs_compilation.cpp.o CMakeFiles/orthoseg_core.dir/src/SegmentationEngine.cpp.o
+/usr/bin/ranlib liborthoseg_core.a

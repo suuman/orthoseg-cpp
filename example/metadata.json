@@ -1,0 +1,6 @@
+{
+  "name": "OrthoSeg",
+  "description": "Medical segmentation tool for lower limb X-rays identifying femur, tibia, and fibula with brush, fill, and eraser support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

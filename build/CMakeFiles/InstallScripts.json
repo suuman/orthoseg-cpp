@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/suman/agentic_coding/orthoseg/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,6 @@
+set(__QT_DEPLOY_TARGET_orthoseg_core_FILE /home/suman/agentic_coding/orthoseg/build/liborthoseg_core.a)
+set(__QT_DEPLOY_TARGET_orthoseg_core_TYPE STATIC_LIBRARY)
+set(__QT_DEPLOY_TARGET_orthoseg_FILE /home/suman/agentic_coding/orthoseg/build/orthoseg)
+set(__QT_DEPLOY_TARGET_orthoseg_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_test_seg_FILE /home/suman/agentic_coding/orthoseg/build/test_seg)
+set(__QT_DEPLOY_TARGET_test_seg_TYPE EXECUTABLE)
