@@ -14,11 +14,11 @@ class CanvasWidget : public QWidget {
 public:
     explicit CanvasWidget(Document* doc, QWidget* parent = nullptr);
 
-    void setActiveTool(Tool t)          { tool_ = t; }
+    void setActiveTool(Tool t)          { tool_ = t; update(); }
     void setActiveLabel(Label l)        { label_ = l; }
     void setBrushSize(int s)            { brushSize_ = s; }
     void setMaskOpacity(float o)        { opacity_ = o; update(); }
-    void setFillAlgorithm(FillAlgorithm a) { fillAlgo_ = a; }
+    void setFillAlgorithm(FillAlgorithm a) { fillAlgo_ = a; update(); }
     void setIntensityThreshold(int t)   { intensityThreshold_ = t; }
     void setEdgePenaltyThreshold(int t) { edgePenalty_ = t; }
 

@@ -63,9 +63,10 @@ void randomWalkerFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
 // `foreground` label's scribbles become hard foreground, every other scribble
 // becomes hard background, unseeded pixels are probable background. On return,
 // pixels the cut assigns to foreground get `foreground`; pixels it assigns to
-// background that previously held `foreground` are cleared. Other labels in
-// `mask` are left untouched. Returns false if foreground or background seeds
-// are missing (grabCut needs both). `mask` is modified in place.
+// background that previously held `foreground` are cleared. Other labels at
+// background pixels are retained; foreground pixels overwrite any prior label.
+// Returns false, leaving `mask` unchanged, if foreground is Background, fg/bg
+// seeds are missing, or grabCut fails. `mask` is modified in place on success.
 bool graphCutFromSeeds(const cv::Mat& colorSource, const cv::Mat& seeds,
                        cv::Mat& mask, Label foreground, int iterations = 3);
 

@@ -7,21 +7,29 @@
 namespace orthoseg {
 
 bool Document::loadImage(const std::string& path) {
-    cv::Mat color = cv::imread(path, cv::IMREAD_COLOR);
-    if (color.empty()) return false;
+    try {
+        cv::Mat color = cv::imread(path, cv::IMREAD_COLOR);
+        if (color.empty()) return false;
 
-    sourceColor_ = color;
-    // Plain channel average (R+G+B)/3, matching the reference implementation
-    // (canvasUtils.ts) rather than luma-weighted cvtColor grayscale.
-    cv::transform(color, sourceGray_, cv::Matx13f(1.f / 3, 1.f / 3, 1.f / 3));
-    edgeMap_ = computeEdgeMap(sourceGray_);
-    mask_ = cv::Mat::zeros(sourceGray_.size(), CV_8UC1);
-    seeds_ = cv::Mat(sourceGray_.size(), CV_8UC1, cv::Scalar(kNoSeed));
+        // Prepare all layers before replacing the current document, so a
+        // decoder or processing failure leaves the previous annotations intact.
+        cv::Mat gray;
+        // Use the channel mean, as in the web reference, rather than luma weights.
+        cv::transform(color, gray, cv::Matx13f(1.f / 3, 1.f / 3, 1.f / 3));
+        cv::Mat edges = computeEdgeMap(gray);
+        cv::Mat mask = cv::Mat::zeros(gray.size(), CV_8UC1);
+        cv::Mat seeds(gray.size(), CV_8UC1, cv::Scalar(kNoSeed));
 
-    // Empty history: callers snapshot the current state before each mutation,
-    // so there is nothing to undo back to until the first edit.
-    history_.clear();
-    return true;
+        sourceColor_ = color;
+        sourceGray_ = gray;
+        edgeMap_ = edges;
+        mask_ = mask;
+        seeds_ = seeds;
+        history_.clear();
+        return true;
+    } catch (const cv::Exception&) {
+        return false;
+    }
 }
 
 bool Document::exportMask(const std::string& path) const {
@@ -36,7 +44,13 @@ bool Document::exportMask(const std::string& path) const {
                 orow[x] = labelInfo(static_cast<Label>(mrow[x])).colorBGR;
         }
     }
-    return cv::imwrite(path, out);
+    try {
+        return cv::imwrite(path, out);
+    } catch (const cv::Exception&) {
+        // Missing/unsupported extensions and encoder failures can throw rather
+        // than return false. Let the UI show its export error in either case.
+        return false;
+    }
 }
 
 void Document::paintLine(cv::Point a, cv::Point b, Label label, int brushSize) {
@@ -67,6 +81,8 @@ void Document::fill(cv::Point seed, Label label, FillAlgorithm algo,
                                  intensityThreshold, edgePenaltyThreshold,
                                  4, edgeMap_);
             break;
+        default:
+            break; // Scribble algorithms require runSeedSegmentation().
     }
 }
 
@@ -107,8 +123,9 @@ int Document::seedLabelCount() const {
     return count;
 }
 
-// Downscale a seed layer while preserving every scribble: stamp each seeded
-// pixel into its target cell (a plain resize would drop thin strokes).
+// Stamp seeds into the working grid so thin strokes are not skipped. Labels
+// can collide; the caller checks for lost classes and restores the original
+// hard constraints after upsampling the result.
 static cv::Mat downscaleSeeds(const cv::Mat& seeds, cv::Size dst) {
     cv::Mat out(dst, CV_8UC1, cv::Scalar(kNoSeed));
     double sx = static_cast<double>(dst.width)  / seeds.cols;
@@ -127,8 +144,11 @@ static cv::Mat downscaleSeeds(const cv::Mat& seeds, cv::Size dst) {
 
 bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
                                    double beta) {
-    if (sourceGray_.empty() || !hasSeeds()) return false;
+    if (sourceGray_.empty() || seedLabelCount() < 2) return false;
     if (!isScribbleAlgorithm(algo)) return false;
+    if (algo == FillAlgorithm::GraphCut &&
+        (foreground == Label::Background || !hasSeedForLabel(foreground)))
+        return false;
 
     // Cap the working resolution so the iterative solvers stay interactive.
     constexpr int kMaxWorkDim = 512;
@@ -144,13 +164,21 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
         cv::resize(sourceGray_,  wgray,  ws, 0, 0, cv::INTER_AREA);
         cv::resize(sourceColor_, wcolor, ws, 0, 0, cv::INTER_AREA);
         wseeds = downscaleSeeds(seeds_, ws);
-        cv::resize(mask_, wout, ws, 0, 0, cv::INTER_NEAREST); // baseline for graphcut
+        // Never silently run a different competition after an entire seed
+        // class disappears into another label's working pixel.
+        for (const auto& info : labels()) {
+            if (hasSeedForLabel(info.id) &&
+                cv::countNonZero(wseeds == static_cast<uchar>(info.id)) == 0)
+                return false;
+        }
     } else {
         wgray = sourceGray_;
         wcolor = sourceColor_;
         wseeds = seeds_;
-        wout = mask_.clone();
     }
+    // Graph Cut produces a foreground selection here; merge it into the
+    // original mask later so unrelated labels never take a resizing round trip.
+    wout = cv::Mat::zeros(ws, CV_8UC1);
 
     bool ok = true;
     switch (algo) {
@@ -168,10 +196,28 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
     }
     if (!ok) return false;
 
+    cv::Mat result;
     if (down)
-        cv::resize(wout, mask_, sourceGray_.size(), 0, 0, cv::INTER_NEAREST);
+        cv::resize(wout, result, sourceGray_.size(), 0, 0, cv::INTER_NEAREST);
     else
-        wout.copyTo(mask_);
+        result = wout;
+
+    if (algo == FillAlgorithm::GraphCut) {
+        const uchar fg = static_cast<uchar>(foreground);
+        cv::Mat selected = result == fg;
+        selected.setTo(0, (seeds_ != kNoSeed) & (seeds_ != fg));
+        selected.setTo(255, seeds_ == fg);
+        result = mask_.clone();
+        result.setTo(0, (mask_ == fg) & (selected == 0));
+        result.setTo(fg, selected);
+    } else {
+        // Working-grid collisions must not override explicit full-size seeds.
+        seeds_.copyTo(result, seeds_ != kNoSeed);
+    }
+
+    // Snapshot only a successful run, immediately before committing its result.
+    pushHistory();
+    mask_ = result;
     return true;
 }
 

@@ -27,3 +27,17 @@ enable_testing()
 add_executable(test_seg tests/test_seg.cpp)
 target_link_libraries(test_seg PRIVATE orthoseg_core)
 add_test(NAME segmentation COMMAND test_seg)
+
+add_executable(test_document tests/test_document.cpp src/Document.cpp)
+target_link_libraries(test_document PRIVATE orthoseg_core)
+add_test(NAME document COMMAND test_document)
+
+add_executable(test_ui
+    tests/test_ui.cpp
+    src/Document.cpp
+    src/CanvasWidget.cpp
+    src/MainWindow.cpp
+)
+target_link_libraries(test_ui PRIVATE orthoseg_core Qt6::Widgets)
+add_test(NAME ui COMMAND test_ui)
+set_tests_properties(ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)

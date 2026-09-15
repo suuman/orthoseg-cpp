@@ -4,3 +4,7 @@ set(__QT_DEPLOY_TARGET_orthoseg_FILE /home/suman/agentic_coding/orthoseg/build/o
 set(__QT_DEPLOY_TARGET_orthoseg_TYPE EXECUTABLE)
 set(__QT_DEPLOY_TARGET_test_seg_FILE /home/suman/agentic_coding/orthoseg/build/test_seg)
 set(__QT_DEPLOY_TARGET_test_seg_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_test_document_FILE /home/suman/agentic_coding/orthoseg/build/test_document)
+set(__QT_DEPLOY_TARGET_test_document_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_test_ui_FILE /home/suman/agentic_coding/orthoseg/build/test_ui)
+set(__QT_DEPLOY_TARGET_test_ui_TYPE EXECUTABLE)

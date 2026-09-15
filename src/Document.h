@@ -48,10 +48,13 @@ public:
     // Run a scribble algorithm (GrowCut/RandomWalker/GraphCut) over the current
     // seeds, writing the result into the mask. `foreground` is the active label
     // (only used by GraphCut). Runs at a capped working resolution for speed.
-    // Returns false if it could not run (no image/seeds, or missing fg/bg).
+    // Creates its own undo snapshot on success. Failure leaves mask/history
+    // unchanged (including when downscaling loses a seed label). GraphCut
+    // requires a bone foreground label; all methods need two seed labels.
     bool runSeedSegmentation(FillAlgorithm algo, Label foreground, double beta);
 
-    // Undo support: caller pushes a snapshot before a mutating gesture begins.
+    // Undo support: caller pushes a snapshot before a mutating gesture begins,
+    // except runSeedSegmentation(), which records its own successful mutation.
     // A snapshot captures both the mask and the seed layer.
     void pushHistory();
     bool canUndo() const { return !history_.empty(); }

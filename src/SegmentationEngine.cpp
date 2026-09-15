@@ -380,6 +380,7 @@ bool graphCutFromSeeds(const cv::Mat& colorSource, const cv::Mat& seeds,
     CV_Assert(colorSource.type() == CV_8UC3 && seeds.type() == CV_8UC1);
     CV_Assert(mask.type() == CV_8UC1);
     CV_Assert(colorSource.size() == seeds.size() && colorSource.size() == mask.size());
+    if (foreground == Label::Background) return false;
     const uchar fg = static_cast<uchar>(foreground);
 
     cv::Mat gc(colorSource.size(), CV_8UC1);
@@ -396,8 +397,12 @@ bool graphCutFromSeeds(const cv::Mat& colorSource, const cv::Mat& seeds,
     if (nFG == 0 || nBG == 0) return false; // grabCut needs both classes
 
     cv::Mat bgModel, fgModel;
-    cv::grabCut(colorSource, gc, cv::Rect(), bgModel, fgModel,
-                std::max(1, iterations), cv::GC_INIT_WITH_MASK);
+    try {
+        cv::grabCut(colorSource, gc, cv::Rect(), bgModel, fgModel,
+                    std::max(1, iterations), cv::GC_INIT_WITH_MASK);
+    } catch (const cv::Exception&) {
+        return false; // The caller's mask has not been modified yet.
+    }
 
     for (int y = 0; y < gc.rows; ++y) {
         const uchar* g = gc.ptr<uchar>(y);

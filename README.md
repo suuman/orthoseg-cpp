@@ -1,68 +1,237 @@
-# OrthoSeg (Native C++ Edition)
+# OrthoSeg
 
-A desktop medical-image annotation tool for segmenting lower-limb X-rays
-(Femur, Tibia, Fibula) with intensity/edge-aware region-growing fills. This is a
-native C++ port of the web reference in [`example/`](example/), built on **Qt 6**
-(GUI) and **OpenCV 4** (image processing).
+OrthoSeg is a desktop annotation tool for segmenting the **femur, tibia, and
+fibula** in lower-limb X-rays. The native application uses **C++17**, **Qt 6
+Widgets**, and **OpenCV**, with manual painting and six interactive segmentation
+algorithms. Image processing runs locally and requires no model downloads or API
+keys.
 
-## Layout
+The original React/TypeScript implementation is included in [`example/`](example/).
+The instructions below describe the native application; see
+[Web reference](#web-reference) to run the browser version.
 
-| File | Responsibility |
-|------|----------------|
-| `src/Labels.h` | Label/Tool/FillAlgorithm enums, label colors (BGR) |
-| `src/SegmentationEngine.{h,cpp}` | Pure-OpenCV edge map + 3 fill algorithms (no Qt) |
-| `src/Document.{h,cpp}` | App state: source, indexed mask, undo history, brush/fill/export |
-| `src/CanvasWidget.{h,cpp}` | Canvas rendering, zoom, mouse gestures |
-| `src/MainWindow.{h,cpp}` | Sidebar controls + top toolbar |
-| `src/main.cpp` | Entry point + global dark theme |
-| `tests/test_seg.cpp` | Headless tests for the segmentation core |
+## Features
 
-The mask is a single-channel `CV_8U` **indexed** image (each pixel holds a label
-id 0–3); color is applied only at render/export time. Painting the Background id
-(0) erases.
+- Brush and eraser tools with adjustable stroke size.
+- Three fills that grow a region from a single click.
+- Three algorithms that segment from labeled scribbles, including background seeds.
+- Color mask overlay with adjustable opacity and zoom controls.
+- Undo for the last 20 edits, restoring both the mask and seed layer.
+- Export of a color PNG mask at the source image dimensions.
 
-## Algorithms
+## Build and run
 
-Click-seed (single click grows one region):
+### Requirements
 
-- **Standard** — 4-way BFS; grows while `|intensity − seedIntensity| ≤ intensityThreshold`.
-- **Embedded Boundary** — same, but halts at any pixel whose Sobel edge magnitude
-  exceeds `edgePenaltyThreshold`.
-- **Split-and-Merge** — divides the image into blocks, computes per-block mean
-  intensity and max edge magnitude, then unions adjacent blocks (union-find) when
-  both are below the edge penalty and similar in mean; fills the seed's component.
+- A C++17 compiler.
+- CMake 3.16 or newer.
+- Qt 6 development files for the `Widgets` component.
+- OpenCV development files for `core`, `imgproc`, and `imgcodecs` (OpenCV 4 is used
+  by this project).
 
-Seed-competition (scribble seeds for several labels — including Background —
-then press **Run Segmentation**; the labels compete for the ambiguous pixels,
-which lets you force a clean split at the knee or hip by seeding both sides):
+On Debian/Ubuntu, install the build dependencies:
 
-- **Grow from Seeds (GrowCut)** — synchronous cellular automaton; each seeded
-  cell attacks its neighbours with strength `exp(−β·ΔI²)`, iterated to
-  convergence. Multi-label.
-- **Random Walker** — solves the weighted harmonic (Dirichlet) problem per
-  label with edge weights `exp(−β·ΔI²)` via SOR relaxation; each pixel takes the
-  argmax label. Degrades gracefully at weak/blurry boundaries. Multi-label.
-- **Graph Cut** — OpenCV `grabCut` (color GMMs + min-cut/max-flow). The active
-  label's scribbles are hard foreground; all other scribbles are hard
-  background. Binary per run; run once per bone with corrective seeds as needed.
+```bash
+sudo apt update
+sudo apt install build-essential cmake qt6-base-dev libopencv-dev
+```
 
-Scribble algorithms run at a capped ≤512 px working resolution (seed-preserving
-downscale) to stay interactive, then the labeling is upsampled to full size.
-
-## Build & Run
+From the repository root:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-
-./build/orthoseg          # launch the app
-ctest --test-dir build    # or: ./build/test_seg
+cmake --build build --parallel
+./build/orthoseg
 ```
 
-Requires `qt6-base-dev` and `libopencv-dev`.
+If Qt or OpenCV is installed outside the usual system locations, set
+`CMAKE_PREFIX_PATH`, or provide `Qt6_DIR` and `OpenCV_DIR`, when configuring CMake.
+The normal application launch requires a graphical desktop session.
 
-## Usage
+### Run the tests
 
-Upload an X-ray → pick an anatomy label → choose Brush, Fill, or Eraser. In Fill
-mode, select an algorithm and tune the Intensity/Edge-Penalty sliders. Undo (top
-bar) keeps the last 20 mask states. Export writes a color PNG mask.
+After building, run CTest from the build directory:
+
+```bash
+cd build
+ctest --output-on-failure
+```
+
+CTest runs three suites:
+
+- `segmentation`: synthetic-image checks for the Sobel edge map, all six algorithms,
+  background erasing, and seed requirements.
+- `document`: image I/O, preservation of annotations and seeds during resizing,
+  validation, and segmentation undo.
+- `ui`: seed controls, overlay repainting, and file dialogs using Qt's offscreen
+  platform, with no desktop session required.
+
+The core and document tests run without Qt GUI code. The current CMake
+configuration still requires Qt 6 to configure the project. To run only the
+segmentation engine checks, use `./build/test_seg` from the repository root.
+
+## Annotating an image
+
+### Open and paint
+
+1. Click **Upload X-ray** and open a PNG, JPEG, BMP, or TIFF image.
+2. Select **Femur**, **Tibia**, or **Fibula** under **Select Anatomy**.
+3. Choose **Brush**, set **Brush Size**, and drag with the left mouse button to
+   paint. Choose **Eraser**, or paint with **Background**, to remove labels.
+4. Use **Mask Opacity** to adjust the overlay. The mouse wheel and toolbar
+   **+**/**−** buttons change zoom; **Reset Zoom** returns to the fitted view.
+5. Click **Export Mask** to save the result. The default filename is
+   `bone_segmentation_mask.png`.
+
+Opening another image starts a new mask and seed layer and resets undo history.
+Annotations are held in memory, so export the mask before changing images or
+closing the application.
+
+### Fill from a click
+
+Choose **Fill**, select **Standard Growing**, **Embedded Boundary**, or
+**Split-and-Merge**, then click inside the region to label. Adjust the intensity
+and edge settings as needed. A fill writes the active label over every pixel it
+reaches, including existing annotations. Selecting **Background** erases the
+filled region.
+
+### Segment from scribbles
+
+1. Choose **Fill** and select **Grow from Seeds**, **Random Walker**, or
+   **Graph Cut**.
+2. Select a bone label and draw short strokes inside that structure. Switch labels
+   to seed other structures and use **Background** outside the bones or between
+   neighboring structures. At least two distinct seed labels are required.
+3. For **Graph Cut**, select the target bone again before running: the active
+   label is foreground, and every other seed label is background for that run.
+4. Click **Run Segmentation**. Add corrective seeds and rerun as needed, then use
+   Brush or Eraser for manual refinements.
+
+In this workflow, strokes modify a separate seed layer. **Background** creates a
+competing seed, displayed in gray. The Eraser tool edits the result mask; use
+**Undo** to revert a seed stroke or **Clear Seeds** to remove all seeds. Seed
+strokes use **Brush Size**, which remains available while drawing seeds.
+
+**Grow from Seeds** and **Random Walker** replace the entire result mask on each
+run. **Graph Cut** assigns the active label to foreground pixels and clears its
+previous pixels where the cut selects background; other labels at background
+pixels are retained. Foreground pixels can overwrite another label.
+
+### Controls and settings
+
+| Control | Range / default | Behavior |
+| --- | --- | --- |
+| Brush Size | 2–100 px / 20 px | Stroke width in source image pixels; also used for erasing and seeds. |
+| Intensity Thresh | 1–50 / 5 | Allowed intensity difference for click fills; larger values allow more variation. |
+| Edge Penalty | 1–255 / 30 | Edge cutoff for Embedded Boundary and Split-and-Merge; lower values block growth at weaker edges. |
+| Edge Sensitivity (β) | 1–100 / 30 | Grow from Seeds and Random Walker only; larger values reduce propagation across intensity changes. Internally, β = slider value × 0.0001. |
+| Mask Opacity | 10–100% / 50% | Display opacity; exported mask colors stay fully opaque. |
+| Zoom | 25–400% / 100% | Changes in 25 percentage-point steps relative to the fitted view. |
+| Undo | Up to 20 edits | Restores the mask and seeds before a stroke, fill, segmentation run, or clear action. |
+| Clear Seeds | — | Removes seed strokes while retaining the result mask. |
+| Clear All | — | Clears both the mask and seeds while keeping the source image. |
+
+## Segmentation algorithms
+
+| Algorithm | Input | Implementation |
+| --- | --- | --- |
+| Standard Growing | Single click | Visits four-connected neighbors while their intensity differs from the seed intensity by at most the threshold. |
+| Embedded Boundary | Single click | Applies the same intensity test and stops at pixels whose Sobel edge magnitude exceeds Edge Penalty. |
+| Split-and-Merge | Single click | Divides the image into 4 × 4 blocks, then joins adjacent blocks with similar mean intensity when both maximum edge magnitudes are within the cutoff. Fills the seed block's connected component. |
+| Grow from Seeds (GrowCut) | Labeled scribbles | Neighboring pixels compete for labels using strength weighted by `exp(−β × ΔI²)`. Updates synchronously until stable or the iteration limit is reached. |
+| Random Walker | Labeled scribbles | Solves one weighted harmonic probability field per seeded label using successive over-relaxation, then chooses the label with the highest value at each pixel. Uses the same intensity-based edge weights as GrowCut. |
+| Graph Cut | Foreground and background scribbles | Uses OpenCV `grabCut` with color mixture models and a graph cut, running three iterations by default. Segments one active label per run. |
+
+Click fills run at full resolution. Scribble algorithms run with the longest
+working image dimension capped at **512 pixels**, then resize the result to the
+original dimensions using nearest-neighbor interpolation. Seed pixels are mapped
+into the reduced grid so thin strokes are not simply skipped, but competing seeds
+can collide in the same reduced pixel. Original seed constraints are restored at
+full resolution. If resizing removes an entire seed label, the run is rejected
+without changing the mask or undo history; draw larger, separated strokes and
+retry. Fine boundaries can still be affected by resizing; refine the result at
+full resolution with Brush or Eraser. Graph Cut merges its foreground selection
+into the original mask, preserving other labels at background pixels exactly.
+
+The Sobel edge map has a one-pixel zero border, matching the web reference.
+Embedded Boundary can therefore grow around a barrier along the image boundary
+when the intensity threshold permits it.
+
+## Image and mask formats
+
+The native loader reads images as 8-bit BGR color and computes grayscale intensity
+as the mean of the three channels. The internal mask is a single-channel
+`CV_8UC1` image containing these label IDs:
+
+| ID | Label | Export color (RGB hex) |
+| --- | --- | --- |
+| 0 | Background | `#000000` |
+| 1 | Femur | `#ef4444` |
+| 2 | Tibia | `#22c55e` |
+| 3 | Fibula | `#3b82f6` |
+
+The separate seed layer uses IDs 0–3 and `255` for unseeded pixels. In the result
+mask, ID 0 means background; in the seed layer, ID 0 is an explicit background
+seed.
+
+**Export Mask** writes a three-channel color PNG with a black background. It
+contains the mask only, with no source X-ray, seed strokes, or transparency. To
+recover label IDs from an exported PNG, map its RGB colors using the table above.
+
+The current application works with individual raster images. It has no direct
+DICOM reader, project save/reload, mask import, or indexed-label export. Convert
+DICOM images to a supported raster format before opening them; original
+high-bit-depth image values are not preserved by the current loader.
+
+## Project layout
+
+| Path | Responsibility |
+| --- | --- |
+| [`CMakeLists.txt`](CMakeLists.txt) | Defines the `orthoseg_core` library, `orthoseg` application, and `test_seg` executable. |
+| [`src/Labels.h`](src/Labels.h) | Anatomy IDs, tools, algorithm enums, and BGR label colors. |
+| [`src/SegmentationEngine.cpp`](src/SegmentationEngine.cpp) / [header](src/SegmentationEngine.h) | OpenCV-only edge map and all six segmentation algorithms. |
+| [`src/Document.cpp`](src/Document.cpp) / [header](src/Document.h) | Image loading, indexed mask, seeds, undo history, segmentation execution, and export; independent of Qt. |
+| [`src/CanvasWidget.cpp`](src/CanvasWidget.cpp) / [header](src/CanvasWidget.h) | Image and overlay rendering, mouse gestures, and zoom. |
+| [`src/MainWindow.cpp`](src/MainWindow.cpp) / [header](src/MainWindow.h) | Sidebar, toolbar, file dialogs, and seed validation. |
+| [`src/main.cpp`](src/main.cpp) | Application entry point, dark theme, and screenshot arguments. |
+| [`tests/test_seg.cpp`](tests/test_seg.cpp) | Headless checks for the segmentation engine. |
+| [`tests/test_document.cpp`](tests/test_document.cpp) | Regression checks for image I/O, segmentation resizing, validation, and undo. |
+| [`tests/test_ui.cpp`](tests/test_ui.cpp) | Offscreen Qt checks for controls, repainting, and file dialogs. |
+| [`example/`](example/) | React/TypeScript web reference using Vite and Tailwind CSS. |
+
+### Capture the UI without a display
+
+From the repository root, use Qt's offscreen platform and the built-in screenshot
+arguments:
+
+```bash
+QT_QPA_PLATFORM=offscreen ./build/orthoseg \
+  --fill-algo 3 --screenshot build/orthoseg-growcut.png
+```
+
+`--fill-algo` selects an algorithm by index: `0` Standard Growing, `1` Embedded
+Boundary, `2` Split-and-Merge, `3` Grow from Seeds, `4` Random Walker, or `5` Graph
+Cut. `--screenshot` captures the window shortly after startup and exits. This
+checks UI rendering; it does not load an image or run segmentation.
+
+## Web reference
+
+The browser version provides Brush, Eraser, and the three click-fill algorithms.
+Its annotation logic runs in the browser using canvas; the native application
+adds the scribble algorithms and stores labels in an indexed mask. The web
+version exports a canvas PNG with transparent background pixels.
+
+With Node.js and npm installed, run from the repository root:
+
+```bash
+cd example
+npm install
+npm run dev
+```
+
+Open the local URL printed by Vite (port 3000 by default). `npm run build` creates
+the production bundle in `example/dist/`, and `npm run lint` runs the TypeScript
+type checker.
+
+The example retains AI Studio configuration and a `GEMINI_API_KEY` placeholder,
+but its current annotation code makes no Gemini API calls and needs no API key.

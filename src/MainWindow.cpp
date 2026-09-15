@@ -450,6 +450,7 @@ void MainWindow::updateSettingsVisibility() {
 
     FillAlgorithm algo = static_cast<FillAlgorithm>(algoCombo_->currentIndex());
     bool scribble = isScribbleAlgorithm(algo);
+    brushPanel_->setVisible(scribble);
 
     // Region-grow params only for the click-seed algorithms.
     intensityPanel_->setVisible(!scribble);
@@ -499,9 +500,13 @@ void MainWindow::onExport() {
         QMessageBox::information(this, "OrthoSeg", "Load an image first.");
         return;
     }
-    QString path = QFileDialog::getSaveFileName(
-        this, "Export Mask", "bone_segmentation_mask.png", "PNG (*.png)");
-    if (path.isEmpty()) return;
+    QFileDialog dialog(this, "Export Mask");
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setNameFilter("PNG (*.png)");
+    dialog.setDefaultSuffix("png");
+    dialog.selectFile("bone_segmentation_mask.png");
+    if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) return;
+    const QString path = dialog.selectedFiles().first();
     if (!doc_->exportMask(path.toStdString()))
         QMessageBox::warning(this, "OrthoSeg", "Failed to export mask.");
 }
@@ -539,6 +544,12 @@ void MainWindow::onRunSegmentation() {
     }
 
     if (algo == FillAlgorithm::GraphCut) {
+        if (activeLabel_ == Label::Background) {
+            QMessageBox::information(this, "OrthoSeg",
+                "Select the bone you want to segment before running Graph Cut. "
+                "Background strokes will be used as background seeds.");
+            return;
+        }
         if (!doc_->hasSeedForLabel(activeLabel_)) {
             QMessageBox::information(this, "OrthoSeg",
                 "Graph Cut needs foreground seeds for the active label. "
@@ -558,10 +569,11 @@ void MainWindow::onRunSegmentation() {
         return;
     }
 
-    doc_->pushHistory();
     bool ok = doc_->runSeedSegmentation(algo, activeLabel_, currentBeta());
     if (!ok)
-        QMessageBox::warning(this, "OrthoSeg", "Segmentation could not run.");
+        QMessageBox::warning(this, "OrthoSeg",
+            "Segmentation could not run. Try larger, separated seed strokes; "
+            "small strokes can overlap when the image is reduced for processing.");
     canvas_->update();
     updateUndoState();
 }

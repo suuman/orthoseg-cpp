@@ -166,6 +166,32 @@ test_seg/fast:
 .PHONY : test_seg/fast
 
 #=============================================================================
+# Target rules for targets named test_document
+
+# Build rule for target.
+test_document: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_document
+.PHONY : test_document
+
+# fast build rule for target.
+test_document/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/build
+.PHONY : test_document/fast
+
+#=============================================================================
+# Target rules for targets named test_ui
+
+# Build rule for target.
+test_ui: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_ui
+.PHONY : test_ui
+
+# fast build rule for target.
+test_ui/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/build
+.PHONY : test_ui/fast
+
+#=============================================================================
 # Target rules for targets named orthoseg_core_autogen_timestamp_deps
 
 # Build rule for target.
@@ -243,6 +269,58 @@ test_seg_autogen/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_seg_autogen.dir/build.make CMakeFiles/test_seg_autogen.dir/build
 .PHONY : test_seg_autogen/fast
 
+#=============================================================================
+# Target rules for targets named test_document_autogen_timestamp_deps
+
+# Build rule for target.
+test_document_autogen_timestamp_deps: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_document_autogen_timestamp_deps
+.PHONY : test_document_autogen_timestamp_deps
+
+# fast build rule for target.
+test_document_autogen_timestamp_deps/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document_autogen_timestamp_deps.dir/build.make CMakeFiles/test_document_autogen_timestamp_deps.dir/build
+.PHONY : test_document_autogen_timestamp_deps/fast
+
+#=============================================================================
+# Target rules for targets named test_document_autogen
+
+# Build rule for target.
+test_document_autogen: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_document_autogen
+.PHONY : test_document_autogen
+
+# fast build rule for target.
+test_document_autogen/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document_autogen.dir/build.make CMakeFiles/test_document_autogen.dir/build
+.PHONY : test_document_autogen/fast
+
+#=============================================================================
+# Target rules for targets named test_ui_autogen_timestamp_deps
+
+# Build rule for target.
+test_ui_autogen_timestamp_deps: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_ui_autogen_timestamp_deps
+.PHONY : test_ui_autogen_timestamp_deps
+
+# fast build rule for target.
+test_ui_autogen_timestamp_deps/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui_autogen_timestamp_deps.dir/build.make CMakeFiles/test_ui_autogen_timestamp_deps.dir/build
+.PHONY : test_ui_autogen_timestamp_deps/fast
+
+#=============================================================================
+# Target rules for targets named test_ui_autogen
+
+# Build rule for target.
+test_ui_autogen: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_ui_autogen
+.PHONY : test_ui_autogen
+
+# fast build rule for target.
+test_ui_autogen/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui_autogen.dir/build.make CMakeFiles/test_ui_autogen.dir/build
+.PHONY : test_ui_autogen/fast
+
 orthoseg_autogen/mocs_compilation.o: orthoseg_autogen/mocs_compilation.cpp.o
 .PHONY : orthoseg_autogen/mocs_compilation.o
 
@@ -297,6 +375,7 @@ src/CanvasWidget.o: src/CanvasWidget.cpp.o
 # target to build an object file
 src/CanvasWidget.cpp.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/CanvasWidget.cpp.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/CanvasWidget.cpp.o
 .PHONY : src/CanvasWidget.cpp.o
 
 src/CanvasWidget.i: src/CanvasWidget.cpp.i
@@ -305,6 +384,7 @@ src/CanvasWidget.i: src/CanvasWidget.cpp.i
 # target to preprocess a source file
 src/CanvasWidget.cpp.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/CanvasWidget.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/CanvasWidget.cpp.i
 .PHONY : src/CanvasWidget.cpp.i
 
 src/CanvasWidget.s: src/CanvasWidget.cpp.s
@@ -313,6 +393,7 @@ src/CanvasWidget.s: src/CanvasWidget.cpp.s
 # target to generate assembly for a file
 src/CanvasWidget.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/CanvasWidget.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/CanvasWidget.cpp.s
 .PHONY : src/CanvasWidget.cpp.s
 
 src/Document.o: src/Document.cpp.o
@@ -321,6 +402,8 @@ src/Document.o: src/Document.cpp.o
 # target to build an object file
 src/Document.cpp.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/Document.cpp.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/src/Document.cpp.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/Document.cpp.o
 .PHONY : src/Document.cpp.o
 
 src/Document.i: src/Document.cpp.i
@@ -329,6 +412,8 @@ src/Document.i: src/Document.cpp.i
 # target to preprocess a source file
 src/Document.cpp.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/Document.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/src/Document.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/Document.cpp.i
 .PHONY : src/Document.cpp.i
 
 src/Document.s: src/Document.cpp.s
@@ -337,6 +422,8 @@ src/Document.s: src/Document.cpp.s
 # target to generate assembly for a file
 src/Document.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/Document.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/src/Document.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/Document.cpp.s
 .PHONY : src/Document.cpp.s
 
 src/MainWindow.o: src/MainWindow.cpp.o
@@ -345,6 +432,7 @@ src/MainWindow.o: src/MainWindow.cpp.o
 # target to build an object file
 src/MainWindow.cpp.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/MainWindow.cpp.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/MainWindow.cpp.o
 .PHONY : src/MainWindow.cpp.o
 
 src/MainWindow.i: src/MainWindow.cpp.i
@@ -353,6 +441,7 @@ src/MainWindow.i: src/MainWindow.cpp.i
 # target to preprocess a source file
 src/MainWindow.cpp.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/MainWindow.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/MainWindow.cpp.i
 .PHONY : src/MainWindow.cpp.i
 
 src/MainWindow.s: src/MainWindow.cpp.s
@@ -361,6 +450,7 @@ src/MainWindow.s: src/MainWindow.cpp.s
 # target to generate assembly for a file
 src/MainWindow.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/MainWindow.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/src/MainWindow.cpp.s
 .PHONY : src/MainWindow.cpp.s
 
 src/SegmentationEngine.o: src/SegmentationEngine.cpp.o
@@ -411,6 +501,30 @@ src/main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/orthoseg.dir/build.make CMakeFiles/orthoseg.dir/src/main.cpp.s
 .PHONY : src/main.cpp.s
 
+test_document_autogen/mocs_compilation.o: test_document_autogen/mocs_compilation.cpp.o
+.PHONY : test_document_autogen/mocs_compilation.o
+
+# target to build an object file
+test_document_autogen/mocs_compilation.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/test_document_autogen/mocs_compilation.cpp.o
+.PHONY : test_document_autogen/mocs_compilation.cpp.o
+
+test_document_autogen/mocs_compilation.i: test_document_autogen/mocs_compilation.cpp.i
+.PHONY : test_document_autogen/mocs_compilation.i
+
+# target to preprocess a source file
+test_document_autogen/mocs_compilation.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/test_document_autogen/mocs_compilation.cpp.i
+.PHONY : test_document_autogen/mocs_compilation.cpp.i
+
+test_document_autogen/mocs_compilation.s: test_document_autogen/mocs_compilation.cpp.s
+.PHONY : test_document_autogen/mocs_compilation.s
+
+# target to generate assembly for a file
+test_document_autogen/mocs_compilation.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/test_document_autogen/mocs_compilation.cpp.s
+.PHONY : test_document_autogen/mocs_compilation.cpp.s
+
 test_seg_autogen/mocs_compilation.o: test_seg_autogen/mocs_compilation.cpp.o
 .PHONY : test_seg_autogen/mocs_compilation.o
 
@@ -434,6 +548,54 @@ test_seg_autogen/mocs_compilation.s: test_seg_autogen/mocs_compilation.cpp.s
 test_seg_autogen/mocs_compilation.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_seg.dir/build.make CMakeFiles/test_seg.dir/test_seg_autogen/mocs_compilation.cpp.s
 .PHONY : test_seg_autogen/mocs_compilation.cpp.s
+
+test_ui_autogen/mocs_compilation.o: test_ui_autogen/mocs_compilation.cpp.o
+.PHONY : test_ui_autogen/mocs_compilation.o
+
+# target to build an object file
+test_ui_autogen/mocs_compilation.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/test_ui_autogen/mocs_compilation.cpp.o
+.PHONY : test_ui_autogen/mocs_compilation.cpp.o
+
+test_ui_autogen/mocs_compilation.i: test_ui_autogen/mocs_compilation.cpp.i
+.PHONY : test_ui_autogen/mocs_compilation.i
+
+# target to preprocess a source file
+test_ui_autogen/mocs_compilation.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/test_ui_autogen/mocs_compilation.cpp.i
+.PHONY : test_ui_autogen/mocs_compilation.cpp.i
+
+test_ui_autogen/mocs_compilation.s: test_ui_autogen/mocs_compilation.cpp.s
+.PHONY : test_ui_autogen/mocs_compilation.s
+
+# target to generate assembly for a file
+test_ui_autogen/mocs_compilation.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/test_ui_autogen/mocs_compilation.cpp.s
+.PHONY : test_ui_autogen/mocs_compilation.cpp.s
+
+tests/test_document.o: tests/test_document.cpp.o
+.PHONY : tests/test_document.o
+
+# target to build an object file
+tests/test_document.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/tests/test_document.cpp.o
+.PHONY : tests/test_document.cpp.o
+
+tests/test_document.i: tests/test_document.cpp.i
+.PHONY : tests/test_document.i
+
+# target to preprocess a source file
+tests/test_document.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/tests/test_document.cpp.i
+.PHONY : tests/test_document.cpp.i
+
+tests/test_document.s: tests/test_document.cpp.s
+.PHONY : tests/test_document.s
+
+# target to generate assembly for a file
+tests/test_document.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_document.dir/build.make CMakeFiles/test_document.dir/tests/test_document.cpp.s
+.PHONY : tests/test_document.cpp.s
 
 tests/test_seg.o: tests/test_seg.cpp.o
 .PHONY : tests/test_seg.o
@@ -459,6 +621,30 @@ tests/test_seg.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_seg.dir/build.make CMakeFiles/test_seg.dir/tests/test_seg.cpp.s
 .PHONY : tests/test_seg.cpp.s
 
+tests/test_ui.o: tests/test_ui.cpp.o
+.PHONY : tests/test_ui.o
+
+# target to build an object file
+tests/test_ui.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/tests/test_ui.cpp.o
+.PHONY : tests/test_ui.cpp.o
+
+tests/test_ui.i: tests/test_ui.cpp.i
+.PHONY : tests/test_ui.i
+
+# target to preprocess a source file
+tests/test_ui.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/tests/test_ui.cpp.i
+.PHONY : tests/test_ui.cpp.i
+
+tests/test_ui.s: tests/test_ui.cpp.s
+.PHONY : tests/test_ui.s
+
+# target to generate assembly for a file
+tests/test_ui.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_ui.dir/build.make CMakeFiles/test_ui.dir/tests/test_ui.cpp.s
+.PHONY : tests/test_ui.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -472,11 +658,17 @@ help:
 	@echo "... orthoseg_autogen_timestamp_deps"
 	@echo "... orthoseg_core_autogen"
 	@echo "... orthoseg_core_autogen_timestamp_deps"
+	@echo "... test_document_autogen"
+	@echo "... test_document_autogen_timestamp_deps"
 	@echo "... test_seg_autogen"
 	@echo "... test_seg_autogen_timestamp_deps"
+	@echo "... test_ui_autogen"
+	@echo "... test_ui_autogen_timestamp_deps"
 	@echo "... orthoseg"
 	@echo "... orthoseg_core"
+	@echo "... test_document"
 	@echo "... test_seg"
+	@echo "... test_ui"
 	@echo "... orthoseg_autogen/mocs_compilation.o"
 	@echo "... orthoseg_autogen/mocs_compilation.i"
 	@echo "... orthoseg_autogen/mocs_compilation.s"
@@ -498,12 +690,24 @@ help:
 	@echo "... src/main.o"
 	@echo "... src/main.i"
 	@echo "... src/main.s"
+	@echo "... test_document_autogen/mocs_compilation.o"
+	@echo "... test_document_autogen/mocs_compilation.i"
+	@echo "... test_document_autogen/mocs_compilation.s"
 	@echo "... test_seg_autogen/mocs_compilation.o"
 	@echo "... test_seg_autogen/mocs_compilation.i"
 	@echo "... test_seg_autogen/mocs_compilation.s"
+	@echo "... test_ui_autogen/mocs_compilation.o"
+	@echo "... test_ui_autogen/mocs_compilation.i"
+	@echo "... test_ui_autogen/mocs_compilation.s"
+	@echo "... tests/test_document.o"
+	@echo "... tests/test_document.i"
+	@echo "... tests/test_document.s"
 	@echo "... tests/test_seg.o"
 	@echo "... tests/test_seg.i"
 	@echo "... tests/test_seg.s"
+	@echo "... tests/test_ui.o"
+	@echo "... tests/test_ui.i"
+	@echo "... tests/test_ui.s"
 .PHONY : help
 
 
