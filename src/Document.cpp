@@ -26,6 +26,7 @@ bool Document::loadImage(const std::string& path) {
         mask_ = mask;
         seeds_ = seeds;
         history_.clear();
+        aiFill_ = AIFillState{};
         return true;
     } catch (const cv::Exception&) {
         return false;
@@ -51,6 +52,26 @@ bool Document::exportMask(const std::string& path) const {
         // than return false. Let the UI show its export error in either case.
         return false;
     }
+}
+
+void Document::applyAIResult() {
+    if (aiFill_.resultMask.empty()) return;
+    const cv::Mat& result = aiFill_.resultMask;
+    if (result.size() != mask_.size() || result.type() != CV_8UC1) return;
+    pushHistory();
+    result.copyTo(mask_, result != 0);
+    aiFill_.resultMask.release();
+}
+
+void Document::paintAIPrompt(cv::Point a, cv::Point b, bool erase, int brushSize) {
+    if (!hasImage()) return;
+    if (aiFill_.promptMask.empty())
+        aiFill_.promptMask = cv::Mat::zeros(sourceGray_.size(), CV_8UC1);
+    const cv::Scalar value(erase ? 0 : 255);
+    cv::line(aiFill_.promptMask, a, b, value, brushSize, cv::LINE_8);
+    const int radius = std::max(1, brushSize / 2);
+    cv::circle(aiFill_.promptMask, a, radius, value, cv::FILLED);
+    cv::circle(aiFill_.promptMask, b, radius, value, cv::FILLED);
 }
 
 void Document::paintLine(cv::Point a, cv::Point b, Label label, int brushSize) {

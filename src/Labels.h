@@ -13,7 +13,7 @@ enum class Label : int {
     Fibula    = 3,
 };
 
-enum class Tool { Brush, Fill, Eraser };
+enum class Tool { Brush, Fill, Eraser, AIFill };
 
 // The first three grow a single region from one seed click. The last three are
 // multi-seed competition methods: the user scribbles seeds for several labels

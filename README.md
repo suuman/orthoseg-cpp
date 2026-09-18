@@ -3,8 +3,9 @@
 OrthoSeg is a desktop annotation tool for segmenting the **femur, tibia, and
 fibula** in lower-limb X-rays. The native application uses **C++17**, **Qt 6
 Widgets**, and **OpenCV**, with manual painting and six interactive segmentation
-algorithms. Image processing runs locally and requires no model downloads or API
-keys.
+algorithms, plus **AI Fill** using the existing `ocv/` MedSAM2 implementation.
+Processing runs locally without API keys. AI Fill requires the two MedSAM2 ONNX
+models and CUDA-enabled OpenCV DNN; the other tools do not require a model or GPU.
 
 The original React/TypeScript implementation is included in [`example/`](example/).
 The instructions below describe the native application; see
@@ -15,7 +16,8 @@ The instructions below describe the native application; see
 - Brush and eraser tools with adjustable stroke size.
 - Three fills that grow a region from a single click.
 - Three algorithms that segment from labeled scribbles, including background seeds.
-- Color mask overlay with adjustable opacity and zoom controls.
+- Color mask overlay with adjustable opacity, zoom, and middle-button panning.
+- AI Fill with bounding-box, painted-mask, and loaded-mask prompts for femur/tibia.
 - Undo for the last 20 edits, restoring both the mask and seed layer.
 - Export of a color PNG mask at the source image dimensions.
 
@@ -26,8 +28,9 @@ The instructions below describe the native application; see
 - A C++17 compiler.
 - CMake 3.16 or newer.
 - Qt 6 development files for the `Widgets` component.
-- OpenCV development files for `core`, `imgproc`, and `imgcodecs` (OpenCV 4 is used
-  by this project).
+- OpenCV development files for `core`, `imgproc`, `imgcodecs`, and `dnn` (OpenCV 4+).
+- For AI Fill: an NVIDIA GPU/driver and OpenCV DNN built with CUDA and cuDNN.
+  Distribution OpenCV packages can build the application but may lack CUDA support.
 
 On Debian/Ubuntu, install the build dependencies:
 
@@ -57,14 +60,17 @@ cd build
 ctest --output-on-failure
 ```
 
-CTest runs three suites:
+CTest runs four suites:
 
 - `segmentation`: synthetic-image checks for the Sobel edge map, all six algorithms,
   background erasing, and seed requirements.
 - `document`: image I/O, preservation of annotations and seeds during resizing,
   validation, and segmentation undo.
-- `ui`: seed controls, overlay repainting, and file dialogs using Qt's offscreen
-  platform, with no desktop session required.
+- `ui`: existing controls and dialogs, AI box/paint gestures under zoom/pan,
+  prompt import validation, result overlays, and applying/undoing a preview using
+  Qt's offscreen platform.
+- `ai`: box/mask/result validation, the actual `ocv` prompt adapter, and worker
+  error delivery/duplicate-request prevention. No model inference is simulated.
 
 The core and document tests run without Qt GUI code. The current CMake
 configuration still requires Qt 6 to configure the project. To run only the
@@ -116,6 +122,98 @@ strokes use **Brush Size**, which remains available while drawing seeds.
 run. **Graph Cut** assigns the active label to foreground pixels and clears its
 previous pixels where the cut selects background; other labels at background
 pixels are retained. Foreground pixels can overwrite another label.
+
+### AI Fill (MedSAM2)
+
+1. Upload an X-ray and select **Femur** or **Tibia** using the existing anatomy selector.
+2. Select **AI Fill**, then choose a prompt type:
+   - **Bounding Box**: left-drag a rectangle; drag again to replace it.
+   - **Paint Mask**: paint foreground with the existing **Brush Size** control;
+     check **Erase Prompt** to erase. Brush size is in source-image pixels.
+   - **Load Mask**: click **Load Prompt Mask** and choose PNG, TIFF, BMP, or JPEG.
+     Dimensions must exactly match the displayed image. Nonzero RGB/grayscale
+     values become foreground for the selected anatomy; alpha is ignored. Supply
+     a binary mask for one bone, not a combined femur/tibia label map. JPEG artifacts
+     can add foreground pixels, so lossless formats are preferable.
+3. Set **MedSAM2 Model Directory** to a directory containing
+   `medsam2_image_encoder.onnx` and `medsam2_mask_decoder.onnx`. The default is this
+   checkout's `ocv/models`; `MEDSAM2_MODEL_DIR` can override it at launch.
+4. Click **Run AI Fill**. Status reports loading/inference, duplicate requests are
+   disabled, and the viewer remains interactive. First use loads the models on a
+   persistent worker thread; subsequent runs reuse them. Changing model directory
+   or recovering from a failed forward releases the old engine.
+5. The result appears in the selected anatomy's color, separately from the cyan
+   prompt and existing annotations. **Mask Opacity** controls result opacity.
+   Use **Show AI segmentation**, **Clear AI Segmentation**, and **Clear Prompt**
+   independently. **Clear All** clears AI prompts/results as well as annotations.
+6. Click **Apply AI Result to Mask** to copy foreground pixels into the
+   existing label mask, then use Brush/Eraser, Undo, or Export Mask. Applying can
+   overwrite other labels at foreground pixels; pixels outside the AI foreground
+   are retained. The preview is consumed on apply. Unapplied previews are not exported.
+
+Use the mouse wheel or existing buttons to zoom; middle-drag pans in any tool.
+Reset Zoom also resets pan. Mouse events and drawing share Qt logical coordinates,
+so zoom, fit, aspect ratio, pan, and HiDPI do not change source prompt coordinates.
+Box endpoints follow `ocv`'s inclusive pixel convention (`0..width-1`, `0..height-1`).
+Painted and loaded masks remain binary `CV_8UC1` at original resolution.
+
+The original image loader is unchanged: it supplies the displayed 8-bit BGR pixels,
+including its existing grayscale/16-bit-to-8-bit conversion. AI Fill converts this
+in-memory source to RGB exactly once; it does not reload the file or normalize it
+again. `ocv` handles centered 1024-square padding, blob creation, mask logits, and
+restoration to source dimensions with its existing defaults.
+
+The implemented call path is:
+
+```text
+CanvasWidget gestures / MainWindow::onLoadPromptMask
+  -> Document::aiFill (box or source-resolution binary prompt)
+  -> MainWindow::onRunAIFill
+  -> AIFillController::run (persistent QThread)
+  -> MedSAM2Inference::preparePrompt / run
+  -> ocv boxFromMask / makeMaskLogits (mask prompts only)
+  -> MedSAM2Engine::segment (existing OpenCV DNN CUDA implementation)
+  -> source-sized indexed cv::Mat
+  -> queued AIFillController::completed on UI thread
+  -> Document::aiFill().resultMask -> CanvasWidget::paintEvent
+  -> optional Document::applyAIResult -> existing mask editing/undo/export
+```
+
+Opening another image or clearing the result while inference runs invalidates its
+pending result. Source images are retained by reference counting for the worker;
+prompt masks are snapshotted. Model loading, preprocessing, and forward passes run
+on that worker, with errors delivered through the existing message-box mechanism.
+CUDA absence is reported explicitly; AI Fill does not silently fall back to CPU.
+Closing during inference waits for the current CUDA call to finish safely.
+
+To build with the CUDA-enabled OpenCV installation used by `ocv/run_infer.sh` on
+this machine (no OpenCV/CUDA version change is needed):
+
+```bash
+cmake -S . -B build/cuda -DCMAKE_BUILD_TYPE=Release \
+  -DOpenCV_DIR=/home/suman/soft/opencv/install_new/lib/cmake/opencv5
+cmake --build build/cuda --parallel 4
+ctest --test-dir build/cuda --output-on-failure
+MEDSAM2_MODEL_DIR="$PWD/ocv/models" ./build/cuda/orthoseg
+```
+
+On another machine, set `OpenCV_DIR` to its CUDA-enabled OpenCV CMake directory.
+The default build commands above remain supported, but AI Fill reports an error
+if that OpenCV build has no CUDA DNN target. See `ocv/README.md` for the existing
+model export and standalone inference instructions.
+
+For manual acceptance, run each of the three prompt workflows above on an X-ray,
+repeat after zooming and panning, and verify femur and tibia in separate runs.
+Check result visibility, clearing, applying, undo, and exporting; then load a
+wrong-sized prompt and verify the error. Repeat inference to check model reuse
+(the engine's model-loading messages should appear only on first use). Load a new
+image during inference and confirm the old result is discarded.
+
+Implementation verification in this environment: the system OpenCV 4.10 and custom
+OpenCV 5.1 builds and automated suites were exercised. The standalone `ocv`
+executable ran box and femur/tibia mask inference with the real supplied models,
+returning source-sized masks, but selected CPU fallback. CUDA end-to-end AI Fill
+must still be verified on a machine with an available NVIDIA driver/device.
 
 ### Controls and settings
 
@@ -179,7 +277,8 @@ contains the mask only, with no source X-ray, seed strokes, or transparency. To
 recover label IDs from an exported PNG, map its RGB colors using the table above.
 
 The current application works with individual raster images. It has no direct
-DICOM reader, project save/reload, mask import, or indexed-label export. Convert
+DICOM reader, project save/reload, or indexed-label export. AI Fill imports binary
+prompt masks but does not import a full multi-label annotation project. Convert
 DICOM images to a supported raster format before opening them; original
 high-bit-depth image values are not preserved by the current loader.
 

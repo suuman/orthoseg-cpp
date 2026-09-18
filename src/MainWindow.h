@@ -1,6 +1,7 @@
 #pragma once
 #include "Document.h"
 #include "CanvasWidget.h"
+#include "AIFillController.h"
 #include <QMainWindow>
 #include <memory>
 
@@ -10,6 +11,8 @@ class QComboBox;
 class QLabel;
 class QStackedWidget;
 class QWidget;
+class QLineEdit;
+class QCheckBox;
 
 namespace orthoseg {
 
@@ -17,6 +20,7 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     MainWindow();
+    ~MainWindow() override;
 
     // Test/screenshot hook: switch to the Fill tool with the given algorithm.
     void showFillAlgorithm(int comboIndex);
@@ -28,12 +32,15 @@ private slots:
     void onUndo();
     void onRunSegmentation();
     void onClearSeeds();
+    void onRunAIFill();
+    void onLoadPromptMask();
     void selectLabel(Label l);
     void selectTool(Tool t);
 
 private:
     QWidget* buildSidebar();
     QWidget* buildTopBar();
+    QWidget* buildAIPanel();
     void updateSettingsVisibility();
     void updateUndoState();
     void updateStatus();
@@ -43,7 +50,18 @@ private:
 
     // Sidebar controls kept for state updates.
     QWidget* labelButtons_[4] = {nullptr, nullptr, nullptr, nullptr};
-    QWidget* toolButtons_[3]  = {nullptr, nullptr, nullptr};
+    QWidget* toolButtons_[4]  = {nullptr, nullptr, nullptr, nullptr};
+    QWidget* aiPanel_ = nullptr;
+    QComboBox* aiPromptCombo_ = nullptr;
+    QLineEdit* aiModels_ = nullptr;
+    QLabel* aiStatus_ = nullptr;
+    QPushButton* aiRun_ = nullptr;
+    QCheckBox* aiShow_ = nullptr;
+    QCheckBox* aiErase_ = nullptr;
+    QPushButton* aiLoadMask_ = nullptr;
+    std::unique_ptr<AIFillController> aiController_;
+    unsigned long imageGeneration_ = 0;
+    unsigned long submittedGeneration_ = 0;
     QWidget* brushPanel_ = nullptr;
     QWidget* fillPanel_  = nullptr;
     QWidget* intensityPanel_ = nullptr;

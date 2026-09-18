@@ -14,9 +14,10 @@ class CanvasWidget : public QWidget {
 public:
     explicit CanvasWidget(Document* doc, QWidget* parent = nullptr);
 
-    void setActiveTool(Tool t)          { tool_ = t; update(); }
+    void setActiveTool(Tool t)          { drawing_ = false; tool_ = t; update(); }
     void setActiveLabel(Label l)        { label_ = l; }
     void setBrushSize(int s)            { brushSize_ = s; }
+    void setAIPromptErase(bool erase)   { aiPromptErase_ = erase; }
     void setMaskOpacity(float o)        { opacity_ = o; update(); }
     void setFillAlgorithm(FillAlgorithm a) { fillAlgo_ = a; update(); }
     void setIntensityThreshold(int t)   { intensityThreshold_ = t; }
@@ -28,6 +29,10 @@ public:
     void  zoomIn();
     void  zoomOut();
     void  zoomReset();
+
+    // Qt mouse positions and painting use logical pixels (including HiDPI).
+    QPoint widgetToImage(const QPointF& p) const;
+    QRectF imageRect() const;
 
 signals:
     void maskChanged();   // emitted after any edit so the window can refresh UI
@@ -41,8 +46,6 @@ protected:
     void wheelEvent(QWheelEvent*) override;
 
 private:
-    QPoint widgetToImage(const QPoint& p) const;
-    QRectF imageRect() const;  // where the image is drawn in widget coords
     void rebuildSourceImage();
 
     Document* doc_;
@@ -59,6 +62,11 @@ private:
     float   zoom_ = 1.0f;
     bool    drawing_ = false;
     QPoint  lastImgPt_;
+    QPoint boxStart_;
+    QPointF panOffset_;
+    QPointF lastPanPos_;
+    bool panning_ = false;
+    bool aiPromptErase_ = false;
 };
 
 } // namespace orthoseg

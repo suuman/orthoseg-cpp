@@ -43,14 +43,15 @@ QRectF CanvasWidget::imageRect() const {
     float base = std::min(width() / iw, height() / ih);
     float scale = base * zoom_;
     float dw = iw * scale, dh = ih * scale;
-    return QRectF((width() - dw) / 2.f, (height() - dh) / 2.f, dw, dh);
+    return QRectF((width() - dw) / 2.f + panOffset_.x(),
+                  (height() - dh) / 2.f + panOffset_.y(), dw, dh);
 }
 
-QPoint CanvasWidget::widgetToImage(const QPoint& p) const {
+QPoint CanvasWidget::widgetToImage(const QPointF& p) const {
     QRectF r = imageRect();
     if (r.width() <= 0) return {-1, -1};
-    float fx = (p.x() - r.left()) / r.width() * doc_->width();
-    float fy = (p.y() - r.top()) / r.height() * doc_->height();
+    double fx = (p.x() - r.left()) / r.width() * doc_->width();
+    double fy = (p.y() - r.top()) / r.height() * doc_->height();
     return QPoint(static_cast<int>(std::floor(fx)),
                   static_cast<int>(std::floor(fy)));
 }
@@ -87,6 +88,38 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
     }
     p.drawImage(dst, overlay);
 
+    const auto& ai = doc_->aiFill();
+    if (ai.showResult && !ai.resultMask.empty()) {
+        overlay.fill(Qt::transparent);
+        for (int y = 0; y < ai.resultMask.rows; ++y) {
+            auto* row = reinterpret_cast<QRgb*>(overlay.scanLine(y));
+            const auto* maskRow = ai.resultMask.ptr<uchar>(y);
+            for (int x = 0; x < ai.resultMask.cols; ++x) {
+                if (maskRow[x] == 0) continue;
+                const auto bgr = labelInfo(static_cast<Label>(maskRow[x])).colorBGR;
+                row[x] = qRgba(bgr[2], bgr[1], bgr[0], a);
+            }
+        }
+        p.drawImage(dst, overlay);
+    }
+    if (tool_ == Tool::AIFill && ai.promptType != AIFillPromptType::BoundingBox && !ai.promptMask.empty()) {
+        overlay.fill(Qt::transparent);
+        for (int y = 0; y < ai.promptMask.rows; ++y) {
+            auto* row = reinterpret_cast<QRgb*>(overlay.scanLine(y));
+            const auto* maskRow = ai.promptMask.ptr<uchar>(y);
+            for (int x = 0; x < ai.promptMask.cols; ++x)
+                if (maskRow[x]) row[x] = qRgba(34, 211, 238, 150);
+        }
+        p.drawImage(dst, overlay);
+    }
+    if (tool_ == Tool::AIFill && ai.promptType == AIFillPromptType::BoundingBox && ai.box) {
+        const Box& b = *ai.box;
+        const double sx = dst.width() / doc_->width(), sy = dst.height() / doc_->height();
+        p.setPen(QPen(QColor(250, 204, 21), 2, Qt::DashLine));
+        p.drawRect(QRectF(QPointF(dst.left() + b.x0 * sx, dst.top() + b.y0 * sy),
+                          QPointF(dst.left() + b.x1 * sx, dst.top() + b.y1 * sy)).normalized());
+    }
+
     // Seed overlay: shown while scribbling seeds (Fill tool + a competition
     // algorithm). Drawn opaque so scribbles stand out over the translucent
     // result. Background seeds (id 0, otherwise invisible) use a slate color.
@@ -112,10 +145,29 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
 }
 
 void CanvasWidget::mousePressEvent(QMouseEvent* e) {
+    if (doc_->hasImage() && e->button() == Qt::MiddleButton) {
+        panning_ = true;
+        lastPanPos_ = e->position();
+        return;
+    }
     if (!doc_->hasImage() || e->button() != Qt::LeftButton) return;
-    QPoint ip = widgetToImage(e->pos());
+    QPoint ip = widgetToImage(e->position());
     if (ip.x() < 0 || ip.y() < 0 ||
         ip.x() >= doc_->width() || ip.y() >= doc_->height()) return;
+
+    if (tool_ == Tool::AIFill) {
+        if (doc_->aiFill().promptType == AIFillPromptType::LoadedMask) return;
+        drawing_ = true;
+        if (doc_->aiFill().promptType == AIFillPromptType::BoundingBox) {
+            boxStart_ = ip;
+            doc_->aiFill().box = Box{float(ip.x()), float(ip.y()), float(ip.x()), float(ip.y())};
+        } else {
+            lastImgPt_ = ip;
+            doc_->paintAIPrompt({ip.x(), ip.y()}, {ip.x(), ip.y()}, aiPromptErase_, brushSize_);
+        }
+        update();
+        return;
+    }
 
     if (tool_ == Tool::Fill && isScribbleAlgorithm(fillAlgo_)) {
         // Scribble a seed stroke; the actual segmentation runs on demand.
@@ -148,8 +200,29 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
 }
 
 void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
+    if (panning_) {
+        panOffset_ += e->position() - lastPanPos_;
+        lastPanPos_ = e->position();
+        update();
+        return;
+    }
     if (!drawing_) return;
-    QPoint ip = widgetToImage(e->pos());
+    QPoint ip = widgetToImage(e->position());
+    if (tool_ == Tool::AIFill) {
+        if (doc_->aiFill().promptType == AIFillPromptType::BoundingBox) {
+            ip.setX(std::clamp(ip.x(), 0, doc_->width() - 1));
+            ip.setY(std::clamp(ip.y(), 0, doc_->height() - 1));
+            doc_->aiFill().box = Box{float(std::min(boxStart_.x(), ip.x())),
+                float(std::min(boxStart_.y(), ip.y())), float(std::max(boxStart_.x(), ip.x())),
+                float(std::max(boxStart_.y(), ip.y()))};
+        } else if (doc_->aiFill().promptType == AIFillPromptType::PaintedMask) {
+            doc_->paintAIPrompt({lastImgPt_.x(), lastImgPt_.y()}, {ip.x(), ip.y()},
+                               aiPromptErase_, brushSize_);
+            lastImgPt_ = ip;
+        }
+        update();
+        return;
+    }
     if (tool_ == Tool::Fill && isScribbleAlgorithm(fillAlgo_)) {
         doc_->paintSeedLine(cv::Point(lastImgPt_.x(), lastImgPt_.y()),
                             cv::Point(ip.x(), ip.y()), label_, brushSize_);
@@ -163,8 +236,10 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
 }
 
 void CanvasWidget::mouseReleaseEvent(QMouseEvent* e) {
+    if (e->button() == Qt::MiddleButton) { panning_ = false; return; }
     if (e->button() != Qt::LeftButton) return;
     if (drawing_) {
+        if (tool_ == Tool::AIFill) mouseMoveEvent(e);
         drawing_ = false;
         emit maskChanged();
     }
@@ -177,6 +252,6 @@ void CanvasWidget::wheelEvent(QWheelEvent* e) {
 
 void CanvasWidget::zoomIn()    { zoom_ = std::min(zoom_ + 0.25f, 4.0f);  emit zoomChanged(zoom_); update(); }
 void CanvasWidget::zoomOut()   { zoom_ = std::max(zoom_ - 0.25f, 0.25f); emit zoomChanged(zoom_); update(); }
-void CanvasWidget::zoomReset() { zoom_ = 1.0f; emit zoomChanged(zoom_); update(); }
+void CanvasWidget::zoomReset() { zoom_ = 1.0f; panOffset_ = {}; drawing_ = false; panning_ = false; emit zoomChanged(zoom_); update(); }
 
 } // namespace orthoseg

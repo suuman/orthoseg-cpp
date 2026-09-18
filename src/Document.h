@@ -1,5 +1,6 @@
 #pragma once
 #include "Labels.h"
+#include "AIFill.h"
 #include "SegmentationEngine.h"
 #include <opencv2/core.hpp>
 #include <deque>
@@ -25,6 +26,10 @@ public:
     const cv::Mat& mask() const { return mask_; }
     const cv::Mat& edgeMap() const { return edgeMap_; }
     const cv::Mat& seeds() const { return seeds_; }
+    AIFillState& aiFill() { return aiFill_; }
+    const AIFillState& aiFill() const { return aiFill_; }
+    void applyAIResult(); // Transfer preview foreground into the editable mask, with undo.
+    void paintAIPrompt(cv::Point a, cv::Point b, bool erase, int brushSize);
 
     // Paint a brush stroke segment (thick line) between two points using the
     // given label. Background (id 0) erases.
@@ -69,6 +74,7 @@ private:
     cv::Mat seeds_;        // CV_8UC1 seed layer (label id or kNoSeed)
     cv::Mat edgeMap_;      // CV_8UC1, precomputed once per image
     std::deque<Snapshot> history_;
+    AIFillState aiFill_;
 };
 
 } // namespace orthoseg

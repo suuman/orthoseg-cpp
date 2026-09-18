@@ -12,6 +12,10 @@
 #include <QFrame>
 #include <QButtonGroup>
 #include <QScrollArea>
+#include <QLineEdit>
+#include <QCheckBox>
+#include <opencv2/imgcodecs.hpp>
+#include <stdexcept>
 
 namespace orthoseg {
 
@@ -60,7 +64,31 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     updateSettingsVisibility();
     updateUndoState();
     updateStatus();
+
+    aiController_ = std::make_unique<AIFillController>();
+    connect(aiController_.get(), &AIFillController::completed, this, [this](const cv::Mat& result) {
+        aiRun_->setEnabled(true);
+        aiModels_->setEnabled(true);
+        if (submittedGeneration_ != imageGeneration_) {
+            aiStatus_->setText("Result discarded: image or result was cleared.");
+            return;
+        }
+        doc_->aiFill().resultMask = result;
+        doc_->aiFill().showResult = true;
+        aiShow_->setChecked(true);
+        aiStatus_->setText(cv::countNonZero(result) ? "AI Fill complete. Apply to edit or export."
+                                                  : "AI Fill complete: no foreground found.");
+        canvas_->update();
+    });
+    connect(aiController_.get(), &AIFillController::failed, this, [this](const QString& error) {
+        aiRun_->setEnabled(true);
+        aiModels_->setEnabled(true);
+        aiStatus_->setText("AI Fill failed.");
+        QMessageBox::warning(this, "AI Fill", error);
+    });
 }
+
+MainWindow::~MainWindow() = default;
 
 QWidget* MainWindow::buildSidebar() {
     // The controls live on an inner widget inside a scroll area so that when
@@ -116,9 +144,9 @@ QWidget* MainWindow::buildSidebar() {
     v->addWidget(sectionLabel("Toolbox"));
     auto* toolRow = new QHBoxLayout;
     toolRow->setSpacing(8);
-    const char* toolNames[3] = {"Brush", "Fill", "Eraser"};
-    const char* toolIcons[3] = {"🖌", "🪣", "🧽"};
-    for (int i = 0; i < 3; ++i) {
+    const char* toolNames[4] = {"Brush", "Fill", "Eraser", "AI Fill"};
+    const char* toolIcons[4] = {"🖌", "🪣", "🧽", "AI"};
+    for (int i = 0; i < 4; ++i) {
         Tool tid = static_cast<Tool>(i);
         auto* btn = new QPushButton(QString("%1\n%2").arg(toolIcons[i], toolNames[i]));
         btn->setCheckable(true);
@@ -295,6 +323,8 @@ QWidget* MainWindow::buildSidebar() {
         fl->addWidget(seedPanel_);
     }
     v->addWidget(fillPanel_);
+    aiPanel_ = buildAIPanel();
+    v->addWidget(aiPanel_);
 
     // --- Opacity (global) ---
     {
@@ -420,6 +450,146 @@ QWidget* MainWindow::buildTopBar() {
     return bar;
 }
 
+QWidget* MainWindow::buildAIPanel() {
+    auto* panel = new QWidget;
+    panel->setStyleSheet(
+        "QPushButton, QComboBox, QLineEdit{ background:#1e293b; color:#cbd5e1;"
+        " border:1px solid #334155; border-radius:8px; padding:6px; font-size:11px; }"
+        "QPushButton:hover{ background:#334155; }"
+        "QPushButton:disabled, QLineEdit:disabled{ color:#64748b; }"
+        "QLabel, QCheckBox{ font-size:11px; }");
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(8);
+    layout->addWidget(sectionLabel("AI Fill · Prompt Type"));
+    aiPromptCombo_ = new QComboBox;
+    aiPromptCombo_->setObjectName("aiPromptType");
+    aiPromptCombo_->addItem("Bounding Box");
+    aiPromptCombo_->addItem("Paint Mask");
+    aiPromptCombo_->addItem("Load Mask");
+    connect(aiPromptCombo_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        doc_->aiFill().promptType = static_cast<AIFillPromptType>(index);
+        canvas_->setActiveTool(activeTool_);
+        updateSettingsVisibility();
+    });
+    layout->addWidget(aiPromptCombo_);
+    auto* hint = new QLabel("Select Femur or Tibia above. Drag to draw a box or paint a prompt. "
+                           "Use the wheel to zoom and middle-drag to pan.");
+    hint->setWordWrap(true);
+    hint->setMinimumHeight(64);
+    layout->addWidget(hint);
+    aiErase_ = new QCheckBox("Erase Prompt (unchecked = brush)");
+    connect(aiErase_, &QCheckBox::toggled, canvas_, &CanvasWidget::setAIPromptErase);
+    layout->addWidget(aiErase_);
+    aiLoadMask_ = new QPushButton("Load Prompt Mask");
+    connect(aiLoadMask_, &QPushButton::clicked, this, &MainWindow::onLoadPromptMask);
+    layout->addWidget(aiLoadMask_);
+    auto* clear = new QPushButton("Clear Prompt");
+    connect(clear, &QPushButton::clicked, this, [this] {
+        doc_->aiFill().box.reset();
+        doc_->aiFill().promptMask.release();
+        canvas_->setActiveTool(activeTool_);
+    });
+    layout->addWidget(clear);
+    layout->addWidget(sectionLabel("MedSAM2 Model Directory"));
+    aiModels_ = new QLineEdit(qEnvironmentVariable("MEDSAM2_MODEL_DIR", ORTHOSEG_MODEL_DIR));
+    aiModels_->setObjectName("aiModelDirectory");
+    aiModels_->setToolTip("Directory containing medsam2_image_encoder.onnx and medsam2_mask_decoder.onnx");
+    layout->addWidget(aiModels_);
+    auto* browse = new QPushButton("Choose Model Directory");
+    connect(browse, &QPushButton::clicked, this, [this] {
+        if (aiController_->running()) return;
+        const auto dir = QFileDialog::getExistingDirectory(this, "MedSAM2 Models", aiModels_->text());
+        if (!dir.isEmpty()) aiModels_->setText(dir);
+    });
+    layout->addWidget(browse);
+    aiRun_ = new QPushButton("Run AI Fill");
+    aiRun_->setObjectName("runAIFill");
+    connect(aiRun_, &QPushButton::clicked, this, &MainWindow::onRunAIFill);
+    layout->addWidget(aiRun_);
+    aiStatus_ = new QLabel("Ready. CUDA required.");
+    aiStatus_->setObjectName("aiStatus");
+    aiStatus_->setWordWrap(true);
+    aiStatus_->setMinimumHeight(42);
+    layout->addWidget(aiStatus_);
+    aiShow_ = new QCheckBox("Show AI segmentation");
+    aiShow_->setChecked(true);
+    connect(aiShow_, &QCheckBox::toggled, this, [this](bool show) {
+        doc_->aiFill().showResult = show;
+        canvas_->update();
+    });
+    layout->addWidget(aiShow_);
+    auto* clearResult = new QPushButton("Clear AI Segmentation");
+    connect(clearResult, &QPushButton::clicked, this, [this] {
+        ++imageGeneration_; // Also invalidate any pending result.
+        doc_->aiFill().resultMask.release();
+        canvas_->update();
+    });
+    layout->addWidget(clearResult);
+    auto* apply = new QPushButton("Apply AI Result to Mask");
+    apply->setToolTip("Copy the preview foreground into the editable mask, with undo. Apply before export.");
+    connect(apply, &QPushButton::clicked, this, [this] {
+        doc_->applyAIResult();
+        canvas_->update();
+        updateUndoState();
+    });
+    layout->addWidget(apply);
+    return panel;
+}
+
+void MainWindow::onRunAIFill() {
+    if (aiController_->running()) return;
+    try {
+        const auto& ai = doc_->aiFill();
+        AIFillRequest request;
+        request.imageBGR = doc_->sourceColor();
+        request.target = activeLabel_;
+        request.type = ai.promptType;
+        request.box = ai.box;
+        if (request.type != AIFillPromptType::BoundingBox)
+            request.promptMask = ai.promptMask.clone();
+        request.modelDirectory = aiModels_->text().toStdString();
+        // Cheap input checks happen here; prompt tensor preparation stays in the worker.
+        if (!doc_->hasImage()) throw std::runtime_error("Load an image first.");
+        if (activeLabel_ != Label::Femur && activeLabel_ != Label::Tibia)
+            throw std::runtime_error("Select Femur or Tibia under Select Anatomy.");
+        if (request.type == AIFillPromptType::BoundingBox) {
+            if (!request.box) throw std::runtime_error("Draw a bounding box first.");
+            request.box = validatedBox(*request.box, request.imageBGR.size());
+        } else if (request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0) {
+            throw std::runtime_error("Paint or load a non-empty prompt mask first.");
+        }
+        submittedGeneration_ = imageGeneration_;
+        aiController_->run(std::move(request));
+        aiRun_->setEnabled(false);
+        aiModels_->setEnabled(false);
+        aiStatus_->setText("Running AI Fill… Loading models on first use.");
+    } catch (const std::exception& error) {
+        QMessageBox::warning(this, "AI Fill", QString::fromUtf8(error.what()));
+    }
+}
+
+void MainWindow::onLoadPromptMask() {
+    if (!doc_->hasImage()) {
+        QMessageBox::information(this, "AI Fill", "Load an image first.");
+        return;
+    }
+    const auto path = QFileDialog::getOpenFileName(this, "Load Prompt Mask", {},
+        "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)");
+    if (path.isEmpty()) return;
+    try {
+        // Preserve bit depth: a 16-bit label value of 1 is foreground, not zero.
+        cv::Mat raw = cv::imread(path.toStdString(), cv::IMREAD_UNCHANGED);
+        cv::Mat binary = binaryPromptMask(raw, doc_->sourceColor().size());
+        doc_->aiFill().promptMask = std::move(binary);
+        aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::LoadedMask));
+        aiStatus_->setText("Prompt loaded: nonzero pixels mark the selected anatomy.");
+        canvas_->update();
+    } catch (const std::exception& error) {
+        QMessageBox::warning(this, "AI Fill", QString::fromUtf8(error.what()));
+    }
+}
+
 void MainWindow::showFillAlgorithm(int comboIndex) {
     selectTool(Tool::Fill);
     algoCombo_->setCurrentIndex(comboIndex);
@@ -436,7 +606,7 @@ void MainWindow::selectLabel(Label l) {
 void MainWindow::selectTool(Tool t) {
     activeTool_ = t;
     canvas_->setActiveTool(t);
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 4; ++i)
         static_cast<QPushButton*>(toolButtons_[i])
             ->setChecked(i == static_cast<int>(t));
     updateSettingsVisibility();
@@ -444,7 +614,12 @@ void MainWindow::selectTool(Tool t) {
 
 void MainWindow::updateSettingsVisibility() {
     bool isFill = (activeTool_ == Tool::Fill);
-    brushPanel_->setVisible(!isFill);
+    bool isAI = (activeTool_ == Tool::AIFill);
+    aiPanel_->setVisible(isAI);
+    bool isPaint = isAI && doc_->aiFill().promptType == AIFillPromptType::PaintedMask;
+    aiErase_->setVisible(isPaint);
+    aiLoadMask_->setVisible(isAI && doc_->aiFill().promptType == AIFillPromptType::LoadedMask);
+    brushPanel_->setVisible((!isFill && !isAI) || isPaint);
     fillPanel_->setVisible(isFill);
     if (!isFill || !algoCombo_) return;
 
@@ -490,6 +665,9 @@ void MainWindow::onUpload() {
         return;
     }
     canvas_->zoomReset();
+    ++imageGeneration_;
+    aiPromptCombo_->setCurrentIndex(0);
+    aiShow_->setChecked(true);
     canvas_->refresh();
     updateUndoState();
     updateStatus();
@@ -516,6 +694,10 @@ void MainWindow::onClear() {
     doc_->pushHistory();
     doc_->clearMask();
     doc_->clearSeeds();
+    ++imageGeneration_;
+    doc_->aiFill().box.reset();
+    doc_->aiFill().promptMask.release();
+    doc_->aiFill().resultMask.release();
     canvas_->update();
     updateUndoState();
 }
