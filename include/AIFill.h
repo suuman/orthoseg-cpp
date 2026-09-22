@@ -3,21 +3,28 @@
 #include "image_utils.h"
 #include <optional>
 
+#include <vector>
+
 namespace orthoseg {
 
-enum class AIFillPromptType { BoundingBox, PaintedMask, LoadedMask };
+enum class AIFillPromptType { BoundingBox, PaintedMask, LoadedMask, NormalFillMask };
 
 struct AIFillState {
     AIFillPromptType promptType = AIFillPromptType::BoundingBox;
-    std::optional<Box> box;
+    std::optional<Box> box;       // Active/most-recent box (maintained for backward compatibility & tests)
+    std::optional<Box> femurBox;  // Bounding box for Femur (class 1, red)
+    std::optional<Box> tibiaBox;  // Bounding box for Tibia (class 2, green)
     cv::Mat promptMask; // Source-resolution binary 0/255, separate from annotations.
     cv::Mat resultMask; // Source-resolution indexed labels.
     bool showResult = true;
+    bool showPrompt = true;
 };
 
 // Uses ocv's inclusive pixel-center convention, bounded by width/height - 1.
 Box validatedBox(Box box, cv::Size size);
 cv::Mat binaryPromptMask(const cv::Mat& mask, cv::Size size);
 void validateAIResult(const cv::Mat& mask, cv::Size size, Label target);
+void validateAIResult(const cv::Mat& mask, cv::Size size, const std::vector<int>& allowedClasses);
 
 } // namespace orthoseg
+

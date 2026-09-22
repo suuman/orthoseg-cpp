@@ -2,9 +2,10 @@
 set -e
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${HERE}/build"
+ROOT_DIR="$(cd "${HERE}/.." && pwd)"
+BUILD_DIR="${ROOT_DIR}/build"
 BIN="${BUILD_DIR}/medsam2_ocv_infer"
-MODELS_DIR="${HERE}/models"
+MODELS_DIR="${ROOT_DIR}/models"
 
 IMAGE="/home/suman/plai/xraydata/Dataset101_PNG2D/imagesTr/XR00375104.png"
 PROMPT_MASK="/home/suman/plai/xraydata/Dataset101_PNG2D/labelsTr/XR00375104.png"
@@ -18,17 +19,18 @@ if [ ! -f "${MODELS_DIR}/medsam2_image_encoder.onnx" ] || [ ! -f "${MODELS_DIR}/
     if [ -f "${VENV_DIR}/bin/activate" ]; then
         source "${VENV_DIR}/bin/activate"
     fi
-    python3 "${HERE}/export_onnx.py"
+    python3 "${HERE}/export_onnx.py" --out_dir "${MODELS_DIR}"
 fi
 
 # 2. Build executable if missing
 if [ ! -f "${BIN}" ]; then
-    echo "[run_infer.sh] Compiling OpenCV 5 + CUDA C++ executable..."
+    echo "[run_infer.sh] Compiling medsam2_ocv_infer executable..."
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
-    cmake .. \
+    cmake "${ROOT_DIR}" \
+        -DCMAKE_BUILD_TYPE=Release \
         -DOpenCV_DIR=/home/suman/soft/opencv/install_new/lib/cmake/opencv5
-    cmake --build . -j4
+    cmake --build . --target medsam2_ocv_infer -j4
     cd "${HERE}"
 fi
 

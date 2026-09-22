@@ -38,11 +38,19 @@ cv::Mat binaryPromptMask(const cv::Mat& mask, cv::Size size) {
     return binary;
 }
 
-void validateAIResult(const cv::Mat& mask, cv::Size size, Label target) {
+void validateAIResult(const cv::Mat& mask, cv::Size size, const std::vector<int>& allowedClasses) {
     if (mask.empty() || mask.dims != 2 || mask.type() != CV_8UC1 || mask.size() != size)
         throw std::runtime_error("MedSAM2 returned an incompatible result mask.");
-    if (cv::countNonZero((mask != 0) & (mask != static_cast<int>(target))) != 0)
+    cv::Mat unexpected = (mask != 0);
+    for (int c : allowedClasses) {
+        unexpected &= (mask != c);
+    }
+    if (cv::countNonZero(unexpected) != 0)
         throw std::runtime_error("MedSAM2 returned unexpected anatomy labels.");
+}
+
+void validateAIResult(const cv::Mat& mask, cv::Size size, Label target) {
+    validateAIResult(mask, size, std::vector<int>{static_cast<int>(target)});
 }
 
 } // namespace orthoseg

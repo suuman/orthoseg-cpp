@@ -2,6 +2,7 @@
 #include <QPainter>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
 
@@ -14,15 +15,58 @@ CanvasWidget::CanvasWidget(Document* doc, QWidget* parent)
     setMinimumSize(400, 400);
 }
 
+void CanvasWidget::setClaheEnabled(bool enabled) {
+    if (claheEnabled_ != enabled) {
+        claheEnabled_ = enabled;
+        rebuildSourceImage();
+        update();
+    }
+}
+
+void CanvasWidget::setClaheParams(double clipLimit, int gridSize) {
+    claheClipLimit_ = std::max(0.1, clipLimit);
+    claheGridSize_ = std::max(1, gridSize);
+    if (claheEnabled_) {
+        rebuildSourceImage();
+        update();
+    }
+}
+
 void CanvasWidget::rebuildSourceImage() {
     const cv::Mat& c = doc_->sourceColor();
     if (c.empty()) { sourceQt_ = QImage(); return; }
+
+    cv::Mat displayMat;
+    if (claheEnabled_) {
+        try {
+            int gx = std::max(1, std::min(claheGridSize_, c.cols));
+            int gy = std::max(1, std::min(claheGridSize_, c.rows));
+            auto clahe = cv::createCLAHE(claheClipLimit_, cv::Size(gx, gy));
+            if (c.channels() == 1) {
+                clahe->apply(c, displayMat);
+                cv::cvtColor(displayMat, displayMat, cv::COLOR_GRAY2BGR);
+            } else {
+                cv::Mat lab;
+                cv::cvtColor(c, lab, cv::COLOR_BGR2Lab);
+                std::vector<cv::Mat> channels;
+                cv::split(lab, channels);
+                clahe->apply(channels[0], channels[0]);
+                cv::merge(channels, lab);
+                cv::cvtColor(lab, displayMat, cv::COLOR_Lab2BGR);
+            }
+        } catch (const cv::Exception&) {
+            displayMat = c;
+        }
+    } else {
+        displayMat = c;
+    }
+
     // OpenCV is BGR; QImage::Format_RGB888 expects RGB. Copy with swap.
-    QImage img(c.cols, c.rows, QImage::Format_RGB888);
-    for (int y = 0; y < c.rows; ++y) {
-        const cv::Vec3b* srow = c.ptr<cv::Vec3b>(y);
+    QImage img(displayMat.cols, displayMat.rows, QImage::Format_RGB888);
+    for (int y = 0; y < displayMat.rows; ++y) {
+        const cv::Vec3b* srow = displayMat.ptr<cv::Vec3b>(y);
         uchar* drow = img.scanLine(y);
-        for (int x = 0; x < c.cols; ++x) {
+        for (int x = 0; x < displayMat.cols; ++x) {
             drow[x * 3 + 0] = srow[x][2];
             drow[x * 3 + 1] = srow[x][1];
             drow[x * 3 + 2] = srow[x][0];
@@ -95,29 +139,75 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
             auto* row = reinterpret_cast<QRgb*>(overlay.scanLine(y));
             const auto* maskRow = ai.resultMask.ptr<uchar>(y);
             for (int x = 0; x < ai.resultMask.cols; ++x) {
-                if (maskRow[x] == 0) continue;
-                const auto bgr = labelInfo(static_cast<Label>(maskRow[x])).colorBGR;
+                uchar val = maskRow[x];
+                if (val == 0) continue;
+                cv::Vec3b bgr;
+                if (val == 1 || val == 2 || val == 3) {
+                    bgr = labelInfo(static_cast<Label>(val)).colorBGR;
+                } else {
+                    bgr = labelInfo(label_).colorBGR;
+                }
                 row[x] = qRgba(bgr[2], bgr[1], bgr[0], a);
             }
         }
         p.drawImage(dst, overlay);
     }
-    if (tool_ == Tool::AIFill && ai.promptType != AIFillPromptType::BoundingBox && !ai.promptMask.empty()) {
+    if (tool_ == Tool::AIFill && ai.showPrompt && ai.promptType != AIFillPromptType::BoundingBox && !ai.promptMask.empty()) {
         overlay.fill(Qt::transparent);
+        const cv::Vec3b activeBgr = labelInfo(label_).colorBGR;
         for (int y = 0; y < ai.promptMask.rows; ++y) {
             auto* row = reinterpret_cast<QRgb*>(overlay.scanLine(y));
             const auto* maskRow = ai.promptMask.ptr<uchar>(y);
-            for (int x = 0; x < ai.promptMask.cols; ++x)
-                if (maskRow[x]) row[x] = qRgba(34, 211, 238, 150);
+            for (int x = 0; x < ai.promptMask.cols; ++x) {
+                uchar val = maskRow[x];
+                if (val == 0) continue;
+                if (val == 1 || val == 2 || val == 3) {
+                    const auto bgr = labelInfo(static_cast<Label>(val)).colorBGR;
+                    row[x] = qRgba(bgr[2], bgr[1], bgr[0], a);
+                } else {
+                    row[x] = qRgba(activeBgr[2], activeBgr[1], activeBgr[0], a);
+                }
+            }
         }
         p.drawImage(dst, overlay);
     }
-    if (tool_ == Tool::AIFill && ai.promptType == AIFillPromptType::BoundingBox && ai.box) {
-        const Box& b = *ai.box;
+    if (tool_ == Tool::AIFill && ai.showPrompt && ai.promptType == AIFillPromptType::BoundingBox) {
         const double sx = dst.width() / doc_->width(), sy = dst.height() / doc_->height();
-        p.setPen(QPen(QColor(250, 204, 21), 2, Qt::DashLine));
-        p.drawRect(QRectF(QPointF(dst.left() + b.x0 * sx, dst.top() + b.y0 * sy),
-                          QPointF(dst.left() + b.x1 * sx, dst.top() + b.y1 * sy)).normalized());
+
+        auto drawBoxWithBadge = [&](const Box& b, const QColor& color, const QString& badge) {
+            QRectF br(QPointF(dst.left() + b.x0 * sx, dst.top() + b.y0 * sy),
+                      QPointF(dst.left() + b.x1 * sx, dst.top() + b.y1 * sy));
+            br = br.normalized();
+            p.setPen(QPen(color, 2, Qt::SolidLine));
+            p.setBrush(QColor(0x22, 0xc5, 0x5e, 70)); // Prominent green fill for AI Fill box
+            p.drawRect(br);
+
+            QFont f = p.font();
+            f.setPointSize(9);
+            f.setBold(true);
+            p.setFont(f);
+            QFontMetrics fm(f);
+            int bw = fm.horizontalAdvance(badge) + 8;
+            int bh = fm.height() + 4;
+            QRect badgeRect(static_cast<int>(br.left()),
+                            static_cast<int>(std::max(dst.top(), br.top() - bh)),
+                            bw, bh);
+            p.fillRect(badgeRect, color);
+            p.setPen(Qt::white);
+            p.drawText(badgeRect, Qt::AlignCenter, badge);
+        };
+
+        if (ai.femurBox) {
+            drawBoxWithBadge(*ai.femurBox, QColor(0xef, 0x44, 0x44), "Femur");
+        }
+        if (ai.tibiaBox) {
+            drawBoxWithBadge(*ai.tibiaBox, QColor(0x22, 0xc5, 0x5e), "Tibia");
+        }
+        if (!ai.femurBox && !ai.tibiaBox && ai.box) {
+            QColor col = (label_ == Label::Tibia) ? QColor(0x22, 0xc5, 0x5e) : QColor(0xef, 0x44, 0x44);
+            QString name = (label_ == Label::Tibia) ? "Tibia" : "Femur";
+            drawBoxWithBadge(*ai.box, col, name);
+        }
     }
 
     // Seed overlay: shown while scribbling seeds (Fill tool + a competition
@@ -156,17 +246,39 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
         ip.x() >= doc_->width() || ip.y() >= doc_->height()) return;
 
     if (tool_ == Tool::AIFill) {
-        if (doc_->aiFill().promptType == AIFillPromptType::LoadedMask) return;
+        if (doc_->aiFill().promptType == AIFillPromptType::LoadedMask ||
+            doc_->aiFill().promptType == AIFillPromptType::NormalFillMask) return;
         drawing_ = true;
+        doc_->aiFill().showPrompt = true;
         if (doc_->aiFill().promptType == AIFillPromptType::BoundingBox) {
             boxStart_ = ip;
-            doc_->aiFill().box = Box{float(ip.x()), float(ip.y()), float(ip.x()), float(ip.y())};
+            Box b{float(ip.x()), float(ip.y()), float(ip.x()), float(ip.y())};
+            doc_->aiFill().box = b;
+            if (label_ == Label::Femur) {
+                doc_->aiFill().femurBox = b;
+            } else if (label_ == Label::Tibia) {
+                doc_->aiFill().tibiaBox = b;
+            } else {
+                doc_->aiFill().femurBox = b;
+            }
         } else {
+            // When editing paint prompt, if promptMask is empty and AI resultMask exists,
+            // initialize promptMask with resultMask so edits directly modify the AI mask!
+            if (doc_->aiFill().promptMask.empty() && !doc_->aiFill().resultMask.empty()) {
+                doc_->aiFill().promptMask = doc_->aiFill().resultMask.clone();
+            }
             lastImgPt_ = ip;
             doc_->paintAIPrompt({ip.x(), ip.y()}, {ip.x(), ip.y()}, aiPromptErase_, brushSize_);
         }
         update();
         return;
+    }
+
+    // If an AI result mask exists and user begins editing with Brush, Eraser, or Fill,
+    // automatically apply AI result into doc_->mask() so user edits the actual AI mask!
+    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser || tool_ == Tool::Fill) &&
+        !doc_->aiFill().resultMask.empty()) {
+        doc_->applyAIResult();
     }
 
     if (tool_ == Tool::Fill && isScribbleAlgorithm(fillAlgo_)) {
@@ -212,9 +324,18 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
         if (doc_->aiFill().promptType == AIFillPromptType::BoundingBox) {
             ip.setX(std::clamp(ip.x(), 0, doc_->width() - 1));
             ip.setY(std::clamp(ip.y(), 0, doc_->height() - 1));
-            doc_->aiFill().box = Box{float(std::min(boxStart_.x(), ip.x())),
-                float(std::min(boxStart_.y(), ip.y())), float(std::max(boxStart_.x(), ip.x())),
-                float(std::max(boxStart_.y(), ip.y()))};
+            Box b{float(std::min(boxStart_.x(), ip.x())),
+                  float(std::min(boxStart_.y(), ip.y())),
+                  float(std::max(boxStart_.x(), ip.x())),
+                  float(std::max(boxStart_.y(), ip.y()))};
+            doc_->aiFill().box = b;
+            if (label_ == Label::Femur) {
+                doc_->aiFill().femurBox = b;
+            } else if (label_ == Label::Tibia) {
+                doc_->aiFill().tibiaBox = b;
+            } else {
+                doc_->aiFill().femurBox = b;
+            }
         } else if (doc_->aiFill().promptType == AIFillPromptType::PaintedMask) {
             doc_->paintAIPrompt({lastImgPt_.x(), lastImgPt_.y()}, {ip.x(), ip.y()},
                                aiPromptErase_, brushSize_);

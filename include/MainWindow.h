@@ -24,6 +24,10 @@ public:
 
     // Test/screenshot hook: switch to the Fill tool with the given algorithm.
     void showFillAlgorithm(int comboIndex);
+    Document* document() const { return doc_.get(); }
+    CanvasWidget* canvas() const { return canvas_; }
+    QCheckBox* claheCheckBox() const { return claheCheck_; }
+    QDialog* claheDialog() const { return claheDialog_; }
 
 private slots:
     void onUpload();
@@ -34,6 +38,8 @@ private slots:
     void onClearSeeds();
     void onRunAIFill();
     void onLoadPromptMask();
+    void onOpenModelDirDialog();
+    void onOpenClaheDialog();
     void selectLabel(Label l);
     void selectTool(Tool t);
 
@@ -44,6 +50,7 @@ private:
     void updateSettingsVisibility();
     void updateUndoState();
     void updateStatus();
+    void updateAIPromptStatus();
 
     std::unique_ptr<Document> doc_;
     CanvasWidget* canvas_ = nullptr;
@@ -54,11 +61,26 @@ private:
     QWidget* aiPanel_ = nullptr;
     QComboBox* aiPromptCombo_ = nullptr;
     QLineEdit* aiModels_ = nullptr;
+    QPushButton* modelDirBtn_ = nullptr;
+    QCheckBox* claheCheck_ = nullptr;
+    QPushButton* claheSettingsBtn_ = nullptr;
+    QDialog* claheDialog_ = nullptr;
     QLabel* aiStatus_ = nullptr;
+    QLabel* aiPromptHint_ = nullptr;
     QPushButton* aiRun_ = nullptr;
     QCheckBox* aiShow_ = nullptr;
+    QCheckBox* aiShowPrompt_ = nullptr;
     QCheckBox* aiErase_ = nullptr;
     QPushButton* aiLoadMask_ = nullptr;
+    QPushButton* useResultAsPromptBtn_ = nullptr;
+    QWidget* aiBoxControls_ = nullptr;
+    QLabel* femurBoxStatus_ = nullptr;
+    QPushButton* clearFemurBoxBtn_ = nullptr;
+    QLabel* tibiaBoxStatus_ = nullptr;
+    QPushButton* clearTibiaBoxBtn_ = nullptr;
+    QWidget* normalMaskControls_ = nullptr;
+    QLabel* normalMaskStatus_ = nullptr;
+    QPushButton* copyNormalMaskBtn_ = nullptr;
     std::unique_ptr<AIFillController> aiController_;
     unsigned long imageGeneration_ = 0;
     unsigned long submittedGeneration_ = 0;

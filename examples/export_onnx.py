@@ -50,8 +50,8 @@ def parse_args():
     )
     parser.add_argument(
         "--out_dir",
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
-        help="Output directory for exported .onnx models (default: ocv/models/)",
+        default=os.path.join(ROOT_DIR, "models"),
+        help="Output directory for exported .onnx models (default: models/)",
     )
     parser.add_argument(
         "--device",

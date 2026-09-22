@@ -23,6 +23,13 @@ public:
     void setIntensityThreshold(int t)   { intensityThreshold_ = t; }
     void setEdgePenaltyThreshold(int t) { edgePenalty_ = t; }
 
+    bool claheEnabled() const           { return claheEnabled_; }
+    void setClaheEnabled(bool enabled);
+    double claheClipLimit() const       { return claheClipLimit_; }
+    int claheGridSize() const           { return claheGridSize_; }
+    void setClaheParams(double clipLimit, int gridSize);
+    const QImage& displayImage() const  { return sourceQt_; }
+
     void refresh();  // rebuild cached QImages from the Document and repaint
 
     float zoom() const { return zoom_; }
@@ -67,6 +74,10 @@ private:
     QPointF lastPanPos_;
     bool panning_ = false;
     bool aiPromptErase_ = false;
+
+    bool   claheEnabled_   = false;
+    double claheClipLimit_ = 2.0;
+    int    claheGridSize_  = 8;
 };
 
 } // namespace orthoseg

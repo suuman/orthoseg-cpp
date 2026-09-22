@@ -137,7 +137,7 @@ pixels are retained. Foreground pixels can overwrite another label.
      can add foreground pixels, so lossless formats are preferable.
 3. Set **MedSAM2 Model Directory** to a directory containing
    `medsam2_image_encoder.onnx` and `medsam2_mask_decoder.onnx`. The default is this
-   checkout's `ocv/models`; `MEDSAM2_MODEL_DIR` can override it at launch.
+   checkout's `models`; `MEDSAM2_MODEL_DIR` can override it at launch.
 4. Click **Run AI Fill**. Status reports loading/inference, duplicate requests are
    disabled, and the viewer remains interactive. First use loads the models on a
    persistent worker thread; subsequent runs reuse them. Changing model directory
@@ -186,7 +186,7 @@ on that worker, with errors delivered through the existing message-box mechanism
 CUDA absence is reported explicitly; AI Fill does not silently fall back to CPU.
 Closing during inference waits for the current CUDA call to finish safely.
 
-To build with the CUDA-enabled OpenCV installation used by `ocv/run_infer.sh` on
+To build with the CUDA-enabled OpenCV installation used by `examples/run_infer.sh` on
 this machine (no OpenCV/CUDA version change is needed):
 
 ```bash
@@ -194,12 +194,12 @@ cmake -S . -B build/cuda -DCMAKE_BUILD_TYPE=Release \
   -DOpenCV_DIR=/home/suman/soft/opencv/install_new/lib/cmake/opencv5
 cmake --build build/cuda --parallel 4
 ctest --test-dir build/cuda --output-on-failure
-MEDSAM2_MODEL_DIR="$PWD/ocv/models" ./build/cuda/orthoseg
+MEDSAM2_MODEL_DIR="$PWD/models" ./build/cuda/orthoseg
 ```
 
 On another machine, set `OpenCV_DIR` to its CUDA-enabled OpenCV CMake directory.
 The default build commands above remain supported, but AI Fill reports an error
-if that OpenCV build has no CUDA DNN target. See `ocv/README.md` for the existing
+if that OpenCV build has no CUDA DNN target. See `examples/README.md` for the existing
 model export and standalone inference instructions.
 
 For manual acceptance, run each of the three prompt workflows above on an X-ray,
@@ -286,17 +286,15 @@ high-bit-depth image values are not preserved by the current loader.
 
 | Path | Responsibility |
 | --- | --- |
-| [`CMakeLists.txt`](CMakeLists.txt) | Defines the `orthoseg_core` library, `orthoseg` application, and `test_seg` executable. |
-| [`src/Labels.h`](src/Labels.h) | Anatomy IDs, tools, algorithm enums, and BGR label colors. |
-| [`src/SegmentationEngine.cpp`](src/SegmentationEngine.cpp) / [header](src/SegmentationEngine.h) | OpenCV-only edge map and all six segmentation algorithms. |
-| [`src/Document.cpp`](src/Document.cpp) / [header](src/Document.h) | Image loading, indexed mask, seeds, undo history, segmentation execution, and export; independent of Qt. |
-| [`src/CanvasWidget.cpp`](src/CanvasWidget.cpp) / [header](src/CanvasWidget.h) | Image and overlay rendering, mouse gestures, and zoom. |
-| [`src/MainWindow.cpp`](src/MainWindow.cpp) / [header](src/MainWindow.h) | Sidebar, toolbar, file dialogs, and seed validation. |
-| [`src/main.cpp`](src/main.cpp) | Application entry point, dark theme, and screenshot arguments. |
+| [`CMakeLists.txt`](CMakeLists.txt) | Unified CMake configuration defining the libraries (`medsam2_ocv`, `orthoseg_core`, `orthoseg_ai`), executables (`orthoseg`, `medsam2_ocv_infer`), and test suites. |
+| [`include/`](include/) | All header files: labels ([`Labels.h`](include/Labels.h)), document ([`Document.h`](include/Document.h)), algorithms ([`SegmentationEngine.h`](include/SegmentationEngine.h)), AI inference ([`MedSAM2Inference.h`](include/MedSAM2Inference.h), [`medsam2_ocv.h`](include/medsam2_ocv.h)), and UI widgets. |
+| [`src/`](src/) | All C++ implementation files: GUI application entry ([`main.cpp`](src/main.cpp)), canvas ([`CanvasWidget.cpp`](src/CanvasWidget.cpp)), window ([`MainWindow.cpp`](src/MainWindow.cpp)), document ([`Document.cpp`](src/Document.cpp)), segmentation core ([`SegmentationEngine.cpp`](src/SegmentationEngine.cpp)), and MedSAM2 inference ([`MedSAM2Inference.cpp`](src/MedSAM2Inference.cpp), [`medsam2_ocv.cpp`](src/medsam2_ocv.cpp)). |
+| [`models/`](models/) | Standalone ONNX models (`medsam2_image_encoder.onnx`, `medsam2_mask_decoder.onnx`). |
+| [`examples/`](examples/) | Standalone CLI inference tool ([`medsam2_main.cpp`](examples/medsam2_main.cpp)), runner script ([`run_infer.sh`](examples/run_infer.sh)), exporter ([`export_onnx.py`](examples/export_onnx.py)), and standalone guide. |
 | [`tests/test_seg.cpp`](tests/test_seg.cpp) | Headless checks for the segmentation engine. |
 | [`tests/test_document.cpp`](tests/test_document.cpp) | Regression checks for image I/O, segmentation resizing, validation, and undo. |
 | [`tests/test_ui.cpp`](tests/test_ui.cpp) | Offscreen Qt checks for controls, repainting, and file dialogs. |
-| [`example/`](example/) | React/TypeScript web reference using Vite and Tailwind CSS. |
+| [`tests/test_ai.cpp`](tests/test_ai.cpp) | Prompt adapter, box/mask validation, and AI worker tests. |
 
 ### Capture the UI without a display
 

@@ -71,6 +71,44 @@ int main(int argc, char** argv) {
     CHECK(prompt.has_mask && cv::norm(prompt.mask_logits, expected, cv::NORM_INF) == 0,
           "loaded and painted prompts share the same ocv mask path");
 
+    // Dual bounding box prompt preparation (Femur + Tibia)
+    AIFillRequest dualBoxReq;
+    dualBoxReq.imageBGR = cv::Mat(size, CV_8UC3, cv::Scalar(20, 40, 80));
+    dualBoxReq.type = AIFillPromptType::BoundingBox;
+    dualBoxReq.femurBox = Box{10, 15, 60, 90};
+    dualBoxReq.tibiaBox = Box{12, 100, 55, 180};
+    auto dualPrompts = MedSAM2Inference::preparePrompts(dualBoxReq);
+    CHECK(dualPrompts.size() == 2, "dual bounding box creates 2 prompts");
+    CHECK(dualPrompts[0].class_id == 1 && dualPrompts[0].box.x0 == 10 && dualPrompts[0].box.y1 == 90,
+          "femur bounding box is prompt 0");
+    CHECK(dualPrompts[1].class_id == 2 && dualPrompts[1].box.x0 == 12 && dualPrompts[1].box.y1 == 180,
+          "tibia bounding box is prompt 1");
+
+    // Normal fill mask prompt preparation (multi-class 1 and 2 from annotation mask)
+    cv::Mat normalMask = cv::Mat::zeros(size, CV_8UC1);
+    normalMask(cv::Rect(15, 20, 40, 50)).setTo(1); // Femur region
+    normalMask(cv::Rect(20, 110, 35, 60)).setTo(2); // Tibia region
+    AIFillRequest normalMaskReq;
+    normalMaskReq.imageBGR = dualBoxReq.imageBGR;
+    normalMaskReq.type = AIFillPromptType::NormalFillMask;
+    normalMaskReq.promptMask = normalMask;
+    auto normalPrompts = MedSAM2Inference::preparePrompts(normalMaskReq);
+    CHECK(normalPrompts.size() == 2, "normal fill mask creates prompts for both Femur and Tibia");
+    CHECK(normalPrompts[0].class_id == 1 && normalPrompts[0].has_mask && normalPrompts[0].box.x0 == 15,
+          "femur extracted from normal fill mask");
+    CHECK(normalPrompts[1].class_id == 2 && normalPrompts[1].has_mask && normalPrompts[1].box.x0 == 20,
+          "tibia extracted from normal fill mask");
+
+    // Multi-class validateAIResult
+    cv::Mat combinedResult = cv::Mat::zeros(size, CV_8UC1);
+    combinedResult(cv::Rect(15, 20, 40, 50)).setTo(1);
+    combinedResult(cv::Rect(20, 110, 35, 60)).setTo(2);
+    CHECK(!rejects([&] { validateAIResult(combinedResult, size, {1, 2}); }),
+          "multi-class result with Femur and Tibia accepted");
+    combinedResult.at<uchar>(0, 0) = 3; // Fibula or unexpected label
+    CHECK(rejects([&] { validateAIResult(combinedResult, size, {1, 2}); }),
+          "unexpected label in multi-class result rejected");
+
     // Real worker, deterministic missing-model error; no simulated inference.
     AIFillController controller;
     request.modelDirectory = "/nonexistent/orthoseg-models";

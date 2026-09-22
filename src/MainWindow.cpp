@@ -14,7 +14,11 @@
 #include <QScrollArea>
 #include <QLineEdit>
 #include <QCheckBox>
+#include <QDialog>
+#include <QMouseEvent>
+#include <filesystem>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/core/cuda.hpp>
 #include <stdexcept>
 
 namespace orthoseg {
@@ -33,9 +37,23 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     setWindowTitle("OrthoSeg — Medical Imaging");
     resize(1280, 800);
 
+    aiModels_ = new QLineEdit(qEnvironmentVariable("MEDSAM2_MODEL_DIR", ORTHOSEG_MODEL_DIR));
+    aiModels_->setObjectName("aiModelDirectory");
+    aiModels_->setToolTip("Directory containing medsam2_image_encoder.onnx and medsam2_mask_decoder.onnx");
+
     canvas_ = new CanvasWidget(doc_.get());
     connect(canvas_, &CanvasWidget::maskChanged, this, [this] {
         updateUndoState();
+        updateAIPromptStatus();
+        if (doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+            doc_->aiFill().promptMask = doc_->mask().clone();
+            doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
+            if (aiPromptCombo_) {
+                aiPromptCombo_->blockSignals(true);
+                aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::PaintedMask));
+                aiPromptCombo_->blockSignals(false);
+            }
+        }
     });
     connect(canvas_, &CanvasWidget::zoomChanged, this, [this](float) {
         updateStatus();
@@ -68,21 +86,27 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     aiController_ = std::make_unique<AIFillController>();
     connect(aiController_.get(), &AIFillController::completed, this, [this](const cv::Mat& result) {
         aiRun_->setEnabled(true);
-        aiModels_->setEnabled(true);
+        if (aiModels_) aiModels_->setEnabled(true);
+        if (modelDirBtn_) modelDirBtn_->setEnabled(true);
         if (submittedGeneration_ != imageGeneration_) {
             aiStatus_->setText("Result discarded: image or result was cleared.");
             return;
         }
         doc_->aiFill().resultMask = result;
         doc_->aiFill().showResult = true;
+        doc_->aiFill().showPrompt = false; // Hide prompts after segmentation completes
         aiShow_->setChecked(true);
-        aiStatus_->setText(cv::countNonZero(result) ? "AI Fill complete. Apply to edit or export."
+        if (aiShowPrompt_) aiShowPrompt_->setChecked(false);
+        if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(true);
+        aiStatus_->setText(cv::countNonZero(result) ? "AI Fill complete. Prompts hidden. Apply to edit or export."
                                                   : "AI Fill complete: no foreground found.");
+        updateAIPromptStatus();
         canvas_->update();
     });
     connect(aiController_.get(), &AIFillController::failed, this, [this](const QString& error) {
         aiRun_->setEnabled(true);
-        aiModels_->setEnabled(true);
+        if (aiModels_) aiModels_->setEnabled(true);
+        if (modelDirBtn_) modelDirBtn_->setEnabled(true);
         aiStatus_->setText("AI Fill failed.");
         QMessageBox::warning(this, "AI Fill", error);
     });
@@ -152,12 +176,22 @@ QWidget* MainWindow::buildSidebar() {
         btn->setCheckable(true);
         btn->setCursor(Qt::PointingHandCursor);
         btn->setMinimumHeight(56);
-        btn->setStyleSheet(QString(
-            "QPushButton{ border-radius:12px; border:1px solid #1e293b;"
-            " background:#1e293b4d; color:#94a3b8; font-size:11px; }"
-            "QPushButton:hover{ border:1px solid #334155; }"
-            "QPushButton:checked{ background:%1; border:1px solid %1;"
-            " color:#0f172a; font-weight:600; }").arg(kAccent));
+        if (i == 3) {
+            btn->setObjectName("aiFillToolBtn");
+            btn->setStyleSheet(
+                "QPushButton{ border-radius:12px; border:1px solid #16a34a;"
+                " background:#14532d66; color:#4ade80; font-size:11px; font-weight:600; }"
+                "QPushButton:hover{ background:#16a34a4d; border:1px solid #22c55e; color:#86efac; }"
+                "QPushButton:checked{ background:#22c55e; border:2px solid #16a34a;"
+                " color:#0f172a; font-weight:700; }");
+        } else {
+            btn->setStyleSheet(QString(
+                "QPushButton{ border-radius:12px; border:1px solid #1e293b;"
+                " background:#1e293b4d; color:#94a3b8; font-size:11px; }"
+                "QPushButton:hover{ border:1px solid #334155; }"
+                "QPushButton:checked{ background:%1; border:1px solid %1;"
+                " color:#0f172a; font-weight:600; }").arg(kAccent));
+        }
         toolButtons_[i] = btn;
         connect(btn, &QPushButton::clicked, this, [this, tid] { selectTool(tid); });
         toolRow->addWidget(btn);
@@ -431,6 +465,43 @@ QWidget* MainWindow::buildTopBar() {
         return b;
     };
 
+    claheCheck_ = new QCheckBox("CLAHE");
+    claheCheck_->setObjectName("claheCheck");
+    claheCheck_->setToolTip("Toggle Contrast Limited Adaptive Histogram Equalization for enhanced visibility.\nClick to toggle or configure parameters.");
+    claheCheck_->setCursor(Qt::PointingHandCursor);
+    claheCheck_->setStyleSheet(
+        "QCheckBox{ color:#cbd5e1; font-size:11px; font-weight:600; spacing:6px; padding:6px 10px;"
+        " background:#1e293b; border:1px solid #334155; border-radius:8px; }"
+        "QCheckBox:hover{ background:#334155; border:1px solid #475569; }"
+        "QCheckBox::indicator{ width:14px; height:14px; border-radius:3px; border:1px solid #475569; background:#0f172a; }"
+        "QCheckBox::indicator:checked{ background:#38bdf8; border:1px solid #38bdf8; }");
+    connect(claheCheck_, &QCheckBox::clicked, this, [this](bool checked) {
+        canvas_->setClaheEnabled(checked);
+        if (checked) {
+            onOpenClaheDialog();
+        } else {
+            if (claheDialog_) claheDialog_->hide();
+        }
+    });
+    h->addWidget(claheCheck_);
+
+    claheSettingsBtn_ = makeIconBtn("⚙", "Configure CLAHE Parameters (Clip Limit, Grid Size)");
+    claheSettingsBtn_->setObjectName("claheSettingsBtn");
+    connect(claheSettingsBtn_, &QPushButton::clicked, this, &MainWindow::onOpenClaheDialog);
+    h->addWidget(claheSettingsBtn_);
+
+    modelDirBtn_ = new QPushButton("🧠 MedSAM2 Models");
+    modelDirBtn_->setObjectName("modelDirBtn");
+    modelDirBtn_->setToolTip(QString("MedSAM2 Model Directory: %1\nClick to change directory").arg(aiModels_->text()));
+    modelDirBtn_->setCursor(Qt::PointingHandCursor);
+    modelDirBtn_->setStyleSheet(
+        "QPushButton{ background:#1e293b; color:#cbd5e1; border:1px solid #334155;"
+        " border-radius:8px; padding:6px 12px; font-size:11px; font-weight:600; }"
+        "QPushButton:hover{ background:#334155; color:#ffffff; border:1px solid #475569; }"
+        "QPushButton:disabled{ color:#475569; }");
+    connect(modelDirBtn_, &QPushButton::clicked, this, &MainWindow::onOpenModelDirDialog);
+    h->addWidget(modelDirBtn_);
+
     undoBtn_ = makeIconBtn("↺", "Undo");
     connect(undoBtn_, &QPushButton::clicked, this, &MainWindow::onUndo);
     h->addWidget(undoBtn_);
@@ -467,44 +538,174 @@ QWidget* MainWindow::buildAIPanel() {
     aiPromptCombo_->addItem("Bounding Box");
     aiPromptCombo_->addItem("Paint Mask");
     aiPromptCombo_->addItem("Load Mask");
+    aiPromptCombo_->addItem("Normal Fill Mask");
     connect(aiPromptCombo_, &QComboBox::currentIndexChanged, this, [this](int index) {
-        doc_->aiFill().promptType = static_cast<AIFillPromptType>(index);
+        auto type = static_cast<AIFillPromptType>(index);
+        doc_->aiFill().promptType = type;
+        if (type == AIFillPromptType::NormalFillMask) {
+            if (doc_->hasImage()) {
+                doc_->aiFill().promptMask = doc_->mask().empty() ?
+                    cv::Mat::zeros(doc_->sourceColor().size(), CV_8UC1) : doc_->mask().clone();
+                doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
+                doc_->aiFill().showPrompt = true;
+                if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
+                aiPromptCombo_->blockSignals(true);
+                aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::PaintedMask));
+                aiPromptCombo_->blockSignals(false);
+                if (cv::countNonZero(doc_->aiFill().promptMask) > 0) {
+                    aiStatus_->setText("Normal fill mask converted to paint prompt format.");
+                } else {
+                    aiStatus_->setText("Normal fill mask converted (empty). Paint strokes or fill regions.");
+                }
+                canvas_->update();
+            } else {
+                aiStatus_->setText("Load an image first before selecting Normal Fill Mask.");
+            }
+        }
+        if (aiPromptHint_) {
+            switch (doc_->aiFill().promptType) {
+            case AIFillPromptType::BoundingBox:
+                aiPromptHint_->setText("Select Femur (Red) or Tibia (Green) above to draw bounding boxes. "
+                                       "Both boxes can be drawn and segmented together.");
+                break;
+            case AIFillPromptType::PaintedMask:
+                aiPromptHint_->setText("Paint prompt strokes with brush or eraser. "
+                                       "Uses anatomy color coding (Femur: Red, Tibia: Green).");
+                break;
+            case AIFillPromptType::LoadedMask:
+                aiPromptHint_->setText("Load an external binary or labeled prompt mask from disk.");
+                break;
+            case AIFillPromptType::NormalFillMask:
+                aiPromptHint_->setText("Uses current normal fill annotations as the prompt for MedSAM2 AI refinement.");
+                break;
+            }
+        }
         canvas_->setActiveTool(activeTool_);
         updateSettingsVisibility();
     });
     layout->addWidget(aiPromptCombo_);
-    auto* hint = new QLabel("Select Femur or Tibia above. Drag to draw a box or paint a prompt. "
-                           "Use the wheel to zoom and middle-drag to pan.");
-    hint->setWordWrap(true);
-    hint->setMinimumHeight(64);
-    layout->addWidget(hint);
+
+    aiPromptHint_ = new QLabel("Select Femur (Red) or Tibia (Green) above to draw bounding boxes. "
+                               "Both boxes can be drawn and segmented together.");
+    aiPromptHint_->setWordWrap(true);
+    aiPromptHint_->setMinimumHeight(48);
+    layout->addWidget(aiPromptHint_);
+
+    // Bounding box controls for Femur and Tibia
+    aiBoxControls_ = new QWidget;
+    auto* bcl = new QVBoxLayout(aiBoxControls_);
+    bcl->setContentsMargins(0, 0, 0, 0);
+    bcl->setSpacing(6);
+
+    auto* fRow = new QHBoxLayout;
+    femurBoxStatus_ = new QLabel("Femur Box (Red): Not set");
+    femurBoxStatus_->setStyleSheet("color:#ef4444; font-size:11px; font-weight:600;");
+    fRow->addWidget(femurBoxStatus_, 1);
+    clearFemurBoxBtn_ = new QPushButton("Clear");
+    clearFemurBoxBtn_->setFixedSize(50, 24);
+    connect(clearFemurBoxBtn_, &QPushButton::clicked, this, [this] {
+        doc_->aiFill().femurBox.reset();
+        if (activeLabel_ == Label::Femur) doc_->aiFill().box.reset();
+        updateAIPromptStatus();
+        canvas_->update();
+    });
+    fRow->addWidget(clearFemurBoxBtn_);
+    bcl->addLayout(fRow);
+
+    auto* tRow = new QHBoxLayout;
+    tibiaBoxStatus_ = new QLabel("Tibia Box (Green): Not set");
+    tibiaBoxStatus_->setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;");
+    tRow->addWidget(tibiaBoxStatus_, 1);
+    clearTibiaBoxBtn_ = new QPushButton("Clear");
+    clearTibiaBoxBtn_->setFixedSize(50, 24);
+    connect(clearTibiaBoxBtn_, &QPushButton::clicked, this, [this] {
+        doc_->aiFill().tibiaBox.reset();
+        if (activeLabel_ == Label::Tibia) doc_->aiFill().box.reset();
+        updateAIPromptStatus();
+        canvas_->update();
+    });
+    tRow->addWidget(clearTibiaBoxBtn_);
+    bcl->addLayout(tRow);
+    layout->addWidget(aiBoxControls_);
+
+    aiShowPrompt_ = new QCheckBox("Show Prompt (Box / Mask)");
+    aiShowPrompt_->setChecked(true);
+    connect(aiShowPrompt_, &QCheckBox::toggled, this, [this](bool show) {
+        doc_->aiFill().showPrompt = show;
+        canvas_->update();
+    });
+    layout->addWidget(aiShowPrompt_);
+
     aiErase_ = new QCheckBox("Erase Prompt (unchecked = brush)");
     connect(aiErase_, &QCheckBox::toggled, canvas_, &CanvasWidget::setAIPromptErase);
     layout->addWidget(aiErase_);
     aiLoadMask_ = new QPushButton("Load Prompt Mask");
     connect(aiLoadMask_, &QPushButton::clicked, this, &MainWindow::onLoadPromptMask);
     layout->addWidget(aiLoadMask_);
+
+    // Normal Fill Mask controls
+    normalMaskControls_ = new QWidget;
+    auto* nml = new QVBoxLayout(normalMaskControls_);
+    nml->setContentsMargins(0, 0, 0, 0);
+    nml->setSpacing(6);
+    normalMaskStatus_ = new QLabel("Uses current normal fill mask as prompt.");
+    normalMaskStatus_->setWordWrap(true);
+    normalMaskStatus_->setStyleSheet("color:#94a3b8; font-size:11px;");
+    nml->addWidget(normalMaskStatus_);
+    copyNormalMaskBtn_ = new QPushButton("Copy Normal Mask to Paint Prompt");
+    copyNormalMaskBtn_->setToolTip("Copy normal fill annotations to the paint prompt layer for manual editing.");
+    connect(copyNormalMaskBtn_, &QPushButton::clicked, this, [this] {
+        if (!doc_->hasImage() || doc_->mask().empty()) return;
+        doc_->aiFill().promptMask = doc_->mask().clone();
+        doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
+        doc_->aiFill().showPrompt = true;
+        if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
+        aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::PaintedMask));
+        canvas_->update();
+    });
+    nml->addWidget(copyNormalMaskBtn_);
+    layout->addWidget(normalMaskControls_);
+
+    useResultAsPromptBtn_ = new QPushButton("Use AI Result as Next Prompt");
+    useResultAsPromptBtn_->setToolTip("Use the current AI segmentation output as the prompt for the next refinement pass.");
+    connect(useResultAsPromptBtn_, &QPushButton::clicked, this, [this] {
+        if (doc_->aiFill().resultMask.empty() || cv::countNonZero(doc_->aiFill().resultMask) == 0) {
+            QMessageBox::information(this, "AI Fill", "No AI segmentation result to use as prompt.");
+            return;
+        }
+        doc_->aiFill().promptMask = doc_->aiFill().resultMask.clone();
+        doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
+        doc_->aiFill().showPrompt = true;
+        if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
+        aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::PaintedMask));
+        aiStatus_->setText("AI segmentation result copied to prompt. Ready for refinement.");
+        canvas_->update();
+    });
+    layout->addWidget(useResultAsPromptBtn_);
+
     auto* clear = new QPushButton("Clear Prompt");
     connect(clear, &QPushButton::clicked, this, [this] {
         doc_->aiFill().box.reset();
+        doc_->aiFill().femurBox.reset();
+        doc_->aiFill().tibiaBox.reset();
         doc_->aiFill().promptMask.release();
+        doc_->aiFill().showPrompt = true;
+        if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
+        updateAIPromptStatus();
         canvas_->setActiveTool(activeTool_);
     });
     layout->addWidget(clear);
-    layout->addWidget(sectionLabel("MedSAM2 Model Directory"));
-    aiModels_ = new QLineEdit(qEnvironmentVariable("MEDSAM2_MODEL_DIR", ORTHOSEG_MODEL_DIR));
-    aiModels_->setObjectName("aiModelDirectory");
-    aiModels_->setToolTip("Directory containing medsam2_image_encoder.onnx and medsam2_mask_decoder.onnx");
+
+    aiModels_->setVisible(false);
     layout->addWidget(aiModels_);
-    auto* browse = new QPushButton("Choose Model Directory");
-    connect(browse, &QPushButton::clicked, this, [this] {
-        if (aiController_->running()) return;
-        const auto dir = QFileDialog::getExistingDirectory(this, "MedSAM2 Models", aiModels_->text());
-        if (!dir.isEmpty()) aiModels_->setText(dir);
-    });
-    layout->addWidget(browse);
-    aiRun_ = new QPushButton("Run AI Fill");
+
+    aiRun_ = new QPushButton("▶ Run AI Fill");
     aiRun_->setObjectName("runAIFill");
+    aiRun_->setMinimumHeight(38);
+    aiRun_->setStyleSheet(
+        "QPushButton{ background:#22c55e; color:#0f172a; font-weight:700; border:none; border-radius:8px; font-size:12px; letter-spacing:0.5px; }"
+        "QPushButton:hover{ background:#16a34a; color:#ffffff; }"
+        "QPushButton:disabled{ background:#1e293b; color:#64748b; border:1px solid #334155; }");
     connect(aiRun_, &QPushButton::clicked, this, &MainWindow::onRunAIFill);
     layout->addWidget(aiRun_);
     aiStatus_ = new QLabel("Ready. CUDA required.");
@@ -523,6 +724,7 @@ QWidget* MainWindow::buildAIPanel() {
     connect(clearResult, &QPushButton::clicked, this, [this] {
         ++imageGeneration_; // Also invalidate any pending result.
         doc_->aiFill().resultMask.release();
+        if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(false);
         canvas_->update();
     });
     layout->addWidget(clearResult);
@@ -530,6 +732,17 @@ QWidget* MainWindow::buildAIPanel() {
     apply->setToolTip("Copy the preview foreground into the editable mask, with undo. Apply before export.");
     connect(apply, &QPushButton::clicked, this, [this] {
         doc_->applyAIResult();
+        if (doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+            doc_->aiFill().promptMask = doc_->mask().clone();
+            doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
+            doc_->aiFill().showPrompt = true;
+            if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
+            if (aiPromptCombo_) {
+                aiPromptCombo_->blockSignals(true);
+                aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::PaintedMask));
+                aiPromptCombo_->blockSignals(false);
+            }
+        }
         canvas_->update();
         updateUndoState();
     });
@@ -540,29 +753,68 @@ QWidget* MainWindow::buildAIPanel() {
 void MainWindow::onRunAIFill() {
     if (aiController_->running()) return;
     try {
+        if (!doc_->hasImage()) throw std::runtime_error("Load an image first.");
         const auto& ai = doc_->aiFill();
         AIFillRequest request;
         request.imageBGR = doc_->sourceColor();
         request.target = activeLabel_;
         request.type = ai.promptType;
-        request.box = ai.box;
-        if (request.type != AIFillPromptType::BoundingBox)
-            request.promptMask = ai.promptMask.clone();
         request.modelDirectory = aiModels_->text().toStdString();
-        // Cheap input checks happen here; prompt tensor preparation stays in the worker.
-        if (!doc_->hasImage()) throw std::runtime_error("Load an image first.");
-        if (activeLabel_ != Label::Femur && activeLabel_ != Label::Tibia)
-            throw std::runtime_error("Select Femur or Tibia under Select Anatomy.");
+
         if (request.type == AIFillPromptType::BoundingBox) {
-            if (!request.box) throw std::runtime_error("Draw a bounding box first.");
-            request.box = validatedBox(*request.box, request.imageBGR.size());
-        } else if (request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0) {
-            throw std::runtime_error("Paint or load a non-empty prompt mask first.");
+            request.femurBox = ai.femurBox;
+            request.tibiaBox = ai.tibiaBox;
+            request.box = ai.box;
+            if (!request.femurBox && !request.tibiaBox && !request.box) {
+                if (!ai.promptMask.empty() && cv::countNonZero(ai.promptMask) > 0) {
+                    request.type = AIFillPromptType::PaintedMask;
+                    request.promptMask = ai.promptMask.clone();
+                } else if (!doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+                    request.type = AIFillPromptType::PaintedMask;
+                    request.promptMask = doc_->mask().clone();
+                } else if (!ai.resultMask.empty() && cv::countNonZero(ai.resultMask) > 0) {
+                    request.type = AIFillPromptType::PaintedMask;
+                    request.promptMask = ai.resultMask.clone();
+                } else {
+                    throw std::runtime_error("Draw at least one bounding box (Femur or Tibia) first.");
+                }
+            } else {
+                if (request.femurBox)
+                    request.femurBox = validatedBox(*request.femurBox, request.imageBGR.size());
+                if (request.tibiaBox)
+                    request.tibiaBox = validatedBox(*request.tibiaBox, request.imageBGR.size());
+                if (!request.femurBox && !request.tibiaBox && request.box)
+                    request.box = validatedBox(*request.box, request.imageBGR.size());
+            }
+        } else if (request.type == AIFillPromptType::NormalFillMask) {
+            if (cv::countNonZero(doc_->mask()) == 0)
+                throw std::runtime_error("Normal fill mask has no annotations yet. Fill or paint some bone regions first.");
+            doc_->aiFill().promptMask = doc_->mask().clone();
+            doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
+            request.promptMask = doc_->aiFill().promptMask.clone();
+            request.type = AIFillPromptType::PaintedMask;
+            aiPromptCombo_->blockSignals(true);
+            aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::PaintedMask));
+            aiPromptCombo_->blockSignals(false);
+        } else {
+            if (activeLabel_ != Label::Femur && activeLabel_ != Label::Tibia)
+                throw std::runtime_error("Select Femur or Tibia under Select Anatomy.");
+            request.promptMask = ai.promptMask.clone();
+            if ((request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0) &&
+                !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+                request.promptMask = doc_->mask().clone();
+            } else if ((request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0) &&
+                !ai.resultMask.empty() && cv::countNonZero(ai.resultMask) > 0) {
+                request.promptMask = ai.resultMask.clone();
+            }
+            if (request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0)
+                throw std::runtime_error("Paint or load a non-empty prompt mask first.");
         }
         submittedGeneration_ = imageGeneration_;
         aiController_->run(std::move(request));
         aiRun_->setEnabled(false);
-        aiModels_->setEnabled(false);
+        if (aiModels_) aiModels_->setEnabled(false);
+        if (modelDirBtn_) modelDirBtn_->setEnabled(false);
         aiStatus_->setText("Running AI Fill… Loading models on first use.");
     } catch (const std::exception& error) {
         QMessageBox::warning(this, "AI Fill", QString::fromUtf8(error.what()));
@@ -582,12 +834,297 @@ void MainWindow::onLoadPromptMask() {
         cv::Mat raw = cv::imread(path.toStdString(), cv::IMREAD_UNCHANGED);
         cv::Mat binary = binaryPromptMask(raw, doc_->sourceColor().size());
         doc_->aiFill().promptMask = std::move(binary);
+        doc_->aiFill().showPrompt = true;
+        if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
         aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::LoadedMask));
         aiStatus_->setText("Prompt loaded: nonzero pixels mark the selected anatomy.");
         canvas_->update();
     } catch (const std::exception& error) {
         QMessageBox::warning(this, "AI Fill", QString::fromUtf8(error.what()));
     }
+}
+
+void MainWindow::onOpenModelDirDialog() {
+    if (aiController_->running()) {
+        QMessageBox::information(this, "MedSAM2 Models", "Cannot change model directory while AI Fill is running.");
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle("MedSAM2 Model Directory");
+    dlg.setMinimumWidth(540);
+    dlg.setStyleSheet(
+        "QDialog { background:#0f172a; color:#e2e8f0; }"
+        "QPushButton { background:#1e293b; color:#cbd5e1; border:1px solid #334155; border-radius:8px; padding:6px 14px; font-size:11px; }"
+        "QPushButton:hover { background:#334155; color:#ffffff; }"
+        "QLineEdit { background:#1e293b; color:#f1f5f9; border:1px solid #334155; border-radius:8px; padding:6px 10px; font-size:11px; }");
+
+    auto* l = new QVBoxLayout(&dlg);
+    l->setContentsMargins(20, 20, 20, 20);
+    l->setSpacing(12);
+
+    auto* title = new QLabel("🧠 MedSAM2 ONNX Model Configuration", &dlg);
+    title->setStyleSheet("font-size:14px; font-weight:700; color:#f1f5f9;");
+    l->addWidget(title);
+
+    auto* desc = new QLabel("Select the folder containing medsam2_image_encoder.onnx and medsam2_mask_decoder.onnx:", &dlg);
+    desc->setStyleSheet("color:#94a3b8; font-size:11px;");
+    desc->setWordWrap(true);
+    l->addWidget(desc);
+
+    auto* editRow = new QHBoxLayout;
+    auto* pathEdit = new QLineEdit(aiModels_->text(), &dlg);
+    editRow->addWidget(pathEdit, 1);
+
+    auto* browseBtn = new QPushButton("Browse…", &dlg);
+    browseBtn->setStyleSheet("background:#38bdf8; color:#0f172a; font-weight:600; border-radius:8px; padding:6px 14px;");
+    editRow->addWidget(browseBtn);
+    l->addLayout(editRow);
+
+    auto* statusCard = new QLabel(&dlg);
+    statusCard->setWordWrap(true);
+    statusCard->setStyleSheet("background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px 12px; font-size:11px;");
+    l->addWidget(statusCard);
+
+    auto checkDir = [pathEdit, statusCard]() {
+        const auto dir = std::filesystem::path(pathEdit->text().toStdString());
+        const auto enc = dir / "medsam2_image_encoder.onnx";
+        const auto dec = dir / "medsam2_mask_decoder.onnx";
+        bool encOk = std::filesystem::is_regular_file(enc);
+        bool decOk = std::filesystem::is_regular_file(dec);
+        bool cudaOk = cv::cuda::getCudaEnabledDeviceCount() > 0;
+
+        QString msg;
+        if (encOk && decOk) {
+            msg = QString("<span style='color:#22c55e; font-weight:bold;'>✓ Valid MedSAM2 Models Found</span><br>"
+                          "• medsam2_image_encoder.onnx: <span style='color:#22c55e;'>Present</span><br>"
+                          "• medsam2_mask_decoder.onnx: <span style='color:#22c55e;'>Present</span><br>"
+                          "• Hardware Acceleration: %1")
+                  .arg(cudaOk ? "<span style='color:#22c55e;'>CUDA GPU Available</span>"
+                              : "<span style='color:#f87171;'>CUDA Unavailable (CUDA required for AI Fill)</span>");
+        } else {
+            msg = QString("<span style='color:#f87171; font-weight:bold;'>✗ Incomplete Model Directory</span><br>"
+                          "• medsam2_image_encoder.onnx: %1<br>"
+                          "• medsam2_mask_decoder.onnx: %2")
+                  .arg(encOk ? "<span style='color:#22c55e;'>Found</span>" : "<span style='color:#f87171;'>Missing</span>")
+                  .arg(decOk ? "<span style='color:#22c55e;'>Found</span>" : "<span style='color:#f87171;'>Missing</span>");
+        }
+        statusCard->setText(msg);
+    };
+
+    checkDir();
+    connect(pathEdit, &QLineEdit::textChanged, &dlg, checkDir);
+
+    connect(browseBtn, &QPushButton::clicked, &dlg, [pathEdit, &dlg] {
+        const auto dir = QFileDialog::getExistingDirectory(&dlg, "Choose MedSAM2 Model Directory", pathEdit->text());
+        if (!dir.isEmpty()) {
+            pathEdit->setText(dir);
+        }
+    });
+
+    auto* btnRow = new QHBoxLayout;
+    btnRow->addStretch();
+    auto* cancelBtn = new QPushButton("Cancel", &dlg);
+    connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    btnRow->addWidget(cancelBtn);
+
+    auto* saveBtn = new QPushButton("Save Directory", &dlg);
+    saveBtn->setStyleSheet("background:#38bdf8; color:#0f172a; font-weight:700; border-radius:8px; padding:6px 16px;");
+    connect(saveBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    btnRow->addWidget(saveBtn);
+    l->addLayout(btnRow);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        aiModels_->setText(pathEdit->text());
+        if (modelDirBtn_) {
+            modelDirBtn_->setToolTip(QString("MedSAM2 Model Directory: %1\nClick to change directory").arg(pathEdit->text()));
+        }
+    }
+}
+
+class ClaheDialog : public QDialog {
+public:
+    bool userMoved = false;
+
+    explicit ClaheDialog(QWidget* parent = nullptr)
+        : QDialog(parent, Qt::Dialog | Qt::WindowTitleHint | Qt::WindowCloseButtonHint | Qt::CustomizeWindowHint) {
+        setWindowTitle("CLAHE Display Enhancement");
+        setObjectName("claheDialog");
+        setModal(false);
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) {
+            QWidget* child = childAt(event->position().toPoint());
+            if (!child || qobject_cast<QLabel*>(child) || child == this) {
+                dragPosition_ = event->globalPosition().toPoint() - frameGeometry().topLeft();
+                dragging_ = true;
+                event->accept();
+                return;
+            }
+        }
+        QDialog::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (dragging_ && (event->buttons() & Qt::LeftButton)) {
+            userMoved = true;
+            move(event->globalPosition().toPoint() - dragPosition_);
+            event->accept();
+            return;
+        }
+        QDialog::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) {
+            dragging_ = false;
+            event->accept();
+            return;
+        }
+        QDialog::mouseReleaseEvent(event);
+    }
+
+private:
+    QPoint dragPosition_;
+    bool dragging_ = false;
+};
+
+void MainWindow::onOpenClaheDialog() {
+    if (!claheDialog_) {
+        claheDialog_ = new ClaheDialog(this);
+        claheDialog_->setMinimumWidth(440);
+        claheDialog_->setStyleSheet(
+            "QDialog { background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:12px; }"
+            "QPushButton { background:#1e293b; color:#cbd5e1; border:1px solid #334155; border-radius:8px; padding:6px 14px; font-size:11px; font-weight:600; }"
+            "QPushButton:hover { background:#334155; color:#ffffff; border:1px solid #475569; }"
+            "QSlider::groove:horizontal { height: 4px; background: #334155; border-radius: 2px; }"
+            "QSlider::sub-page:horizontal { background: #38bdf8; border-radius: 2px; }"
+            "QSlider::handle:horizontal { background: #f8fafc; border: 1px solid #94a3b8; width: 14px; margin-top: -5px; margin-bottom: -5px; border-radius: 7px; }"
+            "QCheckBox { color: #cbd5e1; font-size: 12px; font-weight: 600; spacing: 8px; }");
+
+        auto* l = new QVBoxLayout(claheDialog_);
+        l->setContentsMargins(20, 20, 20, 20);
+        l->setSpacing(14);
+
+        auto* hdr = new QHBoxLayout;
+        auto* title = new QLabel("🌓 CLAHE Contrast Enhancement", claheDialog_);
+        title->setStyleSheet("font-size:14px; font-weight:700; color:#f1f5f9;");
+        title->setCursor(Qt::SizeAllCursor);
+        title->setToolTip("Click and drag anywhere on this window to move to the side");
+        hdr->addWidget(title);
+        hdr->addStretch();
+        auto* dragHint = new QLabel("⠿ Drag to Move", claheDialog_);
+        dragHint->setStyleSheet("color:#64748b; font-size:10px; font-weight:600; padding:2px 8px; background:#1e293b; border-radius:4px; border:1px solid #334155;");
+        dragHint->setCursor(Qt::SizeAllCursor);
+        dragHint->setToolTip("Click and drag anywhere on this window to move to the side");
+        hdr->addWidget(dragHint);
+        l->addLayout(hdr);
+
+        auto* desc = new QLabel(
+            "Contrast Limited Adaptive Histogram Equalization enhances local contrast and bone trabeculae visibility. "
+            "This strictly affects visual rendering in the UI; all segmentation algorithms and AI models process the raw original image.", claheDialog_);
+        desc->setStyleSheet("color:#94a3b8; font-size:11px;");
+        desc->setWordWrap(true);
+        l->addWidget(desc);
+
+        auto* enableCb = new QCheckBox("Enable CLAHE Display", claheDialog_);
+        enableCb->setObjectName("claheDialogEnableCb");
+        enableCb->setChecked(canvas_->claheEnabled());
+        connect(enableCb, &QCheckBox::toggled, this, [this](bool en) {
+            canvas_->setClaheEnabled(en);
+            if (claheCheck_) claheCheck_->setChecked(en);
+        });
+        l->addWidget(enableCb);
+
+        // Clip Limit slider (0.5 to 10.0, step 0.1, internal slider 5..100)
+        auto* clipHdr = new QHBoxLayout;
+        auto* clipTitle = new QLabel("Clip Limit", claheDialog_);
+        clipTitle->setStyleSheet("font-size:11px; font-weight:600; color:#cbd5e1;");
+        auto* clipVal = new QLabel(QString::number(canvas_->claheClipLimit(), 'f', 1), claheDialog_);
+        clipVal->setStyleSheet("color:#38bdf8; font-size:12px; font-weight:700;");
+        clipHdr->addWidget(clipTitle);
+        clipHdr->addStretch();
+        clipHdr->addWidget(clipVal);
+        l->addLayout(clipHdr);
+
+        auto* clipSlider = new QSlider(Qt::Horizontal, claheDialog_);
+        clipSlider->setObjectName("claheClipSlider");
+        clipSlider->setRange(5, 100);
+        clipSlider->setValue(static_cast<int>(std::round(canvas_->claheClipLimit() * 10.0)));
+        connect(clipSlider, &QSlider::valueChanged, this, [this, clipVal](int v) {
+            double val = v / 10.0;
+            clipVal->setText(QString::number(val, 'f', 1));
+            canvas_->setClaheParams(val, canvas_->claheGridSize());
+        });
+        l->addWidget(clipSlider);
+
+        // Tile Grid Size slider (2 to 32, default 8)
+        auto* gridHdr = new QHBoxLayout;
+        auto* gridTitle = new QLabel("Tile Grid Size", claheDialog_);
+        gridTitle->setStyleSheet("font-size:11px; font-weight:600; color:#cbd5e1;");
+        auto* gridVal = new QLabel(QString("%1 × %1").arg(canvas_->claheGridSize()), claheDialog_);
+        gridVal->setStyleSheet("color:#38bdf8; font-size:12px; font-weight:700;");
+        gridHdr->addWidget(gridTitle);
+        gridHdr->addStretch();
+        gridHdr->addWidget(gridVal);
+        l->addLayout(gridHdr);
+
+        auto* gridSlider = new QSlider(Qt::Horizontal, claheDialog_);
+        gridSlider->setObjectName("claheGridSlider");
+        gridSlider->setRange(2, 32);
+        gridSlider->setValue(canvas_->claheGridSize());
+        connect(gridSlider, &QSlider::valueChanged, this, [this, gridVal](int v) {
+            gridVal->setText(QString("%1 × %1").arg(v));
+            canvas_->setClaheParams(canvas_->claheClipLimit(), v);
+        });
+        l->addWidget(gridSlider);
+
+        // Bottom buttons
+        auto* btnRow = new QHBoxLayout;
+        auto* resetBtn = new QPushButton("Reset Defaults", claheDialog_);
+        resetBtn->setObjectName("claheResetBtn");
+        connect(resetBtn, &QPushButton::clicked, this, [this, clipSlider, gridSlider] {
+            clipSlider->setValue(20);
+            gridSlider->setValue(8);
+            canvas_->setClaheParams(2.0, 8);
+        });
+        btnRow->addWidget(resetBtn);
+        btnRow->addStretch();
+
+        auto* doneBtn = new QPushButton("Done", claheDialog_);
+        doneBtn->setObjectName("claheDoneBtn");
+        doneBtn->setStyleSheet("background:#38bdf8; color:#0f172a; font-weight:700; border:none; border-radius:8px; padding:6px 16px;");
+        connect(doneBtn, &QPushButton::clicked, claheDialog_, &QDialog::hide);
+        btnRow->addWidget(doneBtn);
+        l->addLayout(btnRow);
+
+        connect(claheDialog_, &QDialog::finished, this, [this] {
+            if (claheCheck_) claheCheck_->setChecked(canvas_->claheEnabled());
+        });
+    }
+
+    auto* customDlg = static_cast<ClaheDialog*>(claheDialog_);
+    if (!customDlg->userMoved) {
+        // Automatically position dialog towards the top-right of the window so the central X-ray is unobstructed
+        int targetX = mapToGlobal(QPoint(0, 0)).x() + width() - claheDialog_->width() - 24;
+        int targetY = mapToGlobal(QPoint(0, 0)).y() + 68;
+        claheDialog_->move(std::max(10, targetX), std::max(10, targetY));
+    }
+
+    if (auto* cb = claheDialog_->findChild<QCheckBox*>("claheDialogEnableCb")) {
+        cb->setChecked(canvas_->claheEnabled());
+    }
+    if (auto* slider = claheDialog_->findChild<QSlider*>("claheClipSlider")) {
+        slider->setValue(static_cast<int>(std::round(canvas_->claheClipLimit() * 10.0)));
+    }
+    if (auto* slider = claheDialog_->findChild<QSlider*>("claheGridSlider")) {
+        slider->setValue(canvas_->claheGridSize());
+    }
+
+    claheDialog_->show();
+    claheDialog_->raise();
+    claheDialog_->activateWindow();
 }
 
 void MainWindow::showFillAlgorithm(int comboIndex) {
@@ -601,6 +1138,7 @@ void MainWindow::selectLabel(Label l) {
     for (int i = 0; i < 4; ++i)
         static_cast<QPushButton*>(labelButtons_[i])
             ->setChecked(i == static_cast<int>(l));
+    updateAIPromptStatus();
 }
 
 void MainWindow::selectTool(Tool t) {
@@ -616,11 +1154,19 @@ void MainWindow::updateSettingsVisibility() {
     bool isFill = (activeTool_ == Tool::Fill);
     bool isAI = (activeTool_ == Tool::AIFill);
     aiPanel_->setVisible(isAI);
+    bool isBox = isAI && doc_->aiFill().promptType == AIFillPromptType::BoundingBox;
     bool isPaint = isAI && doc_->aiFill().promptType == AIFillPromptType::PaintedMask;
-    aiErase_->setVisible(isPaint);
-    aiLoadMask_->setVisible(isAI && doc_->aiFill().promptType == AIFillPromptType::LoadedMask);
+    bool isLoad = isAI && doc_->aiFill().promptType == AIFillPromptType::LoadedMask;
+    bool isNormalMask = isAI && doc_->aiFill().promptType == AIFillPromptType::NormalFillMask;
+    if (aiBoxControls_) aiBoxControls_->setVisible(isBox);
+    if (aiErase_) aiErase_->setVisible(isPaint);
+    if (aiLoadMask_) aiLoadMask_->setVisible(isLoad);
+    if (normalMaskControls_) normalMaskControls_->setVisible(isNormalMask);
+    if (aiShowPrompt_) aiShowPrompt_->setVisible(isAI);
+    if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(isAI && !doc_->aiFill().resultMask.empty());
     brushPanel_->setVisible((!isFill && !isAI) || isPaint);
     fillPanel_->setVisible(isFill);
+    updateAIPromptStatus();
     if (!isFill || !algoCombo_) return;
 
     FillAlgorithm algo = static_cast<FillAlgorithm>(algoCombo_->currentIndex());
@@ -635,6 +1181,45 @@ void MainWindow::updateSettingsVisibility() {
     betaPanel_->setVisible(scribble && algo != FillAlgorithm::GraphCut);
     graphCutNote_->setVisible(algo == FillAlgorithm::GraphCut);
     seedPanel_->setVisible(scribble);
+}
+
+void MainWindow::updateAIPromptStatus() {
+    if (!doc_) return;
+    const auto& ai = doc_->aiFill();
+    if (femurBoxStatus_) {
+        if (ai.femurBox) {
+            femurBoxStatus_->setText(QString("Femur (Red): [%1,%2]-%3x%4")
+                .arg(int(ai.femurBox->x0)).arg(int(ai.femurBox->y0))
+                .arg(int(ai.femurBox->x1 - ai.femurBox->x0 + 1))
+                .arg(int(ai.femurBox->y1 - ai.femurBox->y0 + 1)));
+            clearFemurBoxBtn_->setEnabled(true);
+        } else {
+            femurBoxStatus_->setText("Femur Box (Red): Not set");
+            clearFemurBoxBtn_->setEnabled(false);
+        }
+    }
+    if (tibiaBoxStatus_) {
+        if (ai.tibiaBox) {
+            tibiaBoxStatus_->setText(QString("Tibia (Grn): [%1,%2]-%3x%4")
+                .arg(int(ai.tibiaBox->x0)).arg(int(ai.tibiaBox->y0))
+                .arg(int(ai.tibiaBox->x1 - ai.tibiaBox->x0 + 1))
+                .arg(int(ai.tibiaBox->y1 - ai.tibiaBox->y0 + 1)));
+            clearTibiaBoxBtn_->setEnabled(true);
+        } else {
+            tibiaBoxStatus_->setText("Tibia Box (Green): Not set");
+            clearTibiaBoxBtn_->setEnabled(false);
+        }
+    }
+    if (normalMaskStatus_) {
+        if (!doc_->hasImage() || doc_->mask().empty()) {
+            normalMaskStatus_->setText("No image or mask loaded.");
+        } else {
+            int femurCount = cv::countNonZero(doc_->mask() == static_cast<int>(Label::Femur));
+            int tibiaCount = cv::countNonZero(doc_->mask() == static_cast<int>(Label::Tibia));
+            normalMaskStatus_->setText(QString("Normal mask ready: Femur (%1 px), Tibia (%2 px)")
+                .arg(femurCount).arg(tibiaCount));
+        }
+    }
 }
 
 double MainWindow::currentBeta() const {
@@ -696,8 +1281,14 @@ void MainWindow::onClear() {
     doc_->clearSeeds();
     ++imageGeneration_;
     doc_->aiFill().box.reset();
+    doc_->aiFill().femurBox.reset();
+    doc_->aiFill().tibiaBox.reset();
     doc_->aiFill().promptMask.release();
     doc_->aiFill().resultMask.release();
+    doc_->aiFill().showPrompt = true;
+    if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
+    if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(false);
+    updateAIPromptStatus();
     canvas_->update();
     updateUndoState();
 }

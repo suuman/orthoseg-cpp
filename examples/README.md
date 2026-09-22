@@ -43,23 +43,24 @@ It converts the pipeline to **exclusively use OpenCV 5 and CUDA** without **any 
 ## Directory Layout
 
 ```
-MedSamCustom/
-├── ocv/
-│   ├── CMakeLists.txt             # Build configuration linking OpenCV 5 + CUDA
-│   ├── include/
-│   │   ├── medsam2_ocv.h          # MedSAM2 C++ engine header
-│   │   └── image_utils.h          # OpenCV 5 image loader, square pad/unpad, boxes, overlay
-│   ├── src/
-│   │   ├── medsam2_ocv.cpp        # OpenCV 5 DNN CUDA inference implementation
-│   │   └── main.cpp               # CLI executable matching medsam2_infer_custom.py
-│   ├── models/
-│   │   ├── medsam2_image_encoder.onnx  # Exported Image Encoder ONNX model (104 MB)
-│   │   └── medsam2_mask_decoder.onnx   # Exported Mask Decoder ONNX model (15 MB)
-│   ├── build/
-│   │   └── medsam2_ocv_infer      # Standalone compiled binary (69 KB)
-│   ├── export_onnx.py             # ONNX model exporter script
-│   ├── run_infer.sh               # Convenience build & run script
-│   └── README.md                  # Detailed documentation
+orthoseg/
+├── CMakeLists.txt             # Unified build configuration linking Qt 6, OpenCV + CUDA
+├── include/                   # All project headers (.h)
+│   ├── medsam2_ocv.h          # MedSAM2 C++ engine header
+│   ├── image_utils.h          # OpenCV 5 image loader, square pad/unpad, boxes, overlay
+│   └── ...                    # OrthoSeg GUI and segmentation engine headers
+├── src/                       # All project source files (.cpp)
+│   ├── medsam2_ocv.cpp        # OpenCV 5 DNN CUDA inference implementation
+│   └── ...                    # OrthoSeg GUI and segmentation engine implementation
+├── models/                    # Exported ONNX models
+│   ├── medsam2_image_encoder.onnx  # Exported Image Encoder ONNX model (104 MB)
+│   └── medsam2_mask_decoder.onnx   # Exported Mask Decoder ONNX model (15 MB)
+├── examples/                  # Standalone CLI inference and export utilities
+│   ├── medsam2_main.cpp       # CLI executable matching medsam2_infer_custom.py
+│   ├── export_onnx.py         # ONNX model exporter script
+│   ├── run_infer.sh           # Convenience build & run script
+│   └── README.md              # Detailed documentation
+└── tests/                     # Unit test suites
 ```
 
 ---
@@ -69,7 +70,7 @@ MedSamCustom/
 To generate or re-export the ONNX models from checkpoint:
 
 ```bash
-cd /home/suman/mapmed/MedSamCustom/ocv
+cd examples
 /home/suman/deepnet/bin/python export_onnx.py
 ```
 
@@ -83,22 +84,20 @@ The exporter produces:
 
 ### Quick Run with the Script
 ```bash
-cd /home/suman/mapmed/MedSamCustom/ocv
+cd examples
 ./run_infer.sh
 ```
 
 ### Manual Build with CMake
+From the repository root:
 ```bash
-cd /home/suman/mapmed/MedSamCustom/ocv
-mkdir -p build && cd build
-
-cmake .. \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     -DOpenCV_DIR=/home/suman/soft/opencv/install_new/lib/cmake/opencv5
 
-make -j4
+cmake --build build --target medsam2_ocv_infer -j4
 ```
 
-The resulting executable `medsam2_ocv_infer` embeds RPATH to `/home/suman/soft/opencv/install_new/lib` and CUDA libraries, so it runs standalone without needing `LD_LIBRARY_PATH`.
+The resulting executable `./build/medsam2_ocv_infer` embeds RPATH to `/home/suman/soft/opencv/install_new/lib` and CUDA libraries, so it runs standalone without needing `LD_LIBRARY_PATH`.
 
 ---
 
