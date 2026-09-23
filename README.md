@@ -2,6 +2,36 @@
 
 Local FastAPI service for an existing annotation UI. No UI, cloud services, telemetry, pretrained downloads, or automatic training. PNG mask IDs are **0 background, 1 femur, 2 tibia**. Output is single-channel uint8 at exactly the original image dimensions.
 
+## Local prompted SAM2 model
+
+The supplied SAM2.1 Hiera Tiny checkpoint and Python package from `/run/media/suman/Data/sam2` are installed under `models/pretrained/medsam2/`. This checkpoint needs a box prompt; it cannot serve the automatic `/segment` route or become a UNet production checkpoint. Its independent `/segment/prompted` route accepts one or both `femur_box` and `tibia_box` form fields as JSON arrays of original-image pixel coordinates, for example `[20,30,220,330]`. For bilateral anatomy, pass two boxes for a bone as `[[20,30,220,330],[300,30,500,330]]`. The image is explicitly resized to **1024 pixels high** with its aspect ratio preserved; boxes are scaled to the resized image, and the returned 0/1/2 PNG is restored to the original size. SAM2 then applies its own 1024×1024 model transform. When predictions overlap, the higher SAM2 score wins. Check `sam2_model_loaded` and `sam2_model_version` in `/health` or `prompted_model` in `/model/info`.
+
+The default `.venv` does not contain all SAM2 dependencies. On this workstation, `/home/suman/deepnet/bin/python` has the required packages; `scripts/run_server_sam2.sh` selects it by default, or set `XRAY_PYTHON` to another compatible environment. Install `requirements.txt` and `requirements-sam2.txt` into that environment if needed. Startup is local and downloads nothing. Verify the checkpoint and API together with:
+
+```bash
+PYTHONPATH=. XRAY_CONFIG=configs/management.yaml /home/suman/deepnet/bin/python scripts/smoke_sam2.py
+./scripts/run_server_sam2.sh --config configs/management.yaml
+curl --fail-with-body -F image=@xray.png -F 'femur_box=[20,30,220,330]' \
+  -F 'tibia_box=[150,280,430,580]' http://127.0.0.1:8000/segment/prompted -o mask.png
+```
+
+Box coordinates must lie within the image and have positive area; at least one bone box is required and each bone accepts up to two boxes. The automatic `/segment` route still requires a separately trained production checkpoint. Each model reports readiness independently. The prompted checkpoint is used for inference only; model management and fine-tuning operate on the automatic MONAI UNet family.
+
+## Local nnUNet v2 automatic model
+
+The supplied 2D nnUNet v2 `checkpoint_best.pth`, `plans.json`, and `dataset.json` from `/run/media/suman/Data/nnunet2` are installed under `models/pretrained/nnunet2/`. Its one input channel and label IDs match this service: 0 background, 1 femur, 2 tibia. Its `PlainConvUNet` architecture and nnUNet preprocessing do **not** match this backend's MONAI UNet production checkpoint format, so it runs through a separate automatic `/segment/nnunet` route and model choice. It does not replace `/segment` or participate in the UNet training/promotion workflow.
+
+Input PNGs are converted to the model's uint8 grayscale convention, resized to **2048 pixels high** while preserving aspect ratio, and inferred with nnUNet's 2D sliding window. The returned 0/1/2 PNG is resized back to the original image dimensions with nearest-neighbor interpolation. Check `nnunet_model_loaded` and `nnunet_model_version` in `/health`, or `nnunet_model` in `/model/info`. The local `/home/suman/deepnet/bin/python` environment has nnUNet v2; `scripts/run_server_models.sh` selects it by default. For another Python environment, install `requirements.txt`, `requirements-sam2.txt`, and `requirements-nnunet.txt` as needed and set `XRAY_PYTHON`.
+
+```bash
+PYTHONPATH=. XRAY_CONFIG=configs/management.yaml /home/suman/deepnet/bin/python scripts/smoke_nnunet.py
+./scripts/run_server_models.sh --config configs/management.yaml
+curl --fail-with-body -F image=@xray.png \
+  http://127.0.0.1:8000/segment/nnunet -o mask.png
+```
+
+The supplied training metadata describes an X-ray dataset, but label names alone do not establish accuracy for a new image source; review each predicted mask before use.
+
 ## Installation and environment
 
 Linux is required for the filesystem locks and atomic symlink promotion. Use a local filesystem supporting `flock`, `fsync` and atomic rename. Paths in YAML resolve relative to this repository; absolute paths are accepted.
@@ -27,7 +57,7 @@ PYTHONPATH=. .venv/bin/python -c 'from app.ml.trainer import environment; print(
 ## Start and integrate
 
 ```bash
-./scripts/run_server.sh
+./scripts/run_server_models.sh --config configs/management.yaml
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/model/info
 curl http://127.0.0.1:8000/training/status
@@ -44,7 +74,7 @@ curl --fail-with-body \
 
 Inference returns `image/png` plus `X-Model-Version`, `X-Image-Width`, `X-Image-Height`, and `X-Inference-Time-Ms`. Missing production weights produce HTTP 503; the service still accepts approved cases. Malformed PNG/mask inputs return 422, limits return 413, inference failures return 500, and persistence failures return 507. Health reports service availability; inspect `model_loaded` for inference readiness.
 
-The public routes are `/health`, `/model/info`, `/segment`, `/training/cases`, and `/training/status`. `/segment` also accepts optional `filename`; training submission accepts optional `case_id`, `original_filename`, `model_version`, `annotator`, and `notes`. The machine-readable schema is `/openapi.json`; external-CDN documentation pages are disabled for offline operation.
+The public routes are `/health`, `/model/info`, `/segment`, `/segment/nnunet`, `/segment/prompted`, `/training/cases`, and `/training/status`. `/segment` also accepts optional `filename`; training submission accepts optional `case_id`, `original_filename`, `model_version`, `annotator`, and `notes`. The machine-readable schema is `/openapi.json`; external-CDN documentation pages are disabled for offline operation.
 
 Use `--config /path/to/override.yaml` or `XRAY_CONFIG` to override selected default settings. Bind defaults to `127.0.0.1:8000`. CORS defaults to no permitted cross-origin callers; set `server.cors_origins` to your exact local UI origin(s). This is a trusted local workstation service without authentication; changing its bind address changes that operating assumption.
 
@@ -52,7 +82,7 @@ Use `--config /path/to/override.yaml` or `XRAY_CONFIG` to override selected defa
 
 8-bit and 16-bit grayscale X-rays retain their original stored bytes. RGB/RGBA images are deterministically converted to grayscale for processing and the conversion is logged. Alpha is ignored. Palette, binary, grayscale-alpha and animated images are rejected. Label masks must be 8-bit grayscale with only 0, 1, 2; RGB/palette/16-bit labels are rejected without conversion. Background-only labels are accepted because the service cannot infer anatomical correctness from pixels alone. Anatomical approval belongs to the annotator.
 
-A single preprocessing module handles both training and inference: float32 conversion, percentile clipping, [0,1] scaling, aspect-preserving downscaling, and bottom/right zero padding to UNet stride compatibility. Constant images normalize to zero. Maximum side length defaults to 1024; images are never upscaled before inference. Discrete labels use nearest-neighbor interpolation in both directions. Validation metrics are computed against unaugmented original-resolution labels after inverse mapping. Limits default to 32 MiB per file and 25 million decoded pixels, with an aggregate streamed request limit as well.
+For the automatic UNet route, a single preprocessing module handles both training and inference: float32 conversion, percentile clipping, [0,1] scaling, aspect-preserving downscaling, and bottom/right zero padding to UNet stride compatibility. Constant images normalize to zero. Maximum side length defaults to 1024; images are never upscaled before automatic inference. Discrete labels use nearest-neighbor interpolation in both directions. Validation metrics are computed against unaugmented original-resolution labels after inverse mapping. Limits default to 32 MiB per file and 25 million decoded pixels, with an aggregate streamed request limit as well. Prompted SAM2 uses the separate 1024-high path described above.
 
 ## Dataset and revisions
 

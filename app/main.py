@@ -11,6 +11,8 @@ from app.management.jobs import Management
 from app.core.config import load_config
 from app.core.logging import configure_logging
 from app.ml.predictor import Predictor
+from app.ml.sam2_predictor import Sam2Predictor
+from app.ml.nnunet_predictor import NnUnetPredictor
 from app.ml.store import CaseStore
 
 
@@ -50,11 +52,21 @@ def create_app(config=None, predictor=None):
             app.state.predictor.load()
         except Exception:
             logging.getLogger(__name__).exception("Production model failed to load; inference unavailable")
+        try:
+            app.state.sam2.load()
+        except Exception:
+            logging.getLogger(__name__).exception("Prompted SAM2 model failed to load; prompted inference unavailable")
+        try:
+            app.state.nnunet.load()
+        except Exception:
+            logging.getLogger(__name__).exception("nnUNet v2 model failed to load; nnUNet inference unavailable")
         yield
     app = FastAPI(title="Offline Femur/Tibia Segmentation", lifespan=lifespan,
                   docs_url=None, redoc_url=None)
     app.state.config = config
     app.state.predictor = predictor or Predictor(config)
+    app.state.sam2 = Sam2Predictor(config)
+    app.state.nnunet = NnUnetPredictor(config)
     app.state.store = CaseStore(config)
     app.state.management = Management(config, app.state.predictor)
     app.add_middleware(RequestLimit, maximum=config["limits"]["max_file_bytes"] * 2 + 65536)
