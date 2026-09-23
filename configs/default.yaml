@@ -1,0 +1,42 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+  cors_origins: []
+paths:
+  data: data
+  models: models
+limits:
+  max_file_bytes: 33554432
+  max_pixels: 25000000
+model:
+  architecture: unet
+  channels: [32, 64, 128, 256, 512]
+  strides: [2, 2, 2, 2]
+  num_res_units: 2
+preprocessing:
+  max_size: 1024
+  lower_percentile: 0.5
+  upper_percentile: 99.5
+inference:
+  device: auto
+  mixed_precision: true
+training:
+  epochs: 50
+  batch_size: 4
+  learning_rate: 0.0001
+  new_case_repeat_factor: 3
+  num_workers: 0
+  mixed_precision: true
+  include_background: false
+  seed: 42
+  resume_optimizer: false
+  augmentation:
+    probability: 0.25
+    rotation_radians: 0.0873
+    scale: 0.05
+    translation_pixels: 8
+    intensity: 0.05
+    noise_std: 0.01
+management:
+  enabled: false
+  cpu_threads: 2

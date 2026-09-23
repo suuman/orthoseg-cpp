@@ -1,0 +1,7 @@
+#!/bin/bash
+
+exec systemd-run --user --scope \
+    -p MemoryHigh=7G \
+    -p MemoryMax=8G \
+    -p MemorySwapMax=2G \
+    codex "$@"

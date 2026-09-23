@@ -1,0 +1,4 @@
+# Optional local administrative API. Normal annotation endpoints are unchanged.
+management:
+  enabled: true
+  cpu_threads: 2
