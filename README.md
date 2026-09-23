@@ -332,3 +332,75 @@ type checker.
 
 The example retains AI Studio configuration and a `GEMINI_API_KEY` placeholder,
 but its current annotation code makes no Gemini API calls and needs no API key.
+
+## Optional MONAI AI Segment integration
+
+**AI Segment** calls the separate local MONAI service for a full Femur/Tibia
+prediction. **AI Fill** continues to use the existing MedSAM2 implementation.
+The build additionally requires the Qt 6 `Network` component (provided by
+`qt6-base-dev`). No Python, PyTorch or MONAI dependency is added to the UI.
+
+```bash
+# Start the independently installed MONAI backend from its own repository:
+./scripts/run_server.sh
+
+# In this OrthoSeg repository:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+MONAI_BACKEND_URL=http://127.0.0.1:8000 ./build/orthoseg
+```
+
+`MONAI_BACKEND_URL` is optional and defaults to `http://127.0.0.1:8000`.
+Only local HTTP URLs are accepted; proxy use and redirects are disabled.
+Requests run asynchronously with a three-minute deadline. The normal annotation workflow never launches,
+trains, promotes, or reloads a model. The backend needs an installed production
+model; a missing model is reported without changing the annotation.
+
+Open an original PNG, click **AI Segment**, then edit normally. Existing
+Femur/Tibia annotations require replacement confirmation; Fibula is preserved.
+A prediction is one undoable edit. Changes made during inference cause the
+result to be discarded. Finish/apply/clear an outstanding AI Fill preview before
+AI Segment. PNG bytes are retained at load, including original 16-bit data;
+the display image and original file remain unchanged. JPEG/TIFF/etc. loading
+still works normally, but MONAI operations require an original PNG up to 32 MiB.
+
+After a successful **Export Mask**, **Add to AI Training** optionally uploads
+the original PNG plus a fresh canonical 0/1/2 mask made from the current editable
+annotation. The existing colored PNG export remains authoritative and unchanged.
+Apply AI Fill previews before export as usual. Fibula is background in the
+Femur/Tibia training mask and remains present in the normal export.
+**Save Only** sends nothing. Unchanged accepted/declined annotations are not
+prompted again in that application session; a changed annotation can be offered
+again. Failed uploads preserve the export and allow retry on the next export.
+A first-time empty annotation is not offered; clearing a previously offered or
+MONAI-segmented case can be submitted as an all-background correction.
+
+See [MONAI_INTEGRATION.md](MONAI_INTEGRATION.md) for the API, mapping, tests,
+and the optional real-backend integration check.
+
+## Optional administrative model management
+
+Normal annotation, Export, and Add to AI Training are unchanged. To expose the
+separate technical-user dialog, launch:
+
+```bash
+ORTHOSEG_ENABLE_MODEL_MANAGEMENT=1 ./build/orthoseg
+```
+
+Open **Tools → AI Model Management**. The backend must also have
+`management.enabled: true`; its supplied `configs/management.yaml` enables it.
+The existing `MONAI_BACKEND_URL` value is reused.
+
+The modeless dialog shows backend/device status, disk and loaded production
+versions, training/validation counts, candidate metrics, and recent job logs.
+**Fine-tune New Candidate** and **Promote Candidate** each require explicit
+confirmation. Backend defaults control training; administrative jobs use bounded
+CPU threads to leave the production GPU inference model available. Existing CLI
+GPU training remains separate. Promotion preserves older releases and requires
+a backend restart; the panel shows when loaded and on-disk versions differ.
+
+Opening/refreshing the dialog never trains. Idle panels do not poll; active jobs
+refresh every five seconds while the panel is visible. Closing the UI does not
+cancel backend training. [MODEL_MANAGEMENT.md](MODEL_MANAGEMENT.md) documents the
+API and validation. CTest now includes the focused `management` suite as well as
+all existing annotation and MONAI integration tests.

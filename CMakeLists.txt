@@ -31,7 +31,7 @@ if(NOT OpenCV_DIR)
     endif()
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs dnn)
 
 message(STATUS "OpenCV found version: ${OpenCV_VERSION}")
@@ -71,6 +71,14 @@ target_compile_definitions(orthoseg_ai PUBLIC
 # Executables
 # ---------------------------------------------------------------------------
 
+add_library(orthoseg_monai STATIC src/MonaiClient.cpp)
+target_include_directories(orthoseg_monai PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(orthoseg_monai PUBLIC Qt6::Network ${OpenCV_LIBS})
+
+add_library(orthoseg_management STATIC src/ModelManagementDialog.cpp)
+target_include_directories(orthoseg_management PUBLIC include)
+target_link_libraries(orthoseg_management PUBLIC orthoseg_monai Qt6::Widgets)
+
 # Main Qt desktop application
 add_executable(orthoseg
     src/main.cpp
@@ -81,7 +89,7 @@ add_executable(orthoseg
     include/MainWindow.h
 )
 target_include_directories(orthoseg PRIVATE include)
-target_link_libraries(orthoseg PRIVATE orthoseg_ai Qt6::Widgets)
+target_link_libraries(orthoseg PRIVATE orthoseg_ai orthoseg_monai orthoseg_management Qt6::Widgets)
 
 # Standalone MedSAM2 CLI inference tool
 if(BUILD_EXAMPLES)
@@ -129,6 +137,26 @@ endif()
 if(BUILD_TESTS)
     enable_testing()
 
+    add_executable(test_management tests/test_management.cpp src/Document.cpp src/CanvasWidget.cpp
+        src/MainWindow.cpp include/CanvasWidget.h include/MainWindow.h)
+    target_link_libraries(test_management PRIVATE orthoseg_ai orthoseg_management Qt6::Widgets)
+    add_test(NAME management COMMAND test_management)
+    set_tests_properties(management PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+    if(ALL_RPATHS)
+        set_target_properties(test_management PROPERTIES INSTALL_RPATH "${ALL_RPATHS}" BUILD_WITH_INSTALL_RPATH TRUE)
+        target_link_options(test_management PRIVATE "-Wl,--disable-new-dtags")
+    endif()
+
+    add_executable(test_monai tests/test_monai.cpp src/Document.cpp src/CanvasWidget.cpp
+        src/MainWindow.cpp include/CanvasWidget.h include/MainWindow.h)
+    target_link_libraries(test_monai PRIVATE orthoseg_ai orthoseg_monai orthoseg_management Qt6::Widgets)
+    add_test(NAME monai COMMAND test_monai)
+    set_tests_properties(monai PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+    if(ALL_RPATHS)
+        set_target_properties(test_monai PROPERTIES INSTALL_RPATH "${ALL_RPATHS}" BUILD_WITH_INSTALL_RPATH TRUE)
+        target_link_options(test_monai PRIVATE "-Wl,--disable-new-dtags")
+    endif()
+
     add_executable(test_ai tests/test_ai.cpp)
     target_link_libraries(test_ai PRIVATE orthoseg_ai)
     add_test(NAME ai COMMAND test_ai)
@@ -150,7 +178,7 @@ if(BUILD_TESTS)
         include/CanvasWidget.h
         include/MainWindow.h
     )
-    target_link_libraries(test_ui PRIVATE orthoseg_ai Qt6::Widgets)
+    target_link_libraries(test_ui PRIVATE orthoseg_ai orthoseg_monai orthoseg_management Qt6::Widgets)
     add_test(NAME ui COMMAND test_ui)
     set_tests_properties(ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
 

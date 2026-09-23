@@ -16,6 +16,9 @@ public:
 
     bool loadImage(const std::string& path);
     bool exportMask(const std::string& path) const;
+    const std::vector<unsigned char>& originalPng() const { return originalPng_; }
+    const std::string& sourcePath() const { return sourcePath_; }
+    bool replaceAnatomyMask(const cv::Mat& mapped); // One undo step; preserve unrelated labels.
 
     bool hasImage() const { return !sourceGray_.empty(); }
     int  width()  const { return sourceGray_.cols; }
@@ -68,6 +71,8 @@ public:
 private:
     struct Snapshot { cv::Mat mask; cv::Mat seeds; };
 
+    std::vector<unsigned char> originalPng_;
+    std::string sourcePath_;
     cv::Mat sourceGray_;   // CV_8UC1
     cv::Mat sourceColor_;  // CV_8UC3 (BGR) for display
     cv::Mat mask_;         // CV_8UC1 indexed label ids

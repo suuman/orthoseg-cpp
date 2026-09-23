@@ -3,6 +3,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <iterator>
 
 namespace orthoseg {
 
@@ -20,6 +22,18 @@ bool Document::loadImage(const std::string& path) {
         cv::Mat mask = cv::Mat::zeros(gray.size(), CV_8UC1);
         cv::Mat seeds(gray.size(), CV_8UC1, cv::Scalar(kNoSeed));
 
+        // Retain exact PNG bytes independently of the unchanged display path.
+        std::vector<unsigned char> original;
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (file && file.tellg() > 0 && file.tellg() <= 32 * 1024 * 1024) {
+            file.seekg(0);
+            original.assign(std::istreambuf_iterator<char>(file), {});
+            const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+            if (original.size() < 8 || !std::equal(std::begin(signature), std::end(signature), original.begin()))
+                original.clear();
+        }
+        originalPng_ = std::move(original);
+        sourcePath_ = path;
         sourceColor_ = color;
         sourceGray_ = gray;
         edgeMap_ = edges;
@@ -52,6 +66,19 @@ bool Document::exportMask(const std::string& path) const {
         // than return false. Let the UI show its export error in either case.
         return false;
     }
+}
+
+bool Document::replaceAnatomyMask(const cv::Mat& mapped) {
+    const int bg = static_cast<int>(Label::Background);
+    const int femur = static_cast<int>(Label::Femur);
+    const int tibia = static_cast<int>(Label::Tibia);
+    if (!hasImage() || mapped.size() != mask_.size() || mapped.type() != CV_8UC1 ||
+        cv::countNonZero((mapped != bg) & (mapped != femur) & (mapped != tibia))) return false;
+    cv::Mat next = mask_.clone();
+    mapped.copyTo(next, (mask_ == bg) | (mask_ == femur) | (mask_ == tibia));
+    pushHistory();
+    mask_ = std::move(next);
+    return true;
 }
 
 void Document::applyAIResult() {

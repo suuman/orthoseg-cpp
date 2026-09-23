@@ -1,5 +1,9 @@
 #include "MainWindow.h"
+#include "ModelManagementDialog.h"
+#include <QMenuBar>
 #include <QApplication>
+#include <QFileInfo>
+#include <QStatusBar>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QGridLayout>
@@ -36,6 +40,17 @@ static QLabel* sectionLabel(const QString& text) {
 MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     setWindowTitle("OrthoSeg — Medical Imaging");
     resize(1280, 800);
+    if (qEnvironmentVariable("ORTHOSEG_ENABLE_MODEL_MANAGEMENT") == "1") {
+        auto* tools = menuBar()->addMenu("Tools");
+        auto* manage = tools->addAction("AI Model Management");
+        manage->setObjectName("modelManagementAction");
+        connect(manage, &QAction::triggered, this, [this] {
+            if (!modelManagement_) modelManagement_ = new ModelManagementDialog(this);
+            modelManagement_->show();
+            modelManagement_->raise();
+            modelManagement_->activateWindow();
+        });
+    }
 
     aiModels_ = new QLineEdit(qEnvironmentVariable("MEDSAM2_MODEL_DIR", ORTHOSEG_MODEL_DIR));
     aiModels_->setObjectName("aiModelDirectory");
@@ -83,6 +98,7 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     updateUndoState();
     updateStatus();
 
+    monai_ = std::make_unique<MonaiClient>();
     aiController_ = std::make_unique<AIFillController>();
     connect(aiController_.get(), &AIFillController::completed, this, [this](const cv::Mat& result) {
         aiRun_->setEnabled(true);
@@ -501,6 +517,13 @@ QWidget* MainWindow::buildTopBar() {
         "QPushButton:disabled{ color:#475569; }");
     connect(modelDirBtn_, &QPushButton::clicked, this, &MainWindow::onOpenModelDirDialog);
     h->addWidget(modelDirBtn_);
+
+    monaiSegment_ = new QPushButton("AI Segment");
+    monaiSegment_->setObjectName("monaiSegment");
+    monaiSegment_->setToolTip("Segment Femur/Tibia using the local MONAI service");
+    monaiSegment_->setStyleSheet(modelDirBtn_->styleSheet());
+    connect(monaiSegment_, &QPushButton::clicked, this, &MainWindow::onMonaiSegment);
+    h->addWidget(monaiSegment_);
 
     undoBtn_ = makeIconBtn("↺", "Undo");
     connect(undoBtn_, &QPushButton::clicked, this, &MainWindow::onUndo);
@@ -1270,8 +1293,122 @@ void MainWindow::onExport() {
     dialog.selectFile("bone_segmentation_mask.png");
     if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) return;
     const QString path = dialog.selectedFiles().first();
-    if (!doc_->exportMask(path.toStdString()))
+    if (!doc_->exportMask(path.toStdString())) {
         QMessageBox::warning(this, "OrthoSeg", "Failed to export mask.");
+        return;
+    }
+    offerMonaiTraining();
+}
+
+namespace {
+MonaiLabels editorMonaiLabels() {
+    // Resolve semantics rather than assume canonical numeric IDs.
+    MonaiLabels mapping{-1, -1, -1};
+    for (const auto& info : labels()) {
+        const QString name = QString::fromUtf8(info.name);
+        if (name == "Background") mapping.background = static_cast<int>(info.id);
+        if (name == "Femur") mapping.femur = static_cast<int>(info.id);
+        if (name == "Tibia") mapping.tibia = static_cast<int>(info.id);
+    }
+    if (mapping.background < 0 || mapping.femur < 0 || mapping.tibia < 0)
+        throw std::runtime_error("AI Segment requires Femur and Tibia labels.");
+    return mapping;
+}
+QByteArray sourcePng(const Document& doc) {
+    const auto& bytes = doc.originalPng();
+    if (bytes.empty()) throw std::runtime_error("MONAI requires the original PNG (up to 32 MiB). Open a PNG X-ray first.");
+    return QByteArray(reinterpret_cast<const char*>(bytes.data()), qsizetype(bytes.size()));
+}
+}
+
+void MainWindow::onMonaiSegment() {
+    if (monai_->segmentRunning()) return;
+    try {
+        if (!doc_->hasImage()) throw std::runtime_error("Load a PNG X-ray first.");
+        if (aiController_->running() || !doc_->aiFill().resultMask.empty())
+            throw std::runtime_error("Finish AI Fill and apply or clear its preview before AI Segment.");
+        const auto mapping = editorMonaiLabels();
+        const auto original = sourcePng(*doc_);
+        const auto caseId = monaiCaseId(original);
+        if (cv::countNonZero((doc_->mask() == mapping.femur) | (doc_->mask() == mapping.tibia)) &&
+            QMessageBox::question(this, "AI Segment", "AI Segment will replace the current Femur/Tibia segmentation.\nContinue?",
+                                  QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+        const auto before = doc_->mask().clone();
+        const auto generation = imageGeneration_;
+        monaiSegment_->setEnabled(false);
+        monaiSegment_->setText("Segmenting…");
+        statusBar()->showMessage("MONAI AI Segment is running…");
+        monai_->segment(original, {doc_->width(), doc_->height()},
+            [this, before, generation, caseId, mapping](const cv::Mat& canonical, const QString& version, const QString& error) {
+                monaiSegment_->setEnabled(true);
+                monaiSegment_->setText("AI Segment");
+                statusBar()->clearMessage();
+                if (!error.isEmpty()) { QMessageBox::warning(this, "AI Segment", error); return; }
+                // Editing remains responsive; never overwrite edits made during inference.
+                if (generation != imageGeneration_ || doc_->mask().size() != before.size() ||
+                    cv::norm(doc_->mask(), before, cv::NORM_INF) != 0 || aiController_->running() ||
+                    !doc_->aiFill().resultMask.empty() || (doc_->originalPng().empty() || monaiCaseId(sourcePng(*doc_)) != caseId)) {
+                    QMessageBox::information(this, "AI Segment", "Result discarded because the image or annotation changed. Run AI Segment again when ready.");
+                    return;
+                }
+                try {
+                    if (!doc_->replaceAnatomyMask(fromMonaiLabels(canonical, mapping)))
+                        throw std::runtime_error("Could not apply MONAI mask. Annotation is unchanged.");
+                    monaiVersions_[caseId] = version;
+                    canvas_->update();
+                    updateUndoState();
+                    updateAIPromptStatus();
+                    statusBar()->showMessage("AI Segment complete. Edit normally, then Export Mask.", 8000);
+                } catch (const std::exception& e) {
+                    QMessageBox::warning(this, "AI Segment", QString::fromUtf8(e.what()));
+                }
+            });
+    } catch (const std::exception& e) {
+        monaiSegment_->setEnabled(true);
+        monaiSegment_->setText("AI Segment");
+        statusBar()->clearMessage();
+        QMessageBox::warning(this, "AI Segment", QString::fromUtf8(e.what()));
+    }
+}
+
+void MainWindow::offerMonaiTraining() {
+    // Export has already succeeded; this optional operation never modifies it.
+    if (doc_->originalPng().empty() || monai_->uploadRunning() || monai_->segmentRunning()) return;
+    QByteArray key;
+    try {
+        const auto original = sourcePng(*doc_);
+        const auto caseId = monaiCaseId(original);
+        const auto canonical = toMonaiLabels(doc_->mask(), editorMonaiLabels());
+        if (!cv::countNonZero(canonical) && !monaiVersions_.contains(caseId)) return;
+        key = caseId + monaiCaseId(encodeMonaiMask(canonical));
+        if (monaiPrompted_.contains(key)) return;
+        QMessageBox prompt(QMessageBox::Question, "Add to AI Training",
+            "Segmentation saved successfully.\n\nAdd this corrected segmentation to AI training?",
+            QMessageBox::NoButton, this);
+        auto* add = prompt.addButton("Add to AI Training", QMessageBox::AcceptRole);
+        auto* saveOnly = prompt.addButton("Save Only", QMessageBox::RejectRole);
+        prompt.setDefaultButton(saveOnly);
+        prompt.exec();
+        monaiPrompted_.insert(key);
+        if (!monaiVersions_.contains(caseId)) monaiVersions_.insert(caseId, {});
+        if (prompt.clickedButton() != add) return;
+        // Read the current editable annotation, never a cached MONAI prediction.
+        const auto corrected = toMonaiLabels(doc_->mask(), editorMonaiLabels());
+        monai_->submitTrainingCase(original, corrected, QFileInfo(QString::fromStdString(doc_->sourcePath())).fileName(),
+            monaiVersions_.value(caseId), [this, key](const QJsonObject& response, const QString& error) {
+                if (!error.isEmpty()) {
+                    monaiPrompted_.remove(key); // Next export can retry this revision.
+                    QMessageBox::warning(this, "AI Training",
+                        "Segmentation was saved successfully, but it could not be added to AI training.\n" + error + "\nExport again to retry.");
+                    return;
+                }
+                statusBar()->showMessage(QString("Corrected segmentation added to AI training data. New cases awaiting training: %1")
+                    .arg(response.value("new_cases_since_last_training").toInt()), 12000);
+            });
+    } catch (const std::exception& e) {
+        monaiPrompted_.remove(key);
+        QMessageBox::warning(this, "AI Training", "Segmentation was saved successfully, but it could not be added to AI training.\n" + QString::fromUtf8(e.what()));
+    }
 }
 
 void MainWindow::onClear() {

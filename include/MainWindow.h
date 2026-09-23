@@ -2,6 +2,9 @@
 #include "Document.h"
 #include "CanvasWidget.h"
 #include "AIFillController.h"
+#include "MonaiClient.h"
+#include <QSet>
+#include <QHash>
 #include <QMainWindow>
 #include <memory>
 
@@ -15,6 +18,8 @@ class QLineEdit;
 class QCheckBox;
 
 namespace orthoseg {
+
+class ModelManagementDialog;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -31,6 +36,7 @@ public:
 
 private slots:
     void onUpload();
+    void onMonaiSegment();
     void onExport();
     void onClear();
     void onUndo();
@@ -44,6 +50,7 @@ private slots:
     void selectTool(Tool t);
 
 private:
+    void offerMonaiTraining();
     QWidget* buildSidebar();
     QWidget* buildTopBar();
     QWidget* buildAIPanel();
@@ -52,7 +59,12 @@ private:
     void updateStatus();
     void updateAIPromptStatus();
 
+    ModelManagementDialog* modelManagement_ = nullptr;
     std::unique_ptr<Document> doc_;
+    std::unique_ptr<MonaiClient> monai_;
+    QPushButton* monaiSegment_ = nullptr;
+    QHash<QByteArray, QString> monaiVersions_;
+    QSet<QByteArray> monaiPrompted_;
     CanvasWidget* canvas_ = nullptr;
 
     // Sidebar controls kept for state updates.
