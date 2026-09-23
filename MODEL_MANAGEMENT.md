@@ -1,11 +1,13 @@
 # Optional administrative model management
 
-The admin menu is opt-in: `ORTHOSEG_ENABLE_MODEL_MANAGEMENT=1 ./build/orthoseg`.
-It adds **Tools → AI Model Management**, a modeless dialog separate from all
-annotation controls. Without this environment variable the normal UI is unchanged.
-This flag controls visibility; it is not an authentication credential.
+The AI Fill panel contains a **Model Management** button. It is enabled only
+after the selected local backend accepts `GET /management/status`, and opens a
+modeless dialog. The optional Tools menu shortcut remains available with
+`ORTHOSEG_ENABLE_MODEL_MANAGEMENT=1 ./build/orthoseg`; it follows the same
+backend permission check. The flag is not an authentication credential.
 
-Use the existing `MONAI_BACKEND_URL` (default `http://127.0.0.1:8000`). Backend
+Use the URL in AI Fill, initially taken from `MONAI_BACKEND_URL` (default
+`http://127.0.0.1:8000`). Backend
 management must separately be enabled using `management.enabled: true` or the
 provided `configs/management.yaml`. Administrative APIs are limited to direct
 localhost requests; browser Origin headers and nonlocal Host headers are denied.

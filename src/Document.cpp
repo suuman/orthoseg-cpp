@@ -85,9 +85,14 @@ void Document::applyAIResult() {
     if (aiFill_.resultMask.empty()) return;
     const cv::Mat& result = aiFill_.resultMask;
     if (result.size() != mask_.size() || result.type() != CV_8UC1) return;
-    pushHistory();
-    result.copyTo(mask_, result != 0);
+    if (aiFill_.resultReplacesAnatomy) {
+        if (!replaceAnatomyMask(result)) return;
+    } else {
+        pushHistory();
+        result.copyTo(mask_, result != 0);
+    }
     aiFill_.resultMask.release();
+    aiFill_.resultReplacesAnatomy = false;
 }
 
 void Document::paintAIPrompt(cv::Point a, cv::Point b, bool erase, int brushSize) {

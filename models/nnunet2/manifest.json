@@ -1,0 +1,10 @@
+{
+  "model": "model.onnx",
+  "source": "/run/media/suman/Data/xray/ocv/model.onnx",
+  "source_implementation": "/run/media/suman/Data/xray/ocv/src/segmentor.cpp",
+  "sha256": "1c4f64a5e1edbc875c9017bbcc564f82bd09103a46461578b0ace7dba3468552",
+  "architecture": "nnUNet v2 2D ONNX",
+  "labels": {"background": 0, "femur": 1, "tibia": 2},
+  "input_height": 2048,
+  "runtime": "OpenCV 5 DNN"
+}

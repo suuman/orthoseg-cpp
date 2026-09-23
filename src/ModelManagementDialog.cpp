@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QShowEvent>
 #include <QHideEvent>
+#include <utility>
 
 namespace orthoseg {
 namespace {
@@ -24,7 +25,7 @@ bool active(const QJsonObject& value) {
 }
 QString metricText(const QJsonValue& value) { return value.isDouble() ? QString::number(value.toDouble(), 'f', 4) : "N/A"; }
 }
-ModelManagementDialog::ModelManagementDialog(QWidget* parent) : QDialog(parent), client_(this) {
+ModelManagementDialog::ModelManagementDialog(QWidget* parent, QUrl base) : QDialog(parent), client_(this, std::move(base)) {
     setWindowTitle("AI Model Management");
     setObjectName("modelManagementDialog");
     setModal(false);
@@ -80,6 +81,18 @@ ModelManagementDialog::ModelManagementDialog(QWidget* parent) : QDialog(parent),
 }
 void ModelManagementDialog::showEvent(QShowEvent* event) { QDialog::showEvent(event); refresh(); }
 void ModelManagementDialog::hideEvent(QHideEvent* event) { poll_.stop(); QDialog::hideEvent(event); }
+void ModelManagementDialog::setBackendUrl(QUrl base) {
+    if (client_.baseUrl() == base) return;
+    client_.setBaseUrl(std::move(base));
+    ++backendRevision_;
+    busy_ = false;
+    online_ = false;
+    snapshot_ = {};
+    poll_.stop();
+    render(snapshot_);
+    updateActions();
+    if (isVisible()) refresh();
+}
 void ModelManagementDialog::updateActions() {
     const auto candidate = snapshot_["candidate"].toObject();
     train_->setEnabled(online_ && !busy_ && !active(snapshot_) && snapshot_["can_start"].toBool());
@@ -91,9 +104,11 @@ void ModelManagementDialog::updateActions() {
 void ModelManagementDialog::refresh() {
     if (busy_) return;
     busy_ = true;
+    const auto revision = backendRevision_;
     poll_.stop();
     updateActions();
-    client_.managementStatus([this](const QJsonObject& value, const QString& error) {
+    client_.managementStatus([this, revision](const QJsonObject& value, const QString& error) {
+        if (revision != backendRevision_) return;
         busy_ = false;
         online_ = error.isEmpty();
         if (!online_) {
@@ -117,7 +132,7 @@ void ModelManagementDialog::render(const QJsonObject& value) {
     const auto policy = value["training_policy"].toObject();
     backend_->setText(QString("Backend: %1   Device: %2   GPU: %3\nURL: %4\nModel loaded: %5")
         .arg(text(backend["status"]), text(backend["device"]), text(backend["gpu"]),
-             MonaiClient::configuredUrl().toString(), backend.contains("model_loaded") ? (backend["model_loaded"].toBool() ? "Yes" : "No") : "N/A"));
+             client_.baseUrl().toString(), backend.contains("model_loaded") ? (backend["model_loaded"].toBool() ? "Yes" : "No") : "N/A"));
     production_->setText(QString("Production on disk: %1\nLoaded for inference: %2%3\nArchitecture: %4   Cases: %5\nCreated: %6   Parent: %7")
         .arg(text(production["version"]), text(value["loaded_model_version"]),
              value["restart_required"].toBool() ? " — restart backend required" : "", text(production["architecture"]),
@@ -154,7 +169,9 @@ void ModelManagementDialog::startTraining() {
             .arg(text(production["version"]), text(dataset["total_approved_cases"]), text(dataset["new_cases_since_last_training"]), text(dataset["validation_case_count"])),
         QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
     if (answer != QMessageBox::Yes) { busy_ = false; updateActions(); return; }
-    client_.startTraining([this](const QJsonObject& job, const QString& error) {
+    const auto revision = backendRevision_;
+    client_.startTraining([this, revision](const QJsonObject& job, const QString& error) {
+        if (revision != backendRevision_) return;
         busy_ = false;
         if (!error.isEmpty()) QMessageBox::warning(this, "Fine-tuning failed", error);
         else { snapshot_["job"] = job; snapshot_["training_active"] = true; render(snapshot_); }
@@ -170,7 +187,9 @@ void ModelManagementDialog::promoteCandidate() {
             .arg(text(snapshot_["production"].toObject()["version"]), version),
         QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
     if (answer != QMessageBox::Yes) { busy_ = false; updateActions(); return; }
-    client_.promoteCandidate(version, [this](const QJsonObject&, const QString& error) {
+    const auto revision = backendRevision_;
+    client_.promoteCandidate(version, [this, revision](const QJsonObject&, const QString& error) {
+        if (revision != backendRevision_) return;
         busy_ = false;
         if (!error.isEmpty()) QMessageBox::warning(this, "Promotion failed", error);
         else QMessageBox::information(this, "Candidate promoted", "Candidate promoted successfully. Restart the MONAI backend to load the new model.");

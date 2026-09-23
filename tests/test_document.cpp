@@ -42,6 +42,23 @@ int main() {
     {
         Document doc;
         CHECK(doc.loadImage(input), "load source image");
+        doc.paintLine({20, 20}, {20, 20}, Label::Femur, 2);
+        doc.paintLine({30, 20}, {30, 20}, Label::Fibula, 2);
+        const auto beforeAutomatic = doc.mask().clone();
+        doc.aiFill().resultMask = cv::Mat::zeros(doc.mask().size(), CV_8UC1);
+        doc.aiFill().resultMask.at<uchar>(25, 25) = static_cast<uchar>(Label::Tibia);
+        doc.aiFill().resultReplacesAnatomy = true;
+        doc.applyAIResult();
+        CHECK(doc.mask().at<uchar>(20, 20) == 0 && doc.mask().at<uchar>(25, 25) == 2 &&
+              doc.mask().at<uchar>(20, 30) == 3 && doc.aiFill().resultMask.empty(),
+              "automatic AI preview replaces anatomy while preserving Fibula");
+        doc.undo();
+        CHECK(same(doc.mask(), beforeAutomatic), "automatic AI result applies in one undo step");
+    }
+
+    {
+        Document doc;
+        CHECK(doc.loadImage(input), "load source image");
         doc.paintLine({51, 5}, {51, 5}, Label::Tibia, 2);
         doc.paintLine({800, 51}, {810, 51}, Label::Fibula, 2);
         doc.paintLine({901, 11}, {901, 11}, Label::Femur, 2);

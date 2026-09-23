@@ -11,8 +11,9 @@ class QTableWidget;
 namespace orthoseg {
 class ModelManagementDialog : public QDialog {
 public:
-    explicit ModelManagementDialog(QWidget* parent = nullptr);
+    explicit ModelManagementDialog(QWidget* parent = nullptr, QUrl base = MonaiClient::configuredUrl());
     void refresh();
+    void setBackendUrl(QUrl base);
 protected:
     void showEvent(QShowEvent* event) override;
     void hideEvent(QHideEvent* event) override;
@@ -26,6 +27,7 @@ private:
     QJsonObject snapshot_;
     bool busy_ = false;
     bool online_ = false;
+    unsigned backendRevision_ = 0;
     QLabel* backend_;
     QLabel* production_;
     QLabel* dataset_;

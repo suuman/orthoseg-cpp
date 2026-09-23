@@ -79,6 +79,9 @@ int main(int argc,char** argv){
         qputenv("ORTHOSEG_ENABLE_MODEL_MANAGEMENT", "1");
         MainWindow window; window.show();
         auto* action=window.findChild<QAction*>("modelManagementAction");
+        auto* managementButton=window.findChild<QPushButton*>("modelManagementButton");
+        CHECK(managementButton && waitFor([&]{return managementButton->isEnabled();}), "live management permission available");
+        if (!managementButton || !managementButton->isEnabled()) return 1;
         action->trigger();
         auto* panel=dynamic_cast<ModelManagementDialog*>(window.findChild<QDialog*>("modelManagementDialog"));
         auto* train=panel->findChild<QPushButton*>("managementTrain");
@@ -112,14 +115,20 @@ int main(int argc,char** argv){
         return failures?1:0;
     }
     qunsetenv("ORTHOSEG_ENABLE_MODEL_MANAGEMENT");
+    qputenv("MONAI_BACKEND_URL", "http://127.0.0.1:9");
     MainWindow normal;
     CHECK(!normal.findChild<QAction*>("modelManagementAction"),"normal annotator has no management controls");
+    auto* normalButton=normal.findChild<QPushButton*>("modelManagementButton");
+    CHECK(normalButton && !normalButton->isEnabled(),"management button starts disabled without backend privilege");
     Backend server;
     qputenv("MONAI_BACKEND_URL",QString("http://127.0.0.1:%1").arg(server.serverPort()).toUtf8());
     qputenv("ORTHOSEG_ENABLE_MODEL_MANAGEMENT","1");
     MainWindow admin;admin.show();
     auto* action=admin.findChild<QAction*>("modelManagementAction");
     CHECK(action,"admin Tools action exists");if(!action)return 1;
+    auto* managementButton=admin.findChild<QPushButton*>("modelManagementButton");
+    CHECK(managementButton && waitFor([&]{return managementButton->isEnabled();}),
+          "management button enabled by backend permission");
     action->trigger();
     auto* panel=dynamic_cast<ModelManagementDialog*>(admin.findChild<QDialog*>("modelManagementDialog"));
     CHECK(panel && !panel->isModal(),"management dialog is separate and modeless");if(!panel)return 1;

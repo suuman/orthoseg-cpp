@@ -9,6 +9,7 @@
 #include <QtEndian>
 #include <opencv2/imgcodecs.hpp>
 #include <memory>
+#include <algorithm>
 #include <stdexcept>
 
 namespace orthoseg {
@@ -84,7 +85,8 @@ MonaiClient::MonaiClient(QObject* parent, QUrl base, int timeoutMs)
     network_.setProxy(QNetworkProxy::NoProxy);
 }
 void MonaiClient::request(const QString& path, const QByteArray& original, const QByteArray& mask,
-                          const QString& filename, const QString& version, ReplyCallback done, const QByteArray& jsonBody) {
+                          const QString& filename, const QString& version, ReplyCallback done, const QByteArray& jsonBody,
+                          const QByteArray& femurBox, const QByteArray& tibiaBox) {
     const auto host = base_.host().toLower();
     if (!base_.isValid() || base_.scheme() != "http" ||
         (host != "127.0.0.1" && host != "localhost" && host != "::1") ||
@@ -98,7 +100,9 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
     url.setPath(prefix + path);
     QNetworkRequest req(url);
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
-    req.setTransferTimeout(timeoutMs_);
+    const int deadline = (path == "/health" || path == "/management/status") ?
+        std::min(timeoutMs_, 5000) : timeoutMs_;
+    req.setTransferTimeout(deadline);
     QNetworkReply* reply;
     if (!jsonBody.isNull()) {
         req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -116,6 +120,8 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
         };
         part("image", original, true);
         part("case_id", monaiCaseId(original), false);
+        if (!femurBox.isEmpty()) part("femur_box", femurBox, false);
+        if (!tibiaBox.isEmpty()) part("tibia_box", tibiaBox, false);
         if (!mask.isEmpty()) {
             part("mask", mask, true);
             part("original_filename", filename.toUtf8(), false);
@@ -130,7 +136,7 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
         reply->setProperty("monaiTimeout", true);
         reply->abort();
     });
-    timer->start(timeoutMs_);
+    timer->start(deadline);
     auto body = std::make_shared<QByteArray>();
     connect(reply, &QNetworkReply::readyRead, reply, [reply, body] {
         body->append(reply->readAll());
@@ -152,7 +158,8 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
             if (detail.isString()) error += ": " + detail.toString().left(1000);
         } else if (reply->error() != QNetworkReply::NoError) {
             error = "MONAI AI Segment service is unavailable. Start the local MONAI backend and try again.\n" + reply->errorString();
-        } else if (path == "/segment" && reply->header(QNetworkRequest::ContentTypeHeader).toString().section(';', 0, 0).trimmed() != "image/png") {
+        } else if ((path == "/segment" || path == "/segment/prompted" || path == "/segment/nnunet") &&
+                   reply->header(QNetworkRequest::ContentTypeHeader).toString().section(';', 0, 0).trimmed() != "image/png") {
             error = "MONAI did not return image/png.";
         }
         const auto versionHeader = reply->rawHeader("X-Model-Version");
@@ -201,6 +208,36 @@ bool MonaiClient::segment(const QByteArray& original, cv::Size expected, Segment
         catch (const std::exception& e) { done({}, {}, QString::fromUtf8(e.what())); return; }
         done(mask, QString::fromUtf8(version), {});
     });
+    return true;
+}
+bool MonaiClient::segmentNnUnet(const QByteArray& original, cv::Size expected, SegmentCallback done) {
+    if (segmentRunning_) return false;
+    validateOriginal(original);
+    segmentRunning_ = true;
+    request("/segment/nnunet", original, {}, {}, {},
+        [this, expected, done](const QByteArray& bytes, const QByteArray& version, const QString& error) {
+            segmentRunning_ = false;
+            if (!error.isEmpty()) { done({}, {}, error); return; }
+            try { done(decodeMonaiMask(bytes, expected), QString::fromUtf8(version), {}); }
+            catch (const std::exception& e) { done({}, {}, QString::fromUtf8(e.what())); }
+        });
+    return true;
+}
+bool MonaiClient::segmentPrompted(const QByteArray& original, cv::Size expected, const QJsonArray& femurBox,
+                                  const QJsonArray& tibiaBox, SegmentCallback done) {
+    if (segmentRunning_) return false;
+    validateOriginal(original);
+    if (femurBox.isEmpty() && tibiaBox.isEmpty())
+        throw std::runtime_error("Draw a Femur or Tibia box before running MONAI SAM2.");
+    segmentRunning_ = true;
+    request("/segment/prompted", original, {}, {}, {},
+        [this, expected, done](const QByteArray& bytes, const QByteArray& version, const QString& error) {
+            segmentRunning_ = false;
+            if (!error.isEmpty()) { done({}, {}, error); return; }
+            try { done(decodeMonaiMask(bytes, expected), QString::fromUtf8(version), {}); }
+            catch (const std::exception& e) { done({}, {}, QString::fromUtf8(e.what())); }
+        }, {}, femurBox.isEmpty() ? QByteArray() : QJsonDocument(femurBox).toJson(QJsonDocument::Compact),
+            tibiaBox.isEmpty() ? QByteArray() : QJsonDocument(tibiaBox).toJson(QJsonDocument::Compact));
     return true;
 }
 bool MonaiClient::submitTrainingCase(const QByteArray& original, const cv::Mat& canonical,

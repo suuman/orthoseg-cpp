@@ -16,6 +16,8 @@ class QStackedWidget;
 class QWidget;
 class QLineEdit;
 class QCheckBox;
+class QTimer;
+class QAction;
 
 namespace orthoseg {
 
@@ -43,6 +45,9 @@ private slots:
     void onRunSegmentation();
     void onClearSeeds();
     void onRunAIFill();
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    void onRunNativeNnUnet();
+#endif
     void onLoadPromptMask();
     void onOpenModelDirDialog();
     void onOpenClaheDialog();
@@ -51,6 +56,9 @@ private slots:
 
 private:
     void offerMonaiTraining();
+    void startMonaiSegment(bool prompted, bool nnunet = false);
+    void checkMonaiStatus();
+    void openModelManagement();
     QWidget* buildSidebar();
     QWidget* buildTopBar();
     QWidget* buildAIPanel();
@@ -63,7 +71,29 @@ private:
     std::unique_ptr<Document> doc_;
     std::unique_ptr<MonaiClient> monai_;
     QPushButton* monaiSegment_ = nullptr;
+    QComboBox* aiModelSelector_ = nullptr;
+    QLineEdit* monaiUrl_ = nullptr;
+    QLabel* monaiStatus_ = nullptr;
+    QLabel* monaiModel_ = nullptr;
+    QPushButton* managementButton_ = nullptr;
+    QAction* managementAction_ = nullptr;
+    QWidget* medSamControls_ = nullptr;
+    QWidget* monaiControls_ = nullptr;
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    QWidget* nativeNnUnetControls_ = nullptr;
+    QString nativeNnUnetModelPath_;
+    QString nativeNnUnetDeviceKey_ = "auto";
+    cv::Mat nativeNnUnetBefore_;
+    unsigned long nativeNnUnetGeneration_ = 0;
+#endif
+    QWidget* aiResultControls_ = nullptr;
+    QTimer* monaiCheckTimer_ = nullptr;
+    unsigned monaiCheckSerial_ = 0;
+    bool monaiRequestPending_ = false;
+    bool monaiReady_ = false;
     QHash<QByteArray, QString> monaiVersions_;
+    QByteArray pendingMonaiVersionKey_;
+    QString pendingMonaiVersion_;
     QSet<QByteArray> monaiPrompted_;
     CanvasWidget* canvas_ = nullptr;
 
@@ -90,6 +120,11 @@ private:
     QPushButton* clearFemurBoxBtn_ = nullptr;
     QLabel* tibiaBoxStatus_ = nullptr;
     QPushButton* clearTibiaBoxBtn_ = nullptr;
+    QPushButton* nextBoxBtn_ = nullptr;
+    QLabel* femurBox2Status_ = nullptr;
+    QLabel* tibiaBox2Status_ = nullptr;
+    QPushButton* clearFemurBox2Btn_ = nullptr;
+    QPushButton* clearTibiaBox2Btn_ = nullptr;
     QWidget* normalMaskControls_ = nullptr;
     QLabel* normalMaskStatus_ = nullptr;
     QPushButton* copyNormalMaskBtn_ = nullptr;

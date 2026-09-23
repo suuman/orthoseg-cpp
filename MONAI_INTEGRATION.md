@@ -2,21 +2,26 @@
 
 ## Actual API and startup
 
-Backend startup, from its repository: `./scripts/run_server.sh`. Default bind:
+Backend startup with local SAM2 and nnUNet v2, from its repository:
+`./scripts/run_server_models.sh --config configs/management.yaml`. Default bind:
 `http://127.0.0.1:8000`.
 
 | Route | Method | Contract |
 | --- | --- | --- |
-| `/health` | GET | JSON including `model_loaded`, `model_version`, labels |
-| `/model/info` | GET | Model/input configuration; available but not needed by the UI |
+| `/health` | GET | JSON including separate production, SAM2, and nnUNet readiness/version fields |
+| `/model/info` | GET | Production, prompted SAM2, and nnUNet model information |
 | `/segment` | POST | Multipart `image`, optional `case_id`, `filename`; returns `image/png` |
+| `/segment/nnunet` | POST | Multipart original PNG; nnUNet v2 automatic prediction, source-sized 0/1/2 PNG |
+| `/segment/prompted` | POST | Multipart original PNG and one or two Femur/Tibia boxes; source-sized 0/1/2 PNG |
 | `/training/cases` | POST | Multipart `image`, `mask`, `case_id`, `original_filename`, `model_version` |
 | `/training/status` | GET | Informational counts; never initiates training |
 
 The backend also accepts optional `annotator` and `notes`; the UI does not invent
 these values. Errors are JSON with `detail` (a string or validation-error array).
 Model provenance arrives in `X-Model-Version`; its absence is allowed.
-No backend implementation files were changed for this integration.
+The nnUNet v2 checkpoint has the correct labels but an incompatible architecture
+for the MONAI production UNet. It has its own route and AI Fill model choice;
+model management remains tied to the MONAI production UNet.
 
 ## Minimal changes
 

@@ -137,6 +137,16 @@ int main(int argc, char** argv) {
           doc.aiFill().femurBox && doc.aiFill().femurBox->x0 == 4,
           "both femur and tibia boxes persist concurrently");
     canvas.setActiveLabel(Label::Femur);
+    doc.aiFill().showSecondaryBoxes = true;
+    doc.aiFill().activeBoxNumber = 2;
+    mouse(QEvent::MouseButtonPress, sourcePoint(10, 11), Qt::LeftButton, Qt::LeftButton);
+    mouse(QEvent::MouseMove, sourcePoint(17, 18), Qt::NoButton, Qt::LeftButton);
+    mouse(QEvent::MouseButtonRelease, sourcePoint(17, 18), Qt::LeftButton, Qt::NoButton);
+    CHECK(doc.aiFill().femurBox2 && doc.aiFill().femurBox2->x0 == 10 &&
+          doc.aiFill().femurBox && doc.aiFill().femurBox->x0 == 4,
+          "next bounding box preserves first Femur box for bilateral cases");
+    doc.aiFill().showSecondaryBoxes = false;
+    doc.aiFill().activeBoxNumber = 1;
 
     CHECK(cv::countNonZero(doc.mask()) == 0, "AI box gestures preserve editable annotations");
     canvas.zoomReset();

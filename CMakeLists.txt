@@ -17,6 +17,7 @@ endif()
 # Build options
 option(BUILD_TESTS "Build test suites" ON)
 option(BUILD_EXAMPLES "Build standalone example tools" ON)
+option(ENABLE_NATIVE_NNUNET "Build native OpenCV 5 nnUNet v2 inference" ON)
 
 if(DEFINED BUILD_TESTING)
   set(BUILD_TESTS ${BUILD_TESTING})
@@ -33,6 +34,10 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs dnn)
+if(ENABLE_NATIVE_NNUNET AND OpenCV_VERSION VERSION_LESS "5.0")
+    message(WARNING "Native nnUNet v2 requires OpenCV 5; disabling this AI Fill choice")
+    set(ENABLE_NATIVE_NNUNET OFF)
+endif()
 
 message(STATUS "OpenCV found version: ${OpenCV_VERSION}")
 message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
@@ -56,6 +61,12 @@ add_library(orthoseg_core STATIC
 target_include_directories(orthoseg_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(orthoseg_core PUBLIC ${OpenCV_LIBS})
 
+if(ENABLE_NATIVE_NNUNET)
+    add_library(native_nnunet_ocv STATIC src/native_nnunet/segmentor.cpp)
+    target_include_directories(native_nnunet_ocv PUBLIC src/native_nnunet ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(native_nnunet_ocv PUBLIC ${OpenCV_LIBS})
+endif()
+
 # AI fill controller and worker
 add_library(orthoseg_ai STATIC
     src/MedSAM2Inference.cpp
@@ -64,6 +75,11 @@ add_library(orthoseg_ai STATIC
 )
 target_include_directories(orthoseg_ai PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(orthoseg_ai PUBLIC orthoseg_core medsam2_ocv Qt6::Core)
+if(ENABLE_NATIVE_NNUNET)
+    target_link_libraries(orthoseg_ai PUBLIC native_nnunet_ocv)
+    target_compile_definitions(orthoseg_ai PUBLIC ORTHOSEG_NATIVE_NNUNET=1
+        ORTHOSEG_NNUNET_MODEL="${CMAKE_CURRENT_SOURCE_DIR}/models/nnunet2/model.onnx")
+endif()
 target_compile_definitions(orthoseg_ai PUBLIC
     ORTHOSEG_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/models")
 
@@ -136,6 +152,27 @@ endif()
 # ---------------------------------------------------------------------------
 if(BUILD_TESTS)
     enable_testing()
+
+    if(ENABLE_NATIVE_NNUNET AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/models/nnunet2/model.onnx")
+        add_executable(test_native_nnunet tests/test_native_nnunet.cpp)
+        target_link_libraries(test_native_nnunet PRIVATE native_nnunet_ocv)
+        add_test(NAME native_nnunet COMMAND test_native_nnunet "${CMAKE_CURRENT_SOURCE_DIR}/models/nnunet2/model.onnx")
+        set_tests_properties(native_nnunet PROPERTIES TIMEOUT 120)
+        if(ALL_RPATHS)
+            set_target_properties(test_native_nnunet PROPERTIES INSTALL_RPATH "${ALL_RPATHS}" BUILD_WITH_INSTALL_RPATH TRUE)
+            target_link_options(test_native_nnunet PRIVATE "-Wl,--disable-new-dtags")
+        endif()
+
+        add_executable(test_native_ui tests/test_native_ui.cpp src/Document.cpp src/CanvasWidget.cpp
+            src/MainWindow.cpp include/CanvasWidget.h include/MainWindow.h)
+        target_link_libraries(test_native_ui PRIVATE orthoseg_ai orthoseg_monai orthoseg_management Qt6::Widgets)
+        add_test(NAME native_ui COMMAND test_native_ui "${CMAKE_CURRENT_SOURCE_DIR}/models/nnunet2/model.onnx")
+        set_tests_properties(native_ui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
+        if(ALL_RPATHS)
+            set_target_properties(test_native_ui PROPERTIES INSTALL_RPATH "${ALL_RPATHS}" BUILD_WITH_INSTALL_RPATH TRUE)
+            target_link_options(test_native_ui PRIVATE "-Wl,--disable-new-dtags")
+        endif()
+    endif()
 
     add_executable(test_management tests/test_management.cpp src/Document.cpp src/CanvasWidget.cpp
         src/MainWindow.cpp include/CanvasWidget.h include/MainWindow.h)

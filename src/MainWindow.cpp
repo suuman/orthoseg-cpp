@@ -20,7 +20,10 @@
 #include <QCheckBox>
 #include <QDialog>
 #include <QMouseEvent>
+#include <QTimer>
+#include <QJsonArray>
 #include <filesystem>
+#include <cmath>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <stdexcept>
@@ -44,12 +47,9 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
         auto* tools = menuBar()->addMenu("Tools");
         auto* manage = tools->addAction("AI Model Management");
         manage->setObjectName("modelManagementAction");
-        connect(manage, &QAction::triggered, this, [this] {
-            if (!modelManagement_) modelManagement_ = new ModelManagementDialog(this);
-            modelManagement_->show();
-            modelManagement_->raise();
-            modelManagement_->activateWindow();
-        });
+        manage->setEnabled(false);
+        managementAction_ = manage;
+        connect(manage, &QAction::triggered, this, &MainWindow::openModelManagement);
     }
 
     aiModels_ = new QLineEdit(qEnvironmentVariable("MEDSAM2_MODEL_DIR", ORTHOSEG_MODEL_DIR));
@@ -60,7 +60,8 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     connect(canvas_, &CanvasWidget::maskChanged, this, [this] {
         updateUndoState();
         updateAIPromptStatus();
-        if (doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+        if (doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0 &&
+            !(activeTool_ == Tool::AIFill && doc_->aiFill().promptType == AIFillPromptType::BoundingBox)) {
             doc_->aiFill().promptMask = doc_->mask().clone();
             doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
             if (aiPromptCombo_) {
@@ -99,6 +100,11 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     updateStatus();
 
     monai_ = std::make_unique<MonaiClient>();
+    monaiCheckTimer_ = new QTimer(this);
+    monaiCheckTimer_->setInterval(15000);
+    connect(monaiCheckTimer_, &QTimer::timeout, this, &MainWindow::checkMonaiStatus);
+    monaiCheckTimer_->start();
+    QTimer::singleShot(0, this, &MainWindow::checkMonaiStatus);
     aiController_ = std::make_unique<AIFillController>();
     connect(aiController_.get(), &AIFillController::completed, this, [this](const cv::Mat& result) {
         aiRun_->setEnabled(true);
@@ -109,6 +115,9 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
             return;
         }
         doc_->aiFill().resultMask = result;
+        doc_->aiFill().resultReplacesAnatomy = false;
+        pendingMonaiVersionKey_.clear();
+        pendingMonaiVersion_.clear();
         doc_->aiFill().showResult = true;
         doc_->aiFill().showPrompt = false; // Hide prompts after segmentation completes
         aiShow_->setChecked(true);
@@ -126,6 +135,45 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
         aiStatus_->setText("AI Fill failed.");
         QMessageBox::warning(this, "AI Fill", error);
     });
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    connect(aiController_.get(), &AIFillController::nativeCompleted, this, [this](const cv::Mat& result) {
+        aiRun_->setEnabled(true);
+        if (modelDirBtn_) modelDirBtn_->setEnabled(true);
+        statusBar()->clearMessage();
+        if (nativeNnUnetGeneration_ != imageGeneration_ || !doc_->hasImage() ||
+            result.size() != nativeNnUnetBefore_.size() ||
+            doc_->mask().size() != nativeNnUnetBefore_.size() ||
+            cv::norm(doc_->mask(), nativeNnUnetBefore_, cv::NORM_INF) != 0) {
+            aiStatus_->setText("Native nnUNet result discarded because the image or annotation changed.");
+            nativeNnUnetBefore_.release();
+            return;
+        }
+        nativeNnUnetBefore_.release();
+        if (result.type() != CV_8UC1 || cv::countNonZero(result > 2)) {
+            aiStatus_->setText("Native nnUNet returned an invalid mask. Annotation unchanged.");
+            QMessageBox::warning(this, "Native nnUNet", aiStatus_->text());
+            return;
+        }
+        doc_->aiFill().resultMask = result.clone();
+        doc_->aiFill().resultReplacesAnatomy = true;
+        doc_->aiFill().showResult = true;
+        aiShow_->setChecked(true);
+        pendingMonaiVersionKey_.clear();
+        pendingMonaiVersion_.clear();
+        canvas_->update();
+        updateAIPromptStatus();
+        aiStatus_->setText("Native nnUNet preview ready. Apply AI Result to Mask to edit or export.");
+        statusBar()->showMessage(aiStatus_->text(), 8000);
+    });
+    connect(aiController_.get(), &AIFillController::nativeFailed, this, [this](const QString& error) {
+        aiRun_->setEnabled(true);
+        if (modelDirBtn_) modelDirBtn_->setEnabled(true);
+        nativeNnUnetBefore_.release();
+        statusBar()->clearMessage();
+        aiStatus_->setText("Native nnUNet inference failed.");
+        QMessageBox::warning(this, "Native nnUNet", error);
+    });
+#endif
 }
 
 MainWindow::~MainWindow() = default;
@@ -185,7 +233,7 @@ QWidget* MainWindow::buildSidebar() {
     auto* toolRow = new QHBoxLayout;
     toolRow->setSpacing(8);
     const char* toolNames[4] = {"Brush", "Fill", "Eraser", "AI Fill"};
-    const char* toolIcons[4] = {"🖌", "🪣", "🧽", "AI"};
+    const char* toolIcons[4] = {"🖌", "🪣", "🧽", "✦"};
     for (int i = 0; i < 4; ++i) {
         Tool tid = static_cast<Tool>(i);
         auto* btn = new QPushButton(QString("%1\n%2").arg(toolIcons[i], toolNames[i]));
@@ -430,7 +478,7 @@ QWidget* MainWindow::buildSidebar() {
     auto* scroll = new QScrollArea;
     scroll->setWidget(side);
     scroll->setWidgetResizable(true);
-    scroll->setFixedWidth(288);
+    scroll->setFixedWidth(328);
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
@@ -506,9 +554,9 @@ QWidget* MainWindow::buildTopBar() {
     connect(claheSettingsBtn_, &QPushButton::clicked, this, &MainWindow::onOpenClaheDialog);
     h->addWidget(claheSettingsBtn_);
 
-    modelDirBtn_ = new QPushButton("🧠 MedSAM2 Models");
+    modelDirBtn_ = new QPushButton("🧠 Local Models");
     modelDirBtn_->setObjectName("modelDirBtn");
-    modelDirBtn_->setToolTip(QString("MedSAM2 Model Directory: %1\nClick to change directory").arg(aiModels_->text()));
+    modelDirBtn_->setToolTip("Configure local MedSAM2 and nnUNet v2 models");
     modelDirBtn_->setCursor(Qt::PointingHandCursor);
     modelDirBtn_->setStyleSheet(
         "QPushButton{ background:#1e293b; color:#cbd5e1; border:1px solid #334155;"
@@ -555,7 +603,110 @@ QWidget* MainWindow::buildAIPanel() {
     auto* layout = new QVBoxLayout(panel);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(8);
-    layout->addWidget(sectionLabel("AI Fill · Prompt Type"));
+    layout->addWidget(sectionLabel("AI model"));
+    aiModelSelector_ = new QComboBox;
+    aiModelSelector_->setObjectName("aiModelSelector");
+    aiModelSelector_->addItems({"MedSAM2", "MONAI production (UNet)", "MONAI SAM2 (boxes)", "MONAI nnUNet v2"});
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    aiModelSelector_->addItem("Native nnUNet v2 (OpenCV 5)");
+#endif
+    connect(aiModelSelector_, &QComboBox::currentIndexChanged, this, [this] {
+        if (medSamControls_) medSamControls_->setVisible(aiModelSelector_->currentIndex() == 0);
+        if (monaiControls_) monaiControls_->setVisible(aiModelSelector_->currentIndex() != 0
+#ifdef ORTHOSEG_NATIVE_NNUNET
+                                                       && aiModelSelector_->currentIndex() != 4
+#endif
+                                                       );
+#ifdef ORTHOSEG_NATIVE_NNUNET
+        if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(aiModelSelector_->currentIndex() == 4);
+#endif
+        if (aiRun_) aiRun_->setText(aiModelSelector_->currentIndex() == 0 ? "▶ Run AI Fill" :
+                                   aiModelSelector_->currentIndex() == 1 ? "▶ Run MONAI Segment" :
+                                   aiModelSelector_->currentIndex() == 2 ? "▶ Run MONAI SAM2" :
+                                   aiModelSelector_->currentIndex() == 3 ? "▶ Run nnUNet v2" : "▶ Run Native nnUNet");
+        if (aiModelSelector_->currentIndex() == 2) {
+            doc_->aiFill().promptType = AIFillPromptType::BoundingBox;
+            doc_->aiFill().showPrompt = true;
+            doc_->aiFill().showSecondaryBoxes = true;
+            canvas_->setActiveTool(activeTool_);
+        } else if (aiModelSelector_->currentIndex() == 0 && aiPromptCombo_) {
+            doc_->aiFill().promptType = static_cast<AIFillPromptType>(aiPromptCombo_->currentIndex());
+            doc_->aiFill().showSecondaryBoxes = false;
+            doc_->aiFill().activeBoxNumber = 1;
+            canvas_->setActiveTool(activeTool_);
+        } else {
+            doc_->aiFill().showSecondaryBoxes = false;
+        }
+        updateSettingsVisibility();
+#ifdef ORTHOSEG_NATIVE_NNUNET
+        if (aiModelSelector_->currentIndex() == 4) {
+            aiStatus_->setText(QFileInfo(nativeNnUnetModelPath_).isFile() ?
+                "Native nnUNet ready. No MONAI server needed." : "Native nnUNet ONNX model not found.");
+        } else
+#endif
+        if (monaiUrl_) checkMonaiStatus();
+    });
+    layout->addWidget(aiModelSelector_);
+
+    monaiControls_ = new QWidget;
+    auto* monaiLayout = new QVBoxLayout(monaiControls_);
+    monaiLayout->setContentsMargins(0, 0, 0, 0);
+    monaiLayout->addWidget(sectionLabel("MONAI service"));
+    monaiUrl_ = new QLineEdit(MonaiClient::configuredUrl().toString());
+    monaiUrl_->setObjectName("monaiBackendUrl");
+    monaiUrl_->setPlaceholderText("http://127.0.0.1:8000");
+    monaiUrl_->setMinimumWidth(0);
+    monaiLayout->addWidget(monaiUrl_);
+    monaiStatus_ = new QLabel("● Checking MONAI service…");
+    monaiStatus_->setObjectName("monaiHealthStatus");
+    monaiStatus_->setStyleSheet("color:#fbbf24;");
+    monaiStatus_->setTextFormat(Qt::PlainText);
+    monaiStatus_->setWordWrap(true);
+    monaiLayout->addWidget(monaiStatus_);
+    monaiModel_ = new QLabel("Loaded model: N/A");
+    monaiModel_->setObjectName("monaiLoadedModel");
+    monaiModel_->setTextFormat(Qt::PlainText);
+    monaiModel_->setWordWrap(true);
+    monaiLayout->addWidget(monaiModel_);
+    managementButton_ = new QPushButton("Model Management");
+    managementButton_->setObjectName("modelManagementButton");
+    managementButton_->setEnabled(false);
+    managementButton_->setToolTip("Available when the local MONAI backend grants management access");
+    connect(managementButton_, &QPushButton::clicked, this, &MainWindow::openModelManagement);
+    monaiLayout->addWidget(managementButton_);
+    connect(monaiUrl_, &QLineEdit::textChanged, this, [this] {
+        ++monaiCheckSerial_;
+        monaiReady_ = false;
+        managementButton_->setEnabled(false);
+        if (managementAction_) managementAction_->setEnabled(false);
+        if (monai_) monai_->setBaseUrl(QUrl(monaiUrl_->text().trimmed()));
+        monaiStatus_->setStyleSheet("color:#f87171;");
+        monaiStatus_->setText("● URL changed — check pending");
+        const auto revision = monaiCheckSerial_;
+        QTimer::singleShot(500, this, [this, revision] {
+            if (revision == monaiCheckSerial_) checkMonaiStatus();
+        });
+    });
+    connect(monaiUrl_, &QLineEdit::returnPressed, this, &MainWindow::checkMonaiStatus);
+    layout->addWidget(monaiControls_);
+
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    nativeNnUnetControls_ = new QWidget;
+    auto* nativeLayout = new QVBoxLayout(nativeNnUnetControls_);
+    nativeLayout->setContentsMargins(0, 0, 0, 0);
+    nativeLayout->addWidget(sectionLabel("Native nnUNet v2 · OpenCV 5"));
+    nativeNnUnetModelPath_ = qEnvironmentVariable("ORTHOSEG_NNUNET_MODEL", ORTHOSEG_NNUNET_MODEL);
+    auto* nativeNote = new QLabel("Runs locally without MONAI. Input height: 2048 px. Configure model and device in Local Models above.");
+    nativeNote->setWordWrap(true);
+    nativeLayout->addWidget(nativeNote);
+    layout->addWidget(nativeNnUnetControls_);
+#endif
+
+    medSamControls_ = new QWidget;
+    auto* medSamLayout = new QVBoxLayout(medSamControls_);
+    medSamLayout->setContentsMargins(0, 0, 0, 0);
+    medSamLayout->setSpacing(8);
+    medSamLayout->addWidget(sectionLabel("AI Fill · Prompt Type"));
     aiPromptCombo_ = new QComboBox;
     aiPromptCombo_->setObjectName("aiPromptType");
     aiPromptCombo_->addItem("Bounding Box");
@@ -606,19 +757,22 @@ QWidget* MainWindow::buildAIPanel() {
         canvas_->setActiveTool(activeTool_);
         updateSettingsVisibility();
     });
-    layout->addWidget(aiPromptCombo_);
+    medSamLayout->addWidget(aiPromptCombo_);
 
     aiPromptHint_ = new QLabel("Select Femur (Red) or Tibia (Green) above to draw bounding boxes. "
                                "Both boxes can be drawn and segmented together.");
     aiPromptHint_->setWordWrap(true);
     aiPromptHint_->setMinimumHeight(48);
-    layout->addWidget(aiPromptHint_);
+    medSamLayout->addWidget(aiPromptHint_);
 
     // Bounding box controls for Femur and Tibia
     aiBoxControls_ = new QWidget;
     auto* bcl = new QVBoxLayout(aiBoxControls_);
     bcl->setContentsMargins(0, 0, 0, 0);
     bcl->setSpacing(6);
+    auto* boxHint = new QLabel("Select Femur or Tibia, then drag a box on the image. For bilateral cases, use Next bounding box.");
+    boxHint->setWordWrap(true);
+    bcl->addWidget(boxHint);
 
     auto* fRow = new QHBoxLayout;
     femurBoxStatus_ = new QLabel("Femur Box (Red): Not set");
@@ -649,7 +803,47 @@ QWidget* MainWindow::buildAIPanel() {
     });
     tRow->addWidget(clearTibiaBoxBtn_);
     bcl->addLayout(tRow);
-    layout->addWidget(aiBoxControls_);
+
+    nextBoxBtn_ = new QPushButton("Next bounding box (2)");
+    nextBoxBtn_->setObjectName("nextBoundingBox");
+    connect(nextBoxBtn_, &QPushButton::clicked, this, [this] {
+        auto& ai = doc_->aiFill();
+        ai.activeBoxNumber = ai.activeBoxNumber == 1 ? 2 : 1;
+        updateAIPromptStatus();
+    });
+    bcl->addWidget(nextBoxBtn_);
+
+    auto* femurSecondRow = new QHBoxLayout;
+    femurBox2Status_ = new QLabel("Femur Box 2: Not set");
+    femurBox2Status_->setStyleSheet("color:#ef4444; font-size:11px; font-weight:600;");
+    femurSecondRow->addWidget(femurBox2Status_, 1);
+    clearFemurBox2Btn_ = new QPushButton("Clear");
+    clearFemurBox2Btn_->setObjectName("clearFemurBox2");
+    clearFemurBox2Btn_->setFixedSize(50, 24);
+    connect(clearFemurBox2Btn_, &QPushButton::clicked, this, [this] {
+        doc_->aiFill().femurBox2.reset();
+        doc_->aiFill().box.reset();
+        updateAIPromptStatus();
+        canvas_->update();
+    });
+    femurSecondRow->addWidget(clearFemurBox2Btn_);
+    bcl->addLayout(femurSecondRow);
+
+    auto* tibiaSecondRow = new QHBoxLayout;
+    tibiaBox2Status_ = new QLabel("Tibia Box 2: Not set");
+    tibiaBox2Status_->setStyleSheet("color:#22c55e; font-size:11px; font-weight:600;");
+    tibiaSecondRow->addWidget(tibiaBox2Status_, 1);
+    clearTibiaBox2Btn_ = new QPushButton("Clear");
+    clearTibiaBox2Btn_->setObjectName("clearTibiaBox2");
+    clearTibiaBox2Btn_->setFixedSize(50, 24);
+    connect(clearTibiaBox2Btn_, &QPushButton::clicked, this, [this] {
+        doc_->aiFill().tibiaBox2.reset();
+        doc_->aiFill().box.reset();
+        updateAIPromptStatus();
+        canvas_->update();
+    });
+    tibiaSecondRow->addWidget(clearTibiaBox2Btn_);
+    bcl->addLayout(tibiaSecondRow);
 
     aiShowPrompt_ = new QCheckBox("Show Prompt (Box / Mask)");
     aiShowPrompt_->setChecked(true);
@@ -657,14 +851,14 @@ QWidget* MainWindow::buildAIPanel() {
         doc_->aiFill().showPrompt = show;
         canvas_->update();
     });
-    layout->addWidget(aiShowPrompt_);
+    medSamLayout->addWidget(aiShowPrompt_);
 
     aiErase_ = new QCheckBox("Erase Prompt (unchecked = brush)");
     connect(aiErase_, &QCheckBox::toggled, canvas_, &CanvasWidget::setAIPromptErase);
-    layout->addWidget(aiErase_);
+    medSamLayout->addWidget(aiErase_);
     aiLoadMask_ = new QPushButton("Load Prompt Mask");
     connect(aiLoadMask_, &QPushButton::clicked, this, &MainWindow::onLoadPromptMask);
-    layout->addWidget(aiLoadMask_);
+    medSamLayout->addWidget(aiLoadMask_);
 
     // Normal Fill Mask controls
     normalMaskControls_ = new QWidget;
@@ -687,7 +881,7 @@ QWidget* MainWindow::buildAIPanel() {
         canvas_->update();
     });
     nml->addWidget(copyNormalMaskBtn_);
-    layout->addWidget(normalMaskControls_);
+    medSamLayout->addWidget(normalMaskControls_);
 
     useResultAsPromptBtn_ = new QPushButton("Use AI Result as Next Prompt");
     useResultAsPromptBtn_->setToolTip("Use the current AI segmentation output as the prompt for the next refinement pass.");
@@ -704,23 +898,29 @@ QWidget* MainWindow::buildAIPanel() {
         aiStatus_->setText("AI segmentation result copied to prompt. Ready for refinement.");
         canvas_->update();
     });
-    layout->addWidget(useResultAsPromptBtn_);
+    medSamLayout->addWidget(useResultAsPromptBtn_);
 
     auto* clear = new QPushButton("Clear Prompt");
     connect(clear, &QPushButton::clicked, this, [this] {
         doc_->aiFill().box.reset();
         doc_->aiFill().femurBox.reset();
         doc_->aiFill().tibiaBox.reset();
+        doc_->aiFill().femurBox2.reset();
+        doc_->aiFill().tibiaBox2.reset();
+        doc_->aiFill().activeBoxNumber = 1;
         doc_->aiFill().promptMask.release();
         doc_->aiFill().showPrompt = true;
         if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
         updateAIPromptStatus();
         canvas_->setActiveTool(activeTool_);
     });
-    layout->addWidget(clear);
+    medSamLayout->addWidget(clear);
 
     aiModels_->setVisible(false);
-    layout->addWidget(aiModels_);
+    medSamLayout->addWidget(aiModels_);
+
+    layout->addWidget(medSamControls_);
+    layout->addWidget(aiBoxControls_);
 
     aiRun_ = new QPushButton("▶ Run AI Fill");
     aiRun_->setObjectName("runAIFill");
@@ -729,33 +929,56 @@ QWidget* MainWindow::buildAIPanel() {
         "QPushButton{ background:#22c55e; color:#0f172a; font-weight:700; border:none; border-radius:8px; font-size:12px; letter-spacing:0.5px; }"
         "QPushButton:hover{ background:#16a34a; color:#ffffff; }"
         "QPushButton:disabled{ background:#1e293b; color:#64748b; border:1px solid #334155; }");
-    connect(aiRun_, &QPushButton::clicked, this, &MainWindow::onRunAIFill);
+    connect(aiRun_, &QPushButton::clicked, this, [this] {
+        if (aiModelSelector_->currentIndex() == 1) onMonaiSegment();
+        else if (aiModelSelector_->currentIndex() == 2) startMonaiSegment(true);
+        else if (aiModelSelector_->currentIndex() == 3) startMonaiSegment(false, true);
+#ifdef ORTHOSEG_NATIVE_NNUNET
+        else if (aiModelSelector_->currentIndex() == 4) onRunNativeNnUnet();
+#endif
+        else onRunAIFill();
+    });
     layout->addWidget(aiRun_);
     aiStatus_ = new QLabel("Ready. CUDA required.");
     aiStatus_->setObjectName("aiStatus");
     aiStatus_->setWordWrap(true);
     aiStatus_->setMinimumHeight(42);
     layout->addWidget(aiStatus_);
+    aiResultControls_ = new QWidget;
+    auto* aiResultLayout = new QVBoxLayout(aiResultControls_);
+    aiResultLayout->setContentsMargins(0, 0, 0, 0);
+    aiResultLayout->setSpacing(8);
     aiShow_ = new QCheckBox("Show AI segmentation");
     aiShow_->setChecked(true);
     connect(aiShow_, &QCheckBox::toggled, this, [this](bool show) {
         doc_->aiFill().showResult = show;
         canvas_->update();
     });
-    layout->addWidget(aiShow_);
+    aiResultLayout->addWidget(aiShow_);
     auto* clearResult = new QPushButton("Clear AI Segmentation");
+    clearResult->setObjectName("clearAIResult");
     connect(clearResult, &QPushButton::clicked, this, [this] {
         ++imageGeneration_; // Also invalidate any pending result.
         doc_->aiFill().resultMask.release();
+        doc_->aiFill().resultReplacesAnatomy = false;
+        pendingMonaiVersionKey_.clear();
+        pendingMonaiVersion_.clear();
         if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(false);
         canvas_->update();
     });
-    layout->addWidget(clearResult);
+    aiResultLayout->addWidget(clearResult);
     auto* apply = new QPushButton("Apply AI Result to Mask");
-    apply->setToolTip("Copy the preview foreground into the editable mask, with undo. Apply before export.");
+    apply->setObjectName("applyAIResult");
+    apply->setToolTip("Apply the preview to the editable mask, with undo. Apply before export.");
     connect(apply, &QPushButton::clicked, this, [this] {
+        const bool hadResult = !doc_->aiFill().resultMask.empty();
+        const bool automatic = doc_->aiFill().resultReplacesAnatomy;
         doc_->applyAIResult();
-        if (doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+        if (hadResult && doc_->aiFill().resultMask.empty() && !pendingMonaiVersionKey_.isEmpty())
+            monaiVersions_[pendingMonaiVersionKey_] = pendingMonaiVersion_;
+        pendingMonaiVersionKey_.clear();
+        pendingMonaiVersion_.clear();
+        if (hadResult && !automatic && doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
             doc_->aiFill().promptMask = doc_->mask().clone();
             doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
             doc_->aiFill().showPrompt = true;
@@ -768,8 +991,11 @@ QWidget* MainWindow::buildAIPanel() {
         }
         canvas_->update();
         updateUndoState();
+        if (hadResult && doc_->aiFill().resultMask.empty())
+            aiStatus_->setText("AI result applied. Edit normally, then Export Mask.");
     });
-    layout->addWidget(apply);
+    aiResultLayout->addWidget(apply);
+    layout->addWidget(aiResultControls_);
     return panel;
 }
 
@@ -844,6 +1070,44 @@ void MainWindow::onRunAIFill() {
     }
 }
 
+#ifdef ORTHOSEG_NATIVE_NNUNET
+void MainWindow::onRunNativeNnUnet() {
+    if (aiController_->running() || monaiRequestPending_) return;
+    try {
+        if (!doc_->hasImage()) throw std::runtime_error("Load an X-ray image first.");
+        if (!doc_->aiFill().resultMask.empty())
+            throw std::runtime_error("Apply or clear the current AI Fill preview first.");
+        const auto path = nativeNnUnetModelPath_.trimmed();
+        if (!QFileInfo(path).isFile()) throw std::runtime_error("Native nnUNet ONNX model not found.");
+        const auto source = doc_->sourceColor();
+        if (source.empty() || source.type() != CV_8UC3)
+            throw std::runtime_error("Native nnUNet needs an 8-bit X-ray display image.");
+        const auto width = std::max(1, int(std::round(double(source.cols) * 2048 / source.rows)));
+        if (qint64(width) * 2048 > 25'000'000)
+            throw std::runtime_error("The resized nnUNet image exceeds the 25-million-pixel limit.");
+        if (cv::countNonZero((doc_->mask() == static_cast<int>(Label::Femur)) |
+                             (doc_->mask() == static_cast<int>(Label::Tibia))) &&
+            QMessageBox::question(this, "Native nnUNet", "Replace the current Femur/Tibia segmentation?",
+                                  QMessageBox::Yes | QMessageBox::Cancel,
+                                  QMessageBox::Cancel) != QMessageBox::Yes) return;
+        NativeNnUnetRequest request;
+        request.imageBGR = source;
+        request.modelPath = path.toStdString();
+        request.device = nativeNnUnetDeviceKey_.toStdString();
+        nativeNnUnetBefore_ = doc_->mask().clone();
+        nativeNnUnetGeneration_ = imageGeneration_;
+        if (!aiController_->runNative(std::move(request))) return;
+        aiRun_->setEnabled(false);
+        if (modelDirBtn_) modelDirBtn_->setEnabled(false);
+        aiStatus_->setText("Native nnUNet inference is running locally…");
+        statusBar()->showMessage(aiStatus_->text());
+    } catch (const std::exception& e) {
+        aiStatus_->setText("Native nnUNet unavailable.");
+        QMessageBox::warning(this, "Native nnUNet", QString::fromUtf8(e.what()));
+    }
+}
+#endif
+
 void MainWindow::onLoadPromptMask() {
     if (!doc_->hasImage()) {
         QMessageBox::information(this, "AI Fill", "Load an image first.");
@@ -869,11 +1133,12 @@ void MainWindow::onLoadPromptMask() {
 
 void MainWindow::onOpenModelDirDialog() {
     if (aiController_->running()) {
-        QMessageBox::information(this, "MedSAM2 Models", "Cannot change model directory while AI Fill is running.");
+        QMessageBox::information(this, "Local Models", "Cannot change local models while AI Fill is running.");
         return;
     }
     QDialog dlg(this);
-    dlg.setWindowTitle("MedSAM2 Model Directory");
+    dlg.setWindowTitle("Local Models");
+    dlg.setObjectName("localModelsDialog");
     dlg.setMinimumWidth(540);
     dlg.setStyleSheet(
         "QDialog { background:#0f172a; color:#e2e8f0; }"
@@ -885,7 +1150,7 @@ void MainWindow::onOpenModelDirDialog() {
     l->setContentsMargins(20, 20, 20, 20);
     l->setSpacing(12);
 
-    auto* title = new QLabel("🧠 MedSAM2 ONNX Model Configuration", &dlg);
+    auto* title = new QLabel("MedSAM2 ONNX models", &dlg);
     title->setStyleSheet("font-size:14px; font-weight:700; color:#f1f5f9;");
     l->addWidget(title);
 
@@ -944,13 +1209,53 @@ void MainWindow::onOpenModelDirDialog() {
         }
     });
 
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    auto* nativeTitle = new QLabel("Native nnUNet v2 · OpenCV 5", &dlg);
+    nativeTitle->setStyleSheet("font-size:14px; font-weight:700; color:#f1f5f9;");
+    l->addWidget(nativeTitle);
+    auto* nativeDesc = new QLabel("Select the ONNX file and acceleration mode. Inference resizes the image to 2048 px high.", &dlg);
+    nativeDesc->setWordWrap(true);
+    nativeDesc->setStyleSheet("color:#94a3b8; font-size:11px;");
+    l->addWidget(nativeDesc);
+    auto* nativeRow = new QHBoxLayout;
+    auto* nativeModelEdit = new QLineEdit(nativeNnUnetModelPath_, &dlg);
+    nativeModelEdit->setObjectName("nativeNnUnetModel");
+    nativeModelEdit->setToolTip("Path to the exported nnUNet v2 ONNX model");
+    nativeRow->addWidget(nativeModelEdit, 1);
+    auto* nativeBrowse = new QPushButton("Browse…", &dlg);
+    nativeRow->addWidget(nativeBrowse);
+    l->addLayout(nativeRow);
+    connect(nativeBrowse, &QPushButton::clicked, &dlg, [nativeModelEdit, &dlg] {
+        const auto path = QFileDialog::getOpenFileName(&dlg, "Select nnUNet ONNX Model",
+            QFileInfo(nativeModelEdit->text()).absolutePath(), "ONNX models (*.onnx)");
+        if (!path.isEmpty()) nativeModelEdit->setText(path);
+    });
+    auto* nativeStatus = new QLabel(&dlg);
+    nativeStatus->setWordWrap(true);
+    l->addWidget(nativeStatus);
+    auto checkNative = [nativeModelEdit, nativeStatus] {
+        const bool valid = QFileInfo(nativeModelEdit->text().trimmed()).isFile();
+        nativeStatus->setText(valid ? "● nnUNet ONNX model found" : "● nnUNet ONNX model not found");
+        nativeStatus->setStyleSheet(valid ? "color:#22c55e;" : "color:#f87171;");
+    };
+    checkNative();
+    connect(nativeModelEdit, &QLineEdit::textChanged, &dlg, checkNative);
+    auto* nativeDevice = new QComboBox(&dlg);
+    nativeDevice->setObjectName("nativeNnUnetDevice");
+    nativeDevice->addItem("Auto (CUDA FP16, or CPU)", "auto");
+    nativeDevice->addItem("CUDA FP32", "cuda_fp32");
+    nativeDevice->addItem("CPU", "cpu");
+    nativeDevice->setCurrentIndex(std::max(0, nativeDevice->findData(nativeNnUnetDeviceKey_)));
+    l->addWidget(nativeDevice);
+#endif
+
     auto* btnRow = new QHBoxLayout;
     btnRow->addStretch();
     auto* cancelBtn = new QPushButton("Cancel", &dlg);
     connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
     btnRow->addWidget(cancelBtn);
 
-    auto* saveBtn = new QPushButton("Save Directory", &dlg);
+    auto* saveBtn = new QPushButton("Save Models", &dlg);
     saveBtn->setStyleSheet("background:#38bdf8; color:#0f172a; font-weight:700; border-radius:8px; padding:6px 16px;");
     connect(saveBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
     btnRow->addWidget(saveBtn);
@@ -958,9 +1263,13 @@ void MainWindow::onOpenModelDirDialog() {
 
     if (dlg.exec() == QDialog::Accepted) {
         aiModels_->setText(pathEdit->text());
-        if (modelDirBtn_) {
-            modelDirBtn_->setToolTip(QString("MedSAM2 Model Directory: %1\nClick to change directory").arg(pathEdit->text()));
-        }
+#ifdef ORTHOSEG_NATIVE_NNUNET
+        nativeNnUnetModelPath_ = nativeModelEdit->text().trimmed();
+        nativeNnUnetDeviceKey_ = nativeDevice->currentData().toString();
+        if (aiModelSelector_ && aiModelSelector_->currentIndex() == 4)
+            aiStatus_->setText(QFileInfo(nativeNnUnetModelPath_).isFile() ?
+                "Native nnUNet ready. No MONAI server needed." : "Native nnUNet ONNX model not found.");
+#endif
     }
 }
 
@@ -1157,6 +1466,7 @@ void MainWindow::showFillAlgorithm(int comboIndex) {
 
 void MainWindow::selectLabel(Label l) {
     activeLabel_ = l;
+    doc_->aiFill().activeBoxNumber = 1;
     canvas_->setActiveLabel(l);
     for (int i = 0; i < 4; ++i)
         static_cast<QPushButton*>(labelButtons_[i])
@@ -1177,16 +1487,35 @@ void MainWindow::updateSettingsVisibility() {
     bool isFill = (activeTool_ == Tool::Fill);
     bool isAI = (activeTool_ == Tool::AIFill);
     aiPanel_->setVisible(isAI);
-    bool isBox = isAI && doc_->aiFill().promptType == AIFillPromptType::BoundingBox;
-    bool isPaint = isAI && doc_->aiFill().promptType == AIFillPromptType::PaintedMask;
-    bool isLoad = isAI && doc_->aiFill().promptType == AIFillPromptType::LoadedMask;
-    bool isNormalMask = isAI && doc_->aiFill().promptType == AIFillPromptType::NormalFillMask;
+    bool medSam = !aiModelSelector_ || aiModelSelector_->currentIndex() == 0;
+    if (medSamControls_) medSamControls_->setVisible(isAI && medSam);
+    if (monaiControls_) monaiControls_->setVisible(isAI && !medSam
+#ifdef ORTHOSEG_NATIVE_NNUNET
+                                                  && aiModelSelector_->currentIndex() != 4
+#endif
+                                                  );
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(isAI && aiModelSelector_->currentIndex() == 4);
+#endif
+    if (aiResultControls_) aiResultControls_->setVisible(isAI);
+    bool isBox = isAI && (aiModelSelector_ && aiModelSelector_->currentIndex() == 2 ||
+                        medSam && doc_->aiFill().promptType == AIFillPromptType::BoundingBox);
+    bool isPaint = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::PaintedMask;
+    bool isLoad = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::LoadedMask;
+    bool isNormalMask = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::NormalFillMask;
     if (aiBoxControls_) aiBoxControls_->setVisible(isBox);
+    const bool secondary = isBox && aiModelSelector_ && aiModelSelector_->currentIndex() == 2;
+    if (nextBoxBtn_) nextBoxBtn_->setVisible(secondary);
+    if (femurBox2Status_) femurBox2Status_->setVisible(secondary);
+    if (tibiaBox2Status_) tibiaBox2Status_->setVisible(secondary);
+    if (clearFemurBox2Btn_) clearFemurBox2Btn_->setVisible(secondary);
+    if (clearTibiaBox2Btn_) clearTibiaBox2Btn_->setVisible(secondary);
     if (aiErase_) aiErase_->setVisible(isPaint);
     if (aiLoadMask_) aiLoadMask_->setVisible(isLoad);
     if (normalMaskControls_) normalMaskControls_->setVisible(isNormalMask);
-    if (aiShowPrompt_) aiShowPrompt_->setVisible(isAI);
-    if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(isAI && !doc_->aiFill().resultMask.empty());
+    if (aiShowPrompt_) aiShowPrompt_->setVisible(isAI && medSam);
+    if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(isAI && medSam &&
+        !doc_->aiFill().resultReplacesAnatomy && !doc_->aiFill().resultMask.empty());
     brushPanel_->setVisible((!isFill && !isAI) || isPaint);
     fillPanel_->setVisible(isFill);
     updateAIPromptStatus();
@@ -1233,6 +1562,20 @@ void MainWindow::updateAIPromptStatus() {
             clearTibiaBoxBtn_->setEnabled(false);
         }
     }
+    if (femurBox2Status_) {
+        femurBox2Status_->setText(ai.femurBox2 ? QString("Femur Box 2: [%1,%2]-[%3,%4]")
+            .arg(int(ai.femurBox2->x0)).arg(int(ai.femurBox2->y0))
+            .arg(int(ai.femurBox2->x1)).arg(int(ai.femurBox2->y1)) : "Femur Box 2: Not set");
+        clearFemurBox2Btn_->setEnabled(ai.femurBox2.has_value());
+    }
+    if (tibiaBox2Status_) {
+        tibiaBox2Status_->setText(ai.tibiaBox2 ? QString("Tibia Box 2: [%1,%2]-[%3,%4]")
+            .arg(int(ai.tibiaBox2->x0)).arg(int(ai.tibiaBox2->y0))
+            .arg(int(ai.tibiaBox2->x1)).arg(int(ai.tibiaBox2->y1)) : "Tibia Box 2: Not set");
+        clearTibiaBox2Btn_->setEnabled(ai.tibiaBox2.has_value());
+    }
+    if (nextBoxBtn_) nextBoxBtn_->setText(ai.activeBoxNumber == 1 ?
+        "Next bounding box (2)" : "Use first bounding box (1)");
     if (normalMaskStatus_) {
         if (!doc_->hasImage() || doc_->mask().empty()) {
             normalMaskStatus_->setText("No image or mask loaded.");
@@ -1275,8 +1618,10 @@ void MainWindow::onUpload() {
     canvas_->zoomReset();
     ++imageGeneration_;
     aiPromptCombo_->setCurrentIndex(0);
+    doc_->aiFill().showSecondaryBoxes = aiModelSelector_ && aiModelSelector_->currentIndex() == 2;
     aiShow_->setChecked(true);
     canvas_->refresh();
+    updateAIPromptStatus();
     updateUndoState();
     updateStatus();
 }
@@ -1321,66 +1666,212 @@ QByteArray sourcePng(const Document& doc) {
 }
 }
 
+void MainWindow::openModelManagement() {
+    if (!managementButton_ || !managementButton_->isEnabled()) return;
+    if (!modelManagement_) modelManagement_ = new ModelManagementDialog(this, monai_->baseUrl());
+    else modelManagement_->setBackendUrl(monai_->baseUrl());
+    modelManagement_->show();
+    modelManagement_->raise();
+    modelManagement_->activateWindow();
+}
+
+void MainWindow::checkMonaiStatus() {
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    if (aiModelSelector_ && aiModelSelector_->currentIndex() == 4) return;
+#endif
+    if (!monai_ || !monaiUrl_ || monaiRequestPending_) return;
+    const auto revision = ++monaiCheckSerial_;
+    const auto base = QUrl(monaiUrl_->text().trimmed());
+    monai_->setBaseUrl(base);
+    if (modelManagement_) modelManagement_->setBackendUrl(base);
+    monaiReady_ = false;
+    managementButton_->setEnabled(false);
+    if (managementAction_) managementAction_->setEnabled(false);
+    monaiStatus_->setStyleSheet("color:#fbbf24;");
+    monaiStatus_->setText("● Checking MONAI service…");
+    monai_->health([this, revision](const QJsonObject& value, const QString& error) {
+        if (revision != monaiCheckSerial_) return;
+        const bool prompted = aiModelSelector_ && aiModelSelector_->currentIndex() == 2;
+        const bool nnunet = aiModelSelector_ && aiModelSelector_->currentIndex() == 3;
+        const char* loadedKey = prompted ? "sam2_model_loaded" : nnunet ? "nnunet_model_loaded" : "model_loaded";
+        const char* versionKey = prompted ? "sam2_model_version" : nnunet ? "nnunet_model_version" : "model_version";
+        const bool ready = error.isEmpty() && value.value("status").toString() == "ok" &&
+                           value.value(loadedKey).toBool();
+        monaiReady_ = ready;
+        monaiStatus_->setStyleSheet(ready ? "color:#22c55e;" : "color:#f87171;");
+        monaiStatus_->setText(ready ? "● MONAI ready" :
+            error.isEmpty() && value.value("status").toString() == "ok" ?
+                (prompted ? "● MONAI online — no SAM2 model loaded" :
+                 nnunet ? "● MONAI online — no nnUNet model loaded" : "● MONAI online — no production model loaded") :
+                "● MONAI unavailable: " + (error.isEmpty() ? "unhealthy response" : error.left(200)));
+        const auto version = value.value(versionKey).toString();
+        monaiModel_->setText("Loaded model: " + (version.isEmpty() ? "N/A" : version));
+    });
+    monai_->managementStatus([this, revision](const QJsonObject& value, const QString& error) {
+        if (revision != monaiCheckSerial_) return;
+        const bool allowed = error.isEmpty() && value.value("backend").toObject().value("status").toString() == "ok";
+        managementButton_->setEnabled(allowed);
+        if (managementAction_) managementAction_->setEnabled(allowed);
+        managementButton_->setToolTip(allowed ? "Open MONAI model management" :
+            "Model management is unavailable or not enabled on this backend");
+    });
+}
+
 void MainWindow::onMonaiSegment() {
-    if (monai_->segmentRunning()) return;
+    startMonaiSegment(false);
+}
+
+void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
+    if (monaiRequestPending_ || monai_->segmentRunning()) return;
     try {
         if (!doc_->hasImage()) throw std::runtime_error("Load a PNG X-ray first.");
         if (aiController_->running() || !doc_->aiFill().resultMask.empty())
             throw std::runtime_error("Finish AI Fill and apply or clear its preview before AI Segment.");
         const auto mapping = editorMonaiLabels();
         const auto original = sourcePng(*doc_);
+        QJsonArray femurBox, tibiaBox;
+        auto boxJson = [this](const std::optional<Box>& box) {
+            if (!box) return QJsonArray{};
+            const auto b = validatedBox(*box, doc_->mask().size());
+            return QJsonArray{int(std::floor(b.x0)), int(std::floor(b.y0)),
+                              int(std::ceil(b.x1)), int(std::ceil(b.y1))};
+        };
+        if (prompted) {
+            femurBox = boxJson(doc_->aiFill().femurBox);
+            tibiaBox = boxJson(doc_->aiFill().tibiaBox);
+            const auto femurSecond = boxJson(doc_->aiFill().femurBox2);
+            const auto tibiaSecond = boxJson(doc_->aiFill().tibiaBox2);
+            if (!femurSecond.isEmpty()) femurBox = femurBox.isEmpty() ? femurSecond : QJsonArray{femurBox, femurSecond};
+            if (!tibiaSecond.isEmpty()) tibiaBox = tibiaBox.isEmpty() ? tibiaSecond : QJsonArray{tibiaBox, tibiaSecond};
+            if (femurBox.isEmpty() && tibiaBox.isEmpty())
+                throw std::runtime_error("Draw a Femur or Tibia box before running MONAI SAM2.");
+        }
         const auto caseId = monaiCaseId(original);
+        const auto versionKey = monai_->baseUrl().toString().toUtf8() + ':' + caseId;
         if (cv::countNonZero((doc_->mask() == mapping.femur) | (doc_->mask() == mapping.tibia)) &&
             QMessageBox::question(this, "AI Segment", "AI Segment will replace the current Femur/Tibia segmentation.\nContinue?",
                                   QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
         const auto before = doc_->mask().clone();
         const auto generation = imageGeneration_;
+        monai_->setBaseUrl(QUrl(monaiUrl_->text().trimmed()));
+        const auto urlRevision = monaiCheckSerial_;
+        monaiRequestPending_ = true;
         monaiSegment_->setEnabled(false);
         monaiSegment_->setText("Segmenting…");
-        statusBar()->showMessage("MONAI AI Segment is running…");
-        monai_->segment(original, {doc_->width(), doc_->height()},
-            [this, before, generation, caseId, mapping](const cv::Mat& canonical, const QString& version, const QString& error) {
+        aiRun_->setEnabled(false);
+        aiStatus_->setText("Checking MONAI service…");
+        statusBar()->showMessage("Checking MONAI service…");
+        monai_->health([this, original, before, generation, caseId, versionKey, mapping, urlRevision,
+                        prompted, nnunet, femurBox, tibiaBox](const QJsonObject& health, const QString& healthError) {
+            if (urlRevision != monaiCheckSerial_) {
+                monaiRequestPending_ = false;
                 monaiSegment_->setEnabled(true);
                 monaiSegment_->setText("AI Segment");
+                aiRun_->setEnabled(!aiController_->running());
                 statusBar()->clearMessage();
-                if (!error.isEmpty()) { QMessageBox::warning(this, "AI Segment", error); return; }
+                aiStatus_->setText("MONAI URL changed. Run segmentation again.");
+                checkMonaiStatus();
+                return;
+            }
+            if (!healthError.isEmpty() || health.value("status").toString() != "ok" ||
+                !health.value(prompted ? "sam2_model_loaded" : nnunet ? "nnunet_model_loaded" : "model_loaded").toBool()) {
+                monaiRequestPending_ = false;
+                monaiSegment_->setEnabled(true);
+                monaiSegment_->setText("AI Segment");
+                aiRun_->setEnabled(!aiController_->running());
+                statusBar()->clearMessage();
+                aiStatus_->setText("MONAI segmentation unavailable.");
+                QMessageBox::warning(this, "AI Segment", healthError.isEmpty() ?
+                    prompted ? "MONAI is online but has no loaded SAM2 model." :
+                    nnunet ? "MONAI is online but has no loaded nnUNet v2 model." :
+                             "MONAI is online but has no loaded production model." : healthError);
+                checkMonaiStatus();
+                return;
+            }
+            statusBar()->showMessage("MONAI AI Segment is running…");
+            aiStatus_->setText("MONAI segmentation is running…");
+            try {
+                auto done = [this, before, generation, caseId, versionKey, mapping, urlRevision,
+                             prompted, femurBox, tibiaBox](const cv::Mat& canonical, const QString& version, const QString& error) {
+                monaiRequestPending_ = false;
+                monaiSegment_->setEnabled(true);
+                monaiSegment_->setText("AI Segment");
+                aiRun_->setEnabled(!aiController_->running());
+                statusBar()->clearMessage();
+                if (urlRevision != monaiCheckSerial_) { aiStatus_->setText("MONAI URL changed. Result discarded."); checkMonaiStatus(); return; }
+                if (!error.isEmpty()) { aiStatus_->setText("MONAI segmentation failed."); QMessageBox::warning(this, "AI Segment", error); return; }
                 // Editing remains responsive; never overwrite edits made during inference.
                 if (generation != imageGeneration_ || doc_->mask().size() != before.size() ||
                     cv::norm(doc_->mask(), before, cv::NORM_INF) != 0 || aiController_->running() ||
                     !doc_->aiFill().resultMask.empty() || (doc_->originalPng().empty() || monaiCaseId(sourcePng(*doc_)) != caseId)) {
                     QMessageBox::information(this, "AI Segment", "Result discarded because the image or annotation changed. Run AI Segment again when ready.");
+                    aiStatus_->setText("MONAI result discarded after annotation changed.");
                     return;
                 }
                 try {
-                    if (!doc_->replaceAnatomyMask(fromMonaiLabels(canonical, mapping)))
-                        throw std::runtime_error("Could not apply MONAI mask. Annotation is unchanged.");
-                    monaiVersions_[caseId] = version;
+                    cv::Mat result = canonical.clone();
+                    if (prompted && femurBox.isEmpty()) {
+                        result.setTo(0, result == 1);
+                        result.setTo(1, before == mapping.femur);
+                    }
+                    if (prompted && tibiaBox.isEmpty()) {
+                        result.setTo(0, result == 2);
+                        result.setTo(2, before == mapping.tibia);
+                    }
+                    auto preview = fromMonaiLabels(result, mapping);
+                    if (preview.empty() || preview.size() != before.size() || preview.type() != CV_8UC1 ||
+                        cv::countNonZero(preview > 2))
+                        throw std::runtime_error("MONAI returned an invalid mask. Annotation is unchanged.");
+                    doc_->aiFill().resultMask = std::move(preview);
+                    doc_->aiFill().resultReplacesAnatomy = true;
+                    doc_->aiFill().showResult = true;
+                    aiShow_->setChecked(true);
+                    pendingMonaiVersionKey_ = versionKey;
+                    pendingMonaiVersion_ = version;
+                    if (activeTool_ != Tool::AIFill) selectTool(Tool::AIFill);
                     canvas_->update();
-                    updateUndoState();
                     updateAIPromptStatus();
-                    statusBar()->showMessage("AI Segment complete. Edit normally, then Export Mask.", 8000);
+                    statusBar()->showMessage("AI Segment preview ready. Apply AI Result to Mask to edit or export.", 8000);
+                    aiStatus_->setText("MONAI preview ready. Apply AI Result to Mask to edit or export.");
                 } catch (const std::exception& e) {
                     QMessageBox::warning(this, "AI Segment", QString::fromUtf8(e.what()));
                 }
-            });
+                    };
+                if (prompted) monai_->segmentPrompted(original, {before.cols, before.rows}, femurBox, tibiaBox, done);
+                else if (nnunet) monai_->segmentNnUnet(original, {before.cols, before.rows}, done);
+                else monai_->segment(original, {before.cols, before.rows}, done);
+            } catch (const std::exception& e) {
+                monaiRequestPending_ = false;
+                monaiSegment_->setEnabled(true);
+                monaiSegment_->setText("AI Segment");
+                aiRun_->setEnabled(!aiController_->running());
+                statusBar()->clearMessage();
+                aiStatus_->setText("MONAI segmentation failed.");
+                QMessageBox::warning(this, "AI Segment", QString::fromUtf8(e.what()));
+            }
+        });
     } catch (const std::exception& e) {
+        monaiRequestPending_ = false;
         monaiSegment_->setEnabled(true);
         monaiSegment_->setText("AI Segment");
+        aiRun_->setEnabled(!aiController_->running());
         statusBar()->clearMessage();
+        aiStatus_->setText("MONAI segmentation unavailable.");
         QMessageBox::warning(this, "AI Segment", QString::fromUtf8(e.what()));
     }
 }
 
 void MainWindow::offerMonaiTraining() {
     // Export has already succeeded; this optional operation never modifies it.
-    if (doc_->originalPng().empty() || monai_->uploadRunning() || monai_->segmentRunning()) return;
+    if (doc_->originalPng().empty() || monai_->uploadRunning() || monaiRequestPending_ || monai_->segmentRunning()) return;
     QByteArray key;
     try {
         const auto original = sourcePng(*doc_);
         const auto caseId = monaiCaseId(original);
+        const auto versionKey = monai_->baseUrl().toString().toUtf8() + ':' + caseId;
         const auto canonical = toMonaiLabels(doc_->mask(), editorMonaiLabels());
-        if (!cv::countNonZero(canonical) && !monaiVersions_.contains(caseId)) return;
-        key = caseId + monaiCaseId(encodeMonaiMask(canonical));
+        if (!cv::countNonZero(canonical) && !monaiVersions_.contains(versionKey)) return;
+        key = versionKey + ':' + monaiCaseId(encodeMonaiMask(canonical));
         if (monaiPrompted_.contains(key)) return;
         QMessageBox prompt(QMessageBox::Question, "Add to AI Training",
             "Segmentation saved successfully.\n\nAdd this corrected segmentation to AI training?",
@@ -1390,12 +1881,12 @@ void MainWindow::offerMonaiTraining() {
         prompt.setDefaultButton(saveOnly);
         prompt.exec();
         monaiPrompted_.insert(key);
-        if (!monaiVersions_.contains(caseId)) monaiVersions_.insert(caseId, {});
+        if (!monaiVersions_.contains(versionKey)) monaiVersions_.insert(versionKey, {});
         if (prompt.clickedButton() != add) return;
         // Read the current editable annotation, never a cached MONAI prediction.
         const auto corrected = toMonaiLabels(doc_->mask(), editorMonaiLabels());
         monai_->submitTrainingCase(original, corrected, QFileInfo(QString::fromStdString(doc_->sourcePath())).fileName(),
-            monaiVersions_.value(caseId), [this, key](const QJsonObject& response, const QString& error) {
+            monaiVersions_.value(versionKey), [this, key](const QJsonObject& response, const QString& error) {
                 if (!error.isEmpty()) {
                     monaiPrompted_.remove(key); // Next export can retry this revision.
                     QMessageBox::warning(this, "AI Training",
@@ -1420,8 +1911,14 @@ void MainWindow::onClear() {
     doc_->aiFill().box.reset();
     doc_->aiFill().femurBox.reset();
     doc_->aiFill().tibiaBox.reset();
+    doc_->aiFill().femurBox2.reset();
+    doc_->aiFill().tibiaBox2.reset();
+    doc_->aiFill().activeBoxNumber = 1;
     doc_->aiFill().promptMask.release();
     doc_->aiFill().resultMask.release();
+    doc_->aiFill().resultReplacesAnatomy = false;
+    pendingMonaiVersionKey_.clear();
+    pendingMonaiVersion_.clear();
     doc_->aiFill().showPrompt = true;
     if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
     if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(false);

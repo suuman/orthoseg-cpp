@@ -3,10 +3,14 @@
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QFileDialog>
 #include <QLineEdit>
+#include <QComboBox>
+#include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -66,7 +70,7 @@ struct Server : QTcpServer {
                     if (lastPath == "/training/cases") ++uploads;
                     if (stall) return;
                     QByteArray body = response, type = contentType;
-                    if (lastPath == "/health" && status == 200) { body = "{\"status\":\"ok\",\"model_loaded\":true}"; type = "application/json"; }
+                    if (lastPath == "/health" && status == 200) { body = "{\"status\":\"ok\",\"model_loaded\":true,\"sam2_model_loaded\":true,\"sam2_model_version\":\"sam2_test\",\"nnunet_model_loaded\":true,\"nnunet_model_version\":\"nnunet_test\"}"; type = "application/json"; }
                     if (lastPath == "/training/cases" && status == 200) { body = "{\"status\":\"accepted\",\"new_cases_since_last_training\":1}"; type = "application/json"; }
                     socket->write("HTTP/1.1 " + QByteArray::number(status) + " Result\r\nContent-Type: " + type +
                                   "\r\nX-Model-Version: test_v1\r\nConnection: close\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body);
@@ -127,7 +131,9 @@ int main(int argc, char** argv) {
         QMetaObject::invokeMethod(&live, "onUpload", Qt::DirectConnection);
         auto* button = live.findChild<QPushButton*>("monaiSegment");
         button->click();
-        CHECK(waitFor([&]{ return button->isEnabled(); }, 180000) && dialogs.errors == 0, "live MONAI prediction applied");
+        CHECK(waitFor([&]{ return button->isEnabled(); }, 180000) && dialogs.errors == 0, "live MONAI prediction previewed");
+        live.findChild<QPushButton*>("aiFillToolBtn")->click();
+        live.findChild<QPushButton*>("applyAIResult")->click();
         auto* doc = live.document();
         CHECK(doc->hasImage() && doc->canUndo(), "live prediction is editable and undoable");
         if (dialogs.errors || !doc->hasImage()) return 1;
@@ -180,6 +186,18 @@ int main(int argc, char** argv) {
     CHECK(!client.segment(original, source.size(), {}), "duplicate inference rejected");
     CHECK(waitFor([&]{return done;}) && error.isEmpty(), "inference asynchronous completion");
     CHECK(server.field("image") == original && server.field("case_id") == monaiCaseId(original), "original 16-bit bytes and stable hash sent");
+    done=false;
+    client.segmentPrompted(original, source.size(), QJsonArray{1,2,12,14}, QJsonArray{20,3,34,17},
+        [&](auto mask, auto version, auto err) { error=err; done=true; CHECK(same(mask,canonical), "prompted PNG decoded"); CHECK(version=="test_v1", "prompted version header retained"); });
+    CHECK(waitFor([&]{return done;}) && error.isEmpty() && server.lastPath=="/segment/prompted", "prompted endpoint called");
+    CHECK(server.field("femur_box")=="[1,2,12,14]" && server.field("tibia_box")=="[20,3,34,17]", "both box prompts sent as JSON");
+    done=false;
+    client.segmentNnUnet(original, source.size(), [&](auto mask, auto version, auto err) {
+        error=err; done=true; CHECK(same(mask, canonical), "nnUNet PNG decoded");
+        CHECK(version=="test_v1", "nnUNet version header retained");
+    });
+    CHECK(waitFor([&]{return done;}) && error.isEmpty() && server.lastPath=="/segment/nnunet",
+          "nnUNet endpoint called with source-sized mask");
     canonical.at<uchar>(0,0)=2;
     done=false;
     client.submitTrainingCase(original,canonical,"original.png","test_v1",[&](auto,auto err){error=err;done=true;});
@@ -210,16 +228,108 @@ int main(int argc, char** argv) {
     QFile::remove(input); // Requests must not reopen or depend on the source file.
     auto* button=window.findChild<QPushButton*>("monaiSegment");
     CHECK(button!=nullptr,"AI Segment action exists");
+    auto* selector=window.findChild<QComboBox*>("aiModelSelector");
+    auto* url=window.findChild<QLineEdit*>("monaiBackendUrl");
+    auto* health=window.findChild<QLabel*>("monaiHealthStatus");
+    auto* manage=window.findChild<QPushButton*>("modelManagementButton");
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    constexpr int modelCount = 5;
+#else
+    constexpr int modelCount = 4;
+#endif
+    CHECK(selector && selector->count()==modelCount && url && url->text()==server.url().toString(),
+          "AI Fill exposes native and server-backed model choices");
+    CHECK(health && waitFor([&]{return health->text().contains("ready");}) && manage && !manage->isEnabled(),
+          "health indicator is ready while unavailable management stays disabled");
+    selector->setCurrentIndex(1);
+    window.findChild<QPushButton*>("aiFillToolBtn")->click();
+    auto* run=window.findChild<QPushButton*>("runAIFill");
+    auto* apply=window.findChild<QPushButton*>("applyAIResult");
+    auto* clear=window.findChild<QPushButton*>("clearAIResult");
+    CHECK(apply && clear && apply->isVisible() && clear->isVisible(),
+          "MONAI uses the shared preview controls");
+    auto* sideScroll = window.findChild<QScrollArea*>();
+    auto withinSidebar = [sideScroll](QWidget* widget) {
+        return sideScroll && widget && widget->mapTo(sideScroll->viewport(),
+            QPoint(widget->width(), 0)).x() <= sideScroll->viewport()->width();
+    };
+    CHECK(withinSidebar(url) && withinSidebar(manage) && withinSidebar(apply),
+          "MONAI controls fit inside the sidebar viewport");
+    CHECK(run && run->text().contains("MONAI"), "AI Fill model choice routes its run action to MONAI");
     auto* doc=window.document();
     doc->paintLine({20,20},{20,20},Label::Fibula,2);
     auto before=doc->mask().clone();
-    button->click();
+    run->click();
     CHECK(!button->isEnabled(),"AI Segment duplicate action disabled");
     CHECK(waitFor([&]{return button->isEnabled();}),"UI inference finishes");
+    CHECK(same(doc->mask(),before) && doc->aiFill().resultReplacesAnatomy &&
+          doc->aiFill().resultMask.at<uchar>(4,4)==1 && doc->aiFill().resultMask.at<uchar>(6,23)==2,
+          "MONAI result remains a preview until applied");
+    const auto previewImage = window.canvas()->grab().toImage();
+    apply->click();
+    CHECK(window.canvas()->grab().toImage() == previewImage,
+          "automatic preview matches the applied mask display");
     CHECK(doc->mask().at<uchar>(4,4)==1 && doc->mask().at<uchar>(6,23)==2,"MONAI applied to editable document");
     CHECK(doc->mask().at<uchar>(20,20)==3,"unrelated Fibula preserved");
     doc->undo();CHECK(same(doc->mask(),before),"prediction is one undo operation");
     button->click();waitFor([&]{return button->isEnabled();});
+    CHECK(!doc->aiFill().resultMask.empty(), "second MONAI result can be previewed");
+    clear->click();
+    CHECK(doc->aiFill().resultMask.empty() && same(doc->mask(),before),
+          "clear segmentation discards MONAI preview without changing mask");
+    window.findChild<QPushButton*>("aiFillToolBtn")->click();
+    selector->setCurrentIndex(2);
+    CHECK(waitFor([&]{return health->text().contains("ready");}) && run->text().contains("SAM2"),
+          "SAM2 selection checks prompted model readiness");
+    auto* nextBox = window.findChild<QPushButton*>("nextBoundingBox");
+    CHECK(nextBox && nextBox->isVisible() && doc->aiFill().showSecondaryBoxes,
+          "bilateral box control is available for MONAI SAM2");
+    nextBox->click();
+    CHECK(doc->aiFill().activeBoxNumber == 2, "Next bounding box selects second slot");
+    nextBox->click();
+    CHECK(doc->aiFill().activeBoxNumber == 1, "box control can return to first slot");
+    doc->aiFill().femurBox = Box{1, 1, 16, 17};
+    before = doc->mask().clone();
+    run->click();
+    CHECK(waitFor([&]{return button->isEnabled();}) && server.lastPath=="/segment/prompted",
+          "SAM2 AI Fill action sends box prompt");
+    CHECK(server.field("femur_box")=="[1,1,16,17]" && server.field("tibia_box").isEmpty(),
+          "UI sends only drawn bone box");
+    CHECK(doc->mask().at<uchar>(6,23)==before.at<uchar>(6,23),
+          "single-bone prompt preserves unprompted Tibia");
+    CHECK(doc->aiFill().resultMask.at<uchar>(6,23)==before.at<uchar>(6,23),
+          "SAM2 preview retains the unprompted bone");
+    apply->click();
+    CHECK(doc->canUndo(), "SAM2 prediction is undoable after Apply");
+    doc->aiFill().femurBox2 = Box{18, 2, 30, 15};
+    run->click();
+    CHECK(waitFor([&]{return button->isEnabled();}) &&
+          server.field("femur_box")=="[[1,1,16,17],[18,2,30,15]]",
+          "bilateral Femur boxes are submitted together");
+    clear->click();
+    selector->setCurrentIndex(1);
+    selector->setCurrentIndex(3);
+    CHECK(waitFor([&]{return health->text().contains("ready");}) && run->text().contains("nnUNet"),
+          "nnUNet selection checks its own model readiness");
+    run->click();
+    CHECK(waitFor([&]{return button->isEnabled();}) && server.lastPath=="/segment/nnunet",
+          "nnUNet UI option runs automatic inference");
+    CHECK(!doc->aiFill().resultMask.empty() && doc->aiFill().resultReplacesAnatomy,
+          "MONAI nnUNet also previews its result");
+    apply->click();
+#ifdef ORTHOSEG_NATIVE_NNUNET
+    const int requestsBeforeNative = server.requests;
+    selector->setCurrentIndex(4);
+    auto* localModels = window.findChild<QPushButton*>("modelDirBtn");
+    CHECK(localModels && localModels->text().contains("Local Models") && run->text().contains("Native") &&
+          apply->isVisible() && clear->isVisible(),
+          "native nnUNet shows shared controls and Local Models button");
+    CHECK(withinSidebar(selector) && withinSidebar(apply),
+          "native nnUNet controls fit inside the sidebar viewport");
+    QApplication::processEvents();
+    CHECK(server.requests == requestsBeforeNative, "selecting native nnUNet makes no server request");
+#endif
+    selector->setCurrentIndex(1);
     doc->paintLine({4,4},{4,4},Label::Background,2);
     doc->paintLine({15,15},{15,15},Label::Tibia,2);
     auto corrected=toMonaiLabels(doc->mask(),{0,1,2});

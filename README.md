@@ -3,9 +3,10 @@
 OrthoSeg is a desktop annotation tool for segmenting the **femur, tibia, and
 fibula** in lower-limb X-rays. The native application uses **C++17**, **Qt 6
 Widgets**, and **OpenCV**, with manual painting and six interactive segmentation
-algorithms, plus **AI Fill** using the existing `ocv/` MedSAM2 implementation.
-Processing runs locally without API keys. AI Fill requires the two MedSAM2 ONNX
-models and CUDA-enabled OpenCV DNN; the other tools do not require a model or GPU.
+algorithms, plus **AI Fill** with native MedSAM2 and nnUNet v2 options.
+Processing runs locally without API keys. Native nnUNet v2 runs through OpenCV 5
+DNN with no Python, PyTorch, or MONAI server. Native MedSAM2 requires two ONNX
+models and CUDA-enabled OpenCV DNN; MONAI SAM2 uses the separate local backend.
 
 The original React/TypeScript implementation is included in [`example/`](example/).
 The instructions below describe the native application; see
@@ -135,7 +136,7 @@ pixels are retained. Foreground pixels can overwrite another label.
      values become foreground for the selected anatomy; alpha is ignored. Supply
      a binary mask for one bone, not a combined femur/tibia label map. JPEG artifacts
      can add foreground pixels, so lossless formats are preferable.
-3. Set **MedSAM2 Model Directory** to a directory containing
+3. Open **Local Models** in the top bar and set the MedSAM2 directory to one containing
    `medsam2_image_encoder.onnx` and `medsam2_mask_decoder.onnx`. The default is this
    checkout's `models`; `MEDSAM2_MODEL_DIR` can override it at launch.
 4. Click **Run AI Fill**. Status reports loading/inference, duplicate requests are
@@ -289,7 +290,7 @@ high-bit-depth image values are not preserved by the current loader.
 | [`CMakeLists.txt`](CMakeLists.txt) | Unified CMake configuration defining the libraries (`medsam2_ocv`, `orthoseg_core`, `orthoseg_ai`), executables (`orthoseg`, `medsam2_ocv_infer`), and test suites. |
 | [`include/`](include/) | All header files: labels ([`Labels.h`](include/Labels.h)), document ([`Document.h`](include/Document.h)), algorithms ([`SegmentationEngine.h`](include/SegmentationEngine.h)), AI inference ([`MedSAM2Inference.h`](include/MedSAM2Inference.h), [`medsam2_ocv.h`](include/medsam2_ocv.h)), and UI widgets. |
 | [`src/`](src/) | All C++ implementation files: GUI application entry ([`main.cpp`](src/main.cpp)), canvas ([`CanvasWidget.cpp`](src/CanvasWidget.cpp)), window ([`MainWindow.cpp`](src/MainWindow.cpp)), document ([`Document.cpp`](src/Document.cpp)), segmentation core ([`SegmentationEngine.cpp`](src/SegmentationEngine.cpp)), and MedSAM2 inference ([`MedSAM2Inference.cpp`](src/MedSAM2Inference.cpp), [`medsam2_ocv.cpp`](src/medsam2_ocv.cpp)). |
-| [`models/`](models/) | Standalone ONNX models (`medsam2_image_encoder.onnx`, `medsam2_mask_decoder.onnx`). |
+| [`models/`](models/) | Local ONNX models for MedSAM2 and `nnunet2/model.onnx` for native nnUNet v2. |
 | [`examples/`](examples/) | Standalone CLI inference tool ([`medsam2_main.cpp`](examples/medsam2_main.cpp)), runner script ([`run_infer.sh`](examples/run_infer.sh)), exporter ([`export_onnx.py`](examples/export_onnx.py)), and standalone guide. |
 | [`tests/test_seg.cpp`](tests/test_seg.cpp) | Headless checks for the segmentation engine. |
 | [`tests/test_document.cpp`](tests/test_document.cpp) | Regression checks for image I/O, segmentation resizing, validation, and undo. |
@@ -333,16 +334,53 @@ type checker.
 The example retains AI Studio configuration and a `GEMINI_API_KEY` placeholder,
 but its current annotation code makes no Gemini API calls and needs no API key.
 
+## Native nnUNet v2 in AI Fill
+
+Select **AI Fill → Native nnUNet v2 (OpenCV 5)**, open an X-ray, and click
+**Run Native nnUNet**. The default model is `models/nnunet2/model.onnx`, copied
+from `/run/media/suman/Data/xray/ocv`; the model field in **Local Models** or
+`ORTHOSEG_NNUNET_MODEL` can point to another ONNX file. No MONAI server or
+Python process is used. The choice is built when `ENABLE_NATIVE_NNUNET=ON`
+(default) and CMake finds OpenCV 5 or newer. The supplied OpenCV 5.1 build
+has CUDA/cuDNN and TBB support.
+
+The image is resized to **2048 pixels high** while preserving its aspect ratio.
+OpenCV DNN runs 2048×768 tiles; the returned 0/1/2 mask is restored to source
+size. **Auto** uses CUDA FP16 if a CUDA device is available, otherwise the
+multithreaded CPU backend. The device selector in **Local Models** also offers
+CUDA FP32 and CPU. The result appears as a preview; use **Show AI segmentation**,
+**Clear AI Segmentation**, and **Apply AI Result to Mask** to review or commit it.
+Applying replaces Femur/Tibia in one undoable edit, preserves Fibula, and allows
+normal editing and export. Edits or an image change during inference cause
+the result to be discarded. The ONNX file is kept locally and ignored by Git.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DOpenCV_DIR=/home/suman/soft/opencv/install_new/lib/cmake/opencv5
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+./build/orthoseg
+```
+
+The native inference and UI tests use the real ONNX file on CPU. GPU execution
+was not available for verification on this workstation.
+
 ## Optional MONAI AI Segment integration
 
-**AI Segment** calls the separate local MONAI service for a full Femur/Tibia
-prediction. **AI Fill** continues to use the existing MedSAM2 implementation.
+The **AI Fill** panel also offers **MedSAM2**, **MONAI production (UNet)**,
+**MONAI SAM2 (boxes)**, and **MONAI nnUNet v2**. Both MONAI production and nnUNet v2
+provide automatic Femur/Tibia predictions. The supplied nnUNet checkpoint has
+the right labels but a different architecture from the MONAI production UNet,
+so it is a separate model choice. MONAI SAM2 uses Femur/Tibia boxes; MedSAM2
+keeps its ONNX prompt workflow. The top-bar **AI Segment** action runs the
+MONAI production UNet.
 The build additionally requires the Qt 6 `Network` component (provided by
 `qt6-base-dev`). No Python, PyTorch or MONAI dependency is added to the UI.
 
 ```bash
 # Start the independently installed MONAI backend from its own repository:
-./scripts/run_server.sh
+/run/media/suman/Data/monai/scripts/run_server_models.sh \
+  --config /run/media/suman/Data/monai/configs/management.yaml
 
 # In this OrthoSeg repository:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -350,19 +388,67 @@ cmake --build build --parallel
 MONAI_BACKEND_URL=http://127.0.0.1:8000 ./build/orthoseg
 ```
 
-`MONAI_BACKEND_URL` is optional and defaults to `http://127.0.0.1:8000`.
-Only local HTTP URLs are accepted; proxy use and redirects are disabled.
-Requests run asynchronously with a three-minute deadline. The normal annotation workflow never launches,
-trains, promotes, or reloads a model. The backend needs an installed production
-model; a missing model is reported without changing the annotation.
+To start both applications with one command after building OrthoSeg:
 
-Open an original PNG, click **AI Segment**, then edit normally. Existing
-Femur/Tibia annotations require replacement confirmation; Fibula is preserved.
-A prediction is one undoable edit. Changes made during inference cause the
+```bash
+./scripts/launch_with_monai.sh
+```
+
+The launcher uses the separate MONAI checkout at
+`/run/media/suman/Data/monai`, starts its model-enabled server with
+`configs/management.yaml`, waits for `/health`, then opens OrthoSeg. If a
+healthy backend is already running at the URL, the launcher reuses it. When
+OrthoSeg closes, the launcher stops only the server it started. Override
+`MONAI_REPO`, `MONAI_CONFIG`, `MONAI_BACKEND_URL`, or `ORTHOSEG_BIN` for a
+different checkout, config, port, or build location. If the server has no
+production checkpoint, OrthoSeg still opens with prompted SAM2 and automatic
+nnUNet v2 inference if their local checkpoints loaded. The MONAI production
+UNet requires a separately trained checkpoint and backend restart.
+
+`MONAI_BACKEND_URL` is optional and defaults to `http://127.0.0.1:8000`.
+The AI Fill panel shows this URL and lets you change it for the current session.
+Its status dot turns green when `/health` reports the model selected in the
+panel as loaded; red means the service or selected model is unavailable. Every
+MONAI segmentation checks health again before sending the image. The panel
+shows that model's version. The backend does not offer arbitrary archived-version inference.
+Only local HTTP URLs are accepted; proxy use and redirects are disabled.
+Requests run asynchronously; health and management availability checks time out
+after five seconds, while segmentation and uploads retain a three-minute deadline.
+The normal annotation workflow never launches, trains, promotes, or reloads a
+model. A missing selected model is reported without changing the annotation.
+
+Open an original PNG, select **MONAI production (UNet)** in AI Fill and click
+**Run MONAI Segment**, or use the top-bar **AI Segment** action. Review the preview
+with **Show AI segmentation**; use **Apply AI Result to Mask** to edit or export,
+or **Clear AI Segmentation** to discard it. Existing Femur/Tibia annotations
+require replacement confirmation; Fibula is preserved. Applying a prediction is
+one undoable edit. Changes made during inference cause the
 result to be discarded. Finish/apply/clear an outstanding AI Fill preview before
 AI Segment. PNG bytes are retained at load, including original 16-bit data;
 the display image and original file remain unchanged. JPEG/TIFF/etc. loading
 still works normally, but MONAI operations require an original PNG up to 32 MiB.
+
+For automatic inference with the supplied nnUNet v2 checkpoint, select
+**MONAI nnUNet v2** in AI Fill and click **Run nnUNet v2**. The backend resizes
+the image to 2048 pixels high with its aspect ratio preserved, runs 2D sliding
+window inference, and restores the 0/1/2 mask to the original size. This
+prediction follows the same editable, undoable, and exportable mask workflow.
+Its health indicator and version are independent of the MONAI production UNet.
+Model Management trains and promotes the MONAI production UNet only.
+
+For prompted inference, open a PNG X-ray, choose **MONAI SAM2 (boxes)** in AI Fill,
+select Femur or Tibia, and drag a box on the image. For a bilateral case, click
+**Next bounding box (2)** and draw the second box for that bone; repeat after
+selecting the other bone if needed. The button switches back to box 1 for edits,
+and each box has its own Clear control. Click **Run MONAI SAM2**. The server
+resizes the image to 1024 pixels high while preserving aspect ratio, maps the
+boxes into that image, and restores the mask to the original dimensions. The
+source-sized 0/1/2 result becomes one
+undoable annotation edit and can be exported with **Export Mask**. If only one
+bone is prompted, the current annotation for the other bone is preserved.
+SAM2 model readiness and version are separate from the automatic production
+model. The model management window manages the automatic production model and
+its training jobs, not this prompted checkpoint.
 
 After a successful **Export Mask**, **Add to AI Training** optionally uploads
 the original PNG plus a fresh canonical 0/1/2 mask made from the current editable
@@ -380,16 +466,17 @@ and the optional real-backend integration check.
 
 ## Optional administrative model management
 
-Normal annotation, Export, and Add to AI Training are unchanged. To expose the
-separate technical-user dialog, launch:
+The AI Fill panel shows **Model Management**. It becomes enabled only when the
+local backend accepts `/management/status`. Click it to open the separate
+technical-user dialog. The optional legacy Tools menu action is available when launched with:
 
 ```bash
 ORTHOSEG_ENABLE_MODEL_MANAGEMENT=1 ./build/orthoseg
 ```
 
-Open **Tools → AI Model Management**. The backend must also have
+The backend must also have
 `management.enabled: true`; its supplied `configs/management.yaml` enables it.
-The existing `MONAI_BACKEND_URL` value is reused.
+The dialog uses the URL currently shown in AI Fill.
 
 The modeless dialog shows backend/device status, disk and loaded production
 versions, training/validation counts, candidate metrics, and recent job logs.

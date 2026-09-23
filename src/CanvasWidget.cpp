@@ -117,6 +117,7 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
 
     // Build the color overlay from the indexed mask on the fly.
     const cv::Mat& mask = doc_->mask();
+    const auto& ai = doc_->aiFill();
     QImage overlay(mask.cols, mask.rows, QImage::Format_ARGB32);
     overlay.fill(Qt::transparent);
     const int a = static_cast<int>(opacity_ * 255);
@@ -125,6 +126,9 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
         QRgb* orow = reinterpret_cast<QRgb*>(overlay.scanLine(y));
         for (int x = 0; x < mask.cols; ++x) {
             uchar id = mrow[x];
+            if (ai.showResult && ai.resultReplacesAnatomy && !ai.resultMask.empty() &&
+                (id == static_cast<uchar>(Label::Femur) || id == static_cast<uchar>(Label::Tibia)))
+                id = 0;
             if (id == 0) { orow[x] = qRgba(0, 0, 0, 0); continue; }
             cv::Vec3b bgr = labelInfo(static_cast<Label>(id)).colorBGR;
             orow[x] = qRgba(bgr[2], bgr[1], bgr[0], a);
@@ -132,7 +136,6 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
     }
     p.drawImage(dst, overlay);
 
-    const auto& ai = doc_->aiFill();
     if (ai.showResult && !ai.resultMask.empty()) {
         overlay.fill(Qt::transparent);
         for (int y = 0; y < ai.resultMask.rows; ++y) {
@@ -203,7 +206,11 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
         if (ai.tibiaBox) {
             drawBoxWithBadge(*ai.tibiaBox, QColor(0x22, 0xc5, 0x5e), "Tibia");
         }
-        if (!ai.femurBox && !ai.tibiaBox && ai.box) {
+        if (ai.showSecondaryBoxes && ai.femurBox2)
+            drawBoxWithBadge(*ai.femurBox2, QColor(0xef, 0x44, 0x44), "Femur 2");
+        if (ai.showSecondaryBoxes && ai.tibiaBox2)
+            drawBoxWithBadge(*ai.tibiaBox2, QColor(0x22, 0xc5, 0x5e), "Tibia 2");
+        if (!ai.femurBox && !ai.tibiaBox && !ai.femurBox2 && !ai.tibiaBox2 && ai.box) {
             QColor col = (label_ == Label::Tibia) ? QColor(0x22, 0xc5, 0x5e) : QColor(0xef, 0x44, 0x44);
             QString name = (label_ == Label::Tibia) ? "Tibia" : "Femur";
             drawBoxWithBadge(*ai.box, col, name);
@@ -246,6 +253,8 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
         ip.x() >= doc_->width() || ip.y() >= doc_->height()) return;
 
     if (tool_ == Tool::AIFill) {
+        if (doc_->aiFill().showSecondaryBoxes &&
+            label_ != Label::Femur && label_ != Label::Tibia) return;
         if (doc_->aiFill().promptType == AIFillPromptType::LoadedMask ||
             doc_->aiFill().promptType == AIFillPromptType::NormalFillMask) return;
         drawing_ = true;
@@ -255,9 +264,13 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
             Box b{float(ip.x()), float(ip.y()), float(ip.x()), float(ip.y())};
             doc_->aiFill().box = b;
             if (label_ == Label::Femur) {
-                doc_->aiFill().femurBox = b;
+                if (doc_->aiFill().showSecondaryBoxes && doc_->aiFill().activeBoxNumber == 2)
+                    doc_->aiFill().femurBox2 = b;
+                else doc_->aiFill().femurBox = b;
             } else if (label_ == Label::Tibia) {
-                doc_->aiFill().tibiaBox = b;
+                if (doc_->aiFill().showSecondaryBoxes && doc_->aiFill().activeBoxNumber == 2)
+                    doc_->aiFill().tibiaBox2 = b;
+                else doc_->aiFill().tibiaBox = b;
             } else {
                 doc_->aiFill().femurBox = b;
             }
@@ -330,9 +343,13 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
                   float(std::max(boxStart_.y(), ip.y()))};
             doc_->aiFill().box = b;
             if (label_ == Label::Femur) {
-                doc_->aiFill().femurBox = b;
+                if (doc_->aiFill().showSecondaryBoxes && doc_->aiFill().activeBoxNumber == 2)
+                    doc_->aiFill().femurBox2 = b;
+                else doc_->aiFill().femurBox = b;
             } else if (label_ == Label::Tibia) {
-                doc_->aiFill().tibiaBox = b;
+                if (doc_->aiFill().showSecondaryBoxes && doc_->aiFill().activeBoxNumber == 2)
+                    doc_->aiFill().tibiaBox2 = b;
+                else doc_->aiFill().tibiaBox = b;
             } else {
                 doc_->aiFill().femurBox = b;
             }

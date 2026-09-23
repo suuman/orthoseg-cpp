@@ -1,10 +1,12 @@
 #pragma once
 #include <QObject>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QNetworkAccessManager>
 #include <QUrl>
 #include <opencv2/core.hpp>
 #include <functional>
+#include <utility>
 
 namespace orthoseg {
 struct MonaiLabels { int background = 0; int femur = 1; int tibia = 2; };
@@ -19,12 +21,17 @@ public:
     using SegmentCallback = std::function<void(const cv::Mat&, const QString&, const QString&)>;
     explicit MonaiClient(QObject* parent = nullptr, QUrl base = configuredUrl(), int timeoutMs = 180000);
     static QUrl configuredUrl();
+    QUrl baseUrl() const { return base_; }
+    void setBaseUrl(QUrl base) { base_ = std::move(base); }
     void health(JsonCallback done);
     void managementStatus(JsonCallback done);
     void startTraining(JsonCallback done);
     void trainingJob(const QString& id, JsonCallback done);
     void promoteCandidate(const QString& version, JsonCallback done);
     bool segment(const QByteArray& original, cv::Size expected, SegmentCallback done);
+    bool segmentNnUnet(const QByteArray& original, cv::Size expected, SegmentCallback done);
+    bool segmentPrompted(const QByteArray& original, cv::Size expected, const QJsonArray& femurBox,
+                         const QJsonArray& tibiaBox, SegmentCallback done);
     bool submitTrainingCase(const QByteArray& original, const cv::Mat& currentCanonical,
                             const QString& filename, const QString& version, JsonCallback done);
     bool segmentRunning() const { return segmentRunning_; }
@@ -32,7 +39,8 @@ public:
 private:
     using ReplyCallback = std::function<void(const QByteArray&, const QByteArray&, const QString&)>;
     void request(const QString& path, const QByteArray& original, const QByteArray& mask,
-                 const QString& filename, const QString& version, ReplyCallback done, const QByteArray& jsonBody = {});
+                 const QString& filename, const QString& version, ReplyCallback done, const QByteArray& jsonBody = {},
+                 const QByteArray& femurBox = {}, const QByteArray& tibiaBox = {});
     void adminRequest(const QString& path, bool post, JsonCallback done);
     QNetworkAccessManager network_;
     QUrl base_;
