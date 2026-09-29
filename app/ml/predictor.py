@@ -19,6 +19,7 @@ class Predictor:
         self.config = config
         self.device = get_device(config)
         self._lock = threading.RLock()
+        self._info_lock = threading.Lock()
         self._model = None
         self._metadata = None
 
@@ -30,10 +31,11 @@ class Predictor:
         with self._lock:
             model, metadata, _ = load_checkpoint(path)
             model.to(self.device).eval()
-            self._model, self._metadata = model, metadata
+            with self._info_lock:
+                self._model, self._metadata = model, metadata
 
     def info(self):
-        with self._lock:
+        with self._info_lock:
             m = self._metadata or {}
             return {"model_loaded": self._model is not None, "model_version": m.get("version"),
                     "architecture": m.get("config", self.config)["model"],

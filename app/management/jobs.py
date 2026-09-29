@@ -14,7 +14,7 @@ import yaml
 
 from app.core.config import ROOT
 from app.core.paths import atomic_write, file_lock, write_json
-from app.ml.checkpoint import production_path, promote, validate_candidate
+from app.ml.checkpoint import production_path, promote, validate_candidate, model_root
 from app.ml.store import CaseStore, now, safe_id
 
 ACTIVE = {"queued", "preparing", "training", "validating"}
@@ -33,7 +33,8 @@ def process_identity(pid):
 
 def public_metadata(meta):
     return {key: meta.get(key) for key in ("version", "architecture", "created_at",
-        "training_case_count", "parent_model_version", "validation_metrics")}
+        "training_case_count", "parent_model_version", "validation_metrics",
+        "checkpoint_path", "parent_checkpoint", "dataset_snapshot", "dataset_sha256", "mask_encoding", "status")}
 
 
 class Management:
@@ -43,6 +44,8 @@ class Management:
         self.root = self.store.root / "jobs"
         self.control_lock = self.store.root / ".management.lock"
         self._candidate_cache = None
+        self.family = config["training"].get("model", "unet")
+        self.latest_pointer = self.root / ("latest_medsam2.json" if self.family == "medsam2" else "latest.json")
 
     def _job_path(self, job_id):
         if not re.fullmatch(r"[a-f0-9]{32}", job_id):
@@ -74,7 +77,7 @@ class Management:
             return self._read_job(job_id)
 
     def latest_job(self):
-        pointer = self.root / "latest.json"
+        pointer = self.latest_pointer
         return self._read_job(json.loads(pointer.read_text())["job_id"]) if pointer.exists() else None
 
     def _training_busy(self):
@@ -90,9 +93,9 @@ class Management:
             return None
         try:
             safe_id(version)
-            path = Path(self.config["paths"]["models"]) / "candidates" / version
+            path = model_root(self.config) / "candidates" / version
             signature = tuple((f.stat().st_mtime_ns, f.stat().st_size) for f in
-                              (path / "best.pt", path / "metadata.json", path / "metrics.json"))
+                              (path / "best.pt", path / "metadata.json", path / "metrics.json", path / "completed.json"))
             cache_key = (version, signature)
             if self._candidate_cache and self._candidate_cache[0] == cache_key:
                 return self._candidate_cache[1]
@@ -115,30 +118,52 @@ class Management:
                     production = public_metadata(json.loads((release / "metadata.json").read_text()))
             except (OSError, ValueError, TypeError):
                 pass
+            reference = None
+            if self.family == "medsam2":
+                from app.ml.sam2_model import reference_metadata
+                try:
+                    reference = reference_metadata(self.config)
+                    production = production or public_metadata(reference)
+                except OSError:
+                    pass
             validation = Path(self.config["paths"]["data"]) / "validation"
             images = {p.name for p in (validation / "images").glob("*.png")}
             labels = {p.name for p in (validation / "labels").glob("*.png")}
+            candidate = self.candidate()
+            if candidate:
+                candidate = {**candidate, "active": candidate["version"] == loaded["model_version"]}
+            if production:
+                production = {**production, "active": production["version"] == loaded["model_version"]}
+            if reference:
+                reference["active"] = reference["version"] == loaded["model_version"]
             busy = self._training_busy()
             import torch
-            return {"backend": {"status": "ok", "device": self.predictor.device.type,
+            return {"model": self.family, "reference": reference, "backend": {"status": "ok", "device": self.predictor.device.type,
                                 "gpu": torch.cuda.get_device_name() if self.predictor.device.type == "cuda" else None,
                                 "model_loaded": loaded["model_loaded"]},
                     "production": production, "loaded_model_version": loaded["model_version"],
                     "restart_required": bool(production and production["version"] != loaded["model_version"]),
                     "dataset": {**self.store.status(), "validation_case_count": len(images & labels),
                                 "validation_pairs_match": images == labels},
-                    "candidate": self.candidate(), "job": job, "training_active": busy,
-                    "can_start": not busy and production_path(self.config).is_file(),
+                    "candidate": candidate, "job": job, "training_active": busy,
+                    "can_start": not busy and self.parent_path().is_file(),
                     "training_policy": {"device": "cpu", "cpu_threads": self.config["management"]["cpu_threads"],
                                         "epochs": self.config["training"]["epochs"], "inference_available": loaded["model_loaded"]}}
+
+    def parent_path(self):
+        if self.family == "medsam2":
+            from app.ml.sam2_model import parent_path
+            return parent_path(self.config)
+        return production_path(self.config)
 
     def start(self):
         with file_lock(self.control_lock):
             existing = self.latest_job()
             if existing and existing["status"] in ACTIVE:
                 raise BlockingIOError("A training job is already active")
-            if not production_path(self.config).is_file():
-                raise ValueError("No production checkpoint. Bootstrap using finetune.sh --from-scratch first.")
+            if not self.parent_path().is_file():
+                raise ValueError("Install the local MedSAM2 reference checkpoint first." if self.family == "medsam2" else
+                                 "No production checkpoint. Bootstrap using finetune.sh --from-scratch first.")
             training_lock = (self.store.root / ".training.lock").open("a")
             try:
                 fcntl.flock(training_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -150,7 +175,7 @@ class Management:
                 # Preserve server configuration/hyperparameters in an immutable job snapshot.
                 atomic_write(directory / "config.yaml", yaml.safe_dump(config).encode())
                 record = {"id": job_id, "status": "queued", "started_at": now(), "finished_at": None,
-                          "candidate_version": None, "epoch": None, "epochs": config["training"]["epochs"],
+                          "model": self.family, "candidate_version": None, "epoch": None, "epochs": config["training"]["epochs"],
                           "best_validation_dice": None, "error": None}
                 write_json(directory / "status.json", record)
                 env = {**os.environ, "PYTHONPATH": str(ROOT),
@@ -167,7 +192,7 @@ class Management:
                         write_json(directory / "status.json", record)
                         raise
                 write_json(directory / "process.json", {"pid": process.pid, "identity": process_identity(process.pid)})
-                write_json(self.root / "latest.json", {"job_id": job_id})
+                write_json(self.latest_pointer, {"job_id": job_id})
                 threading.Thread(target=process.wait, daemon=True).start()
                 return record
             finally:

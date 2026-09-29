@@ -104,3 +104,30 @@ def test_corrupt_candidate_does_not_replace_production(config, pair):
     with pytest.raises(ValueError, match='metadata'):
         promote(config, version)
     assert production_path(config).resolve() == old
+
+
+def test_interrupted_candidate_cannot_be_promoted(config, pair):
+    populate(config, pair)
+    config['training']['epochs'] = 2
+    def interrupt(**changes):
+        if changes.get('epoch') == 2:
+            raise RuntimeError('simulated interruption')
+    with pytest.raises(RuntimeError, match='simulated interruption'):
+        train(config, source='scratch', progress=interrupt)
+    candidate = next((Path(config['paths']['models']) / 'candidates').iterdir())
+    assert (candidate / 'best.pt').is_file()
+    assert not (candidate / 'completed.json').exists()
+    with pytest.raises(ValueError, match='did not complete'):
+        promote(config, candidate.name)
+    assert not production_path(config).exists()
+
+
+def test_completion_marker_is_validated(config, pair):
+    import json
+    populate(config, pair)
+    version = train(config, source='scratch')
+    marker = Path(config['paths']['models']) / 'candidates' / version / 'completed.json'
+    marker.write_text(json.dumps({'version': 'another_run', 'completed_at': 'now'}))
+    with pytest.raises(ValueError, match='completion marker'):
+        promote(config, version)
+    assert not production_path(config).exists()

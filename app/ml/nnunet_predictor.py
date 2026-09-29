@@ -38,6 +38,7 @@ class NnUnetPredictor:
         self.root = Path(config["paths"]["models"]) / "pretrained" / "nnunet2"
         self.device = get_device(config)
         self._lock = threading.RLock()
+        self._info_lock = threading.Lock()
         self._predictor = None
         self._version = None
 
@@ -69,11 +70,12 @@ class NnUnetPredictor:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         with self._lock:
-            self._predictor = predictor
-            self._version = "nnunet2_xray_best_" + digest.hexdigest()[:12]
+            with self._info_lock:
+                self._predictor = predictor
+                self._version = "nnunet2_xray_best_" + digest.hexdigest()[:12]
 
     def info(self):
-        with self._lock:
+        with self._info_lock:
             return {"model_loaded": self._predictor is not None,
                     "model_version": self._version,
                     "architecture": "nnUNet v2 PlainConvUNet 2D",

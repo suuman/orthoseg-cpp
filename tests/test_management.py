@@ -170,3 +170,61 @@ def test_stale_job_recovered_and_log_tail_bounded(config):
     state = management.job(identifier)
     assert state['status'] == 'failed'
     assert len(state['recent_log']) == 80
+
+
+def test_removed_completion_marker_invalidates_cached_candidate(config, pair):
+    version = bootstrap(config, pair)
+    config['management']['enabled'] = True
+    with client(config) as api:
+        assert api.get('/management/status').json()['candidate']['valid']
+        marker = Path(config['paths']['models']) / 'candidates' / version / 'completed.json'
+        marker.unlink()
+        assert not api.get('/management/status').json()['candidate']['valid']
+        assert api.post('/models/' + version + '/promote', json={}).status_code == 422
+
+
+def test_management_case_list_labels_pagination_and_family_state(config, pair):
+    import numpy as np
+    from conftest import png
+    from app.ml.store import CaseStore
+    store = CaseStore(config)
+    mask = np.zeros((24, 37, 3), dtype=np.uint8)
+    mask[2:10, 3:12] = (1, 2, 0)
+    store.submit(pair[0], png(mask), case_id='a', original_filename='knee.png')
+    record = store.records()[0]
+    write_json(store.state_path, {'revisions': {'a': record['revision']},
+        'last_training_time': None, 'latest_candidate_version': 'unet_done'})
+    store.submit(png(np.zeros((24, 37), np.uint8)), png(np.zeros((24, 37), np.uint8)),
+                 case_id='b', original_filename='empty.png')
+    with client(config) as api:
+        assert api.get('/management/cases').status_code == 403
+    config['management']['enabled'] = True
+    with client(config) as api:
+        result = api.get('/management/cases', params={'limit': 1}).json()
+        assert result['total'] == 2 and len(result['items']) == 1
+        item = result['items'][0]
+        assert item['filename'] == 'knee.png' and item['labels'] == ['Femur', 'Tibia']
+        assert item['overlap_pixels'] == 72 and item['status'] == 'incorporated'
+        assert 'image' not in item and 'mask' not in item
+        assert api.get('/management/cases?model=medsam2&limit=1').json()['items'][0]['status'] == 'pending'
+        page2 = api.get('/management/cases?offset=1&limit=1').json()['items'][0]
+        assert page2['filename'] == 'empty.png' and page2['labels'] == ['Background only']
+        assert api.get('/management/cases?offset=99').json()['items'] == []
+        for query in ('offset=-1', 'limit=0', 'limit=101', 'model=unknown'):
+            assert api.get('/management/cases?' + query).status_code == 422
+        assert api.get('/management/cases', headers={'Origin': 'http://example.com'}).status_code == 403
+
+
+def test_legacy_case_labels_are_read_without_changing_records(config, pair):
+    from app.ml.store import CaseStore
+    store = CaseStore(config)
+    store.submit(*pair, case_id='legacy')
+    record = store.records()[0]
+    for key in ('femur_pixels', 'tibia_pixels', 'overlap_pixels'):
+        record.pop(key)
+    manifest = store.root / 'metadata/legacy.json'
+    write_json(manifest, record)
+    before = manifest.read_bytes()
+    item = store.case_page()['items'][0]
+    assert item['filename'] == 'legacy' and item['labels'] == ['Femur', 'Tibia']
+    assert manifest.read_bytes() == before

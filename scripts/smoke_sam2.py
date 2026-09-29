@@ -7,6 +7,7 @@ from PIL import Image
 
 from app.core.config import load_config
 from app.main import create_app
+from app.ml.preprocessing import mask_statistics
 
 
 def main():
@@ -25,10 +26,10 @@ def main():
                                      "tibia_box": "[18,18,45,45]"})
         assert response.status_code == 200, response.text
         mask = np.asarray(Image.open(io.BytesIO(response.content)))
-        assert mask.shape == image.shape and mask.dtype == np.uint8
-        assert set(np.unique(mask)) <= {0, 1, 2}
+        assert mask.shape == (*image.shape, 3) and mask.dtype == np.uint8
+        stats = mask_statistics(mask)
         assert response.headers["x-model-version"] == health["sam2_model_version"]
-        print(f"SAM2 API ready: {health['sam2_model_version']}; mask labels {sorted(np.unique(mask).tolist())}")
+        print(f"SAM2 API ready: {health['sam2_model_version']}; device {health['device']}; independent mask counts {stats}")
 
 
 if __name__ == "__main__":

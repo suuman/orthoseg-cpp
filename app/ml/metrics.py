@@ -1,4 +1,5 @@
 import numpy as np
+from app.ml.preprocessing import class_mask
 
 
 def segmentation_metrics(predictions):
@@ -8,7 +9,7 @@ def segmentation_metrics(predictions):
     actual = np.zeros(2, dtype=np.float64)
     for pred, target in predictions:
         for i, label in enumerate((1, 2)):
-            p, t = pred == label, target == label
+            p, t = class_mask(pred, label), class_mask(target, label)
             intersection[i] += (p & t).sum()
             predicted[i] += p.sum()
             actual[i] += t.sum()

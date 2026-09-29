@@ -1,9 +1,6 @@
 """Prompted MedSAM2 inference from the locally supplied SAM2.1 checkpoint."""
-import hashlib
-import sys
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -15,8 +12,6 @@ from app.ml.preprocessing import InvalidImage
 
 
 def parse_box(value, shape):
-    if value is None:
-        return None
     if not isinstance(value, list) or len(value) != 4 or any(type(x) is not int for x in value):
         raise InvalidImage("Each SAM2 box must be four integer pixel coordinates [x0,y0,x1,y1]")
     x0, y0, x1, y1 = value
@@ -36,85 +31,122 @@ def parse_boxes(value, shape):
 
 
 def sam2_rgb(arr, config):
-    """Turn an 8/16-bit X-ray into the RGB uint8 input expected by SAM2."""
-    p = config["preprocessing"]
-    x = arr.astype(np.float32)
-    low, high = np.percentile(x, [p["lower_percentile"], p["upper_percentile"]])
-    if high > low:
-        x = np.clip((x - low) * (255.0 / (high - low)), 0, 255).astype(np.uint8)
+    # Match medsam2_infer_custom.py: retain uint8, min/max normalize higher depth.
+    if arr.dtype == np.uint8:
+        x = arr
     else:
-        x = np.zeros(arr.shape, dtype=np.uint8)
+        x = arr.astype(np.float32)
+        low, high = float(x.min()), float(x.max())
+        x = ((x - low) / (high - low + 1e-8) * 255).astype(np.uint8)
     return np.repeat(x[:, :, None], 3, axis=2)
 
 
 def sam2_input(arr, config):
-    """Resize to 1024 pixels high, preserving aspect ratio and source geometry."""
     height, width = arr.shape
     target_width = max(1, round(width * 1024 / height))
+    # Bound the square allocation as well as the input image.
+    if max(1024, target_width) ** 2 > config["limits"]["max_pixels"]:
+        raise InvalidImage("MedSAM2 square canvas exceeds the pixel limit")
     rgb = sam2_rgb(arr, config)
     resized = np.asarray(Image.fromarray(rgb).resize((target_width, 1024), Image.Resampling.BILINEAR)).copy()
     return resized, target_width / width, 1024 / height
+
+
+def square_input(arr, config):
+    rgb, sx, sy = sam2_input(arr, config)
+    h, w = rgb.shape[:2]
+    side = max(h, w)
+    y, x = (side - h) // 2, (side - w) // 2
+    canvas = np.zeros((side, side, 3), np.uint8)
+    canvas[y:y+h, x:x+w] = rgb
+    return canvas, (sx, sy, x, y, w, h)
+
+
+def prompt_canvas(binary, geometry, side):
+    _, _, x, y, w, h = geometry
+    resized = np.asarray(Image.fromarray(binary.astype(np.uint8)).resize((w, h), Image.Resampling.NEAREST))
+    canvas = np.zeros((side, side), np.uint8)
+    canvas[y:y+h, x:x+w] = resized
+    return canvas
+
+
+def mask_logits(binary):
+    t = torch.as_tensor(binary.copy(), dtype=torch.float32)[None, None]
+    small = torch.nn.functional.interpolate(t, size=(256, 256), mode="bilinear", align_corners=False)
+    return ((small[0] > 0.5).float() * 20 - 10).numpy()
+
+
+def mask_box(binary):
+    ys, xs = np.nonzero(binary)
+    return np.asarray([xs.min(), ys.min(), xs.max(), ys.max()], np.float32) if xs.size else None
 
 
 class Sam2Predictor:
     def __init__(self, config):
         self.config = config
         self.device = get_device(config)
-        self.root = Path(config["paths"]["models"]) / "pretrained" / "medsam2"
         self._lock = threading.RLock()
+        self._info_lock = threading.Lock()
         self._predictor = None
         self._version = None
+        self._metadata = {}
 
     def load(self):
-        checkpoint, model_config = self.root / "checkpoint.pt", self.root / "sam2.1_hiera_t.yaml"
-        if not checkpoint.is_file() or not model_config.is_file():
+        from app.ml.sam2_model import parent_path, load_active
+        if not parent_path(self.config).is_file():
             return
-        # The supplied SAM2 package lives alongside its local weights. No network lookup.
-        if str(self.root) not in sys.path:
-            sys.path.insert(0, str(self.root))
-        from sam2.build import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-        model = build_sam2(str(model_config), str(checkpoint), device=str(self.device)).eval()
-        digest = hashlib.sha256()
-        with checkpoint.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        version = "medsam2_hiera_t_" + digest.hexdigest()[:12]
         with self._lock:
-            self._predictor = SAM2ImagePredictor(model)
-            self._version = version
+            model, meta, _ = load_active(self.config, self.device)
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            predictor = SAM2ImagePredictor(model.eval())
+            with self._info_lock:
+                self._predictor = predictor
+                self._version, self._metadata = meta["version"], meta
 
     def info(self):
-        with self._lock:
+        with self._info_lock:
             return {"model_loaded": self._predictor is not None, "model_version": self._version,
                     "architecture": "SAM2.1 Hiera Tiny", "requires_prompts": True,
-                    "supported_prompts": ["femur_box", "tibia_box"]}
+                    "supported_prompts": ["femur_box", "tibia_box", "mask"],
+                    "mask_encoding": "rgb_discrete", "labels": {"femur": 1, "tibia": 2},
+                    "checkpoint": self._metadata.get("checkpoint_path"),
+                    "model_status": self._metadata.get("status")}
 
-    def predict(self, arr, boxes):
-        if not boxes:
-            raise InvalidImage("Provide at least one femur_box or tibia_box")
+    def predict(self, arr, boxes, prompt=None):
+        from app.ml.preprocessing import validate_mask, class_mask
         validated = {label: parse_boxes(box, arr.shape) for label, box in boxes.items()}
         if any(label not in (1, 2) for label in validated):
-            raise InvalidImage("SAM2 supports only femur and tibia boxes")
+            raise InvalidImage("SAM2 supports only femur and tibia")
+        if prompt is not None:
+            validate_mask(prompt)
+            if prompt.shape[:2] != arr.shape:
+                raise InvalidImage("Prompt mask dimensions must match the original image")
+        if not validated and (prompt is None or not prompt.any()):
+            raise InvalidImage("Provide a femur/tibia box or a non-empty labeled mask")
         start = time.perf_counter()
         with self._lock:
             if self._predictor is None:
-                raise ModelUnavailable("Prompted SAM2 model unavailable; install local SAM2 dependencies and restart backend")
-            output = np.zeros(arr.shape, dtype=np.uint8)
-            confidence = np.full(arr.shape, -np.inf, dtype=np.float32)
-            with torch.inference_mode():
-                rgb, scale_x, scale_y = sam2_input(arr, self.config)
+                raise ModelUnavailable("Prompted MedSAM2 unavailable; install local assets and restart backend")
+            output = np.zeros((*arr.shape, 3), dtype=np.uint8)
+            with torch.inference_mode(), torch.autocast(device_type=self.device.type,
+                    dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+                rgb, geometry = square_input(arr, self.config)
+                sx, sy, x, y, w, h = geometry
                 self._predictor.set_image(rgb)
-                for label, bone_boxes in validated.items():
-                    for box in bone_boxes:
-                        scaled = box * np.array([scale_x, scale_y, scale_x, scale_y], dtype=np.float32)
-                        masks, scores, _ = self._predictor.predict(box=scaled, multimask_output=False)
-                        if masks.shape != (1, *rgb.shape[:2]) or not np.isfinite(scores).all():
-                            raise RuntimeError("SAM2 produced an invalid mask or score")
-                        original_mask = np.asarray(Image.fromarray(np.asarray(masks[0], dtype=np.uint8))
-                                                   .resize((arr.shape[1], arr.shape[0]), Image.Resampling.NEAREST), dtype=bool)
-                        winner = original_mask & (float(scores[0]) > confidence)
-                        output[winner] = label
-                        confidence[winner] = float(scores[0])
+                for label in (1, 2):
+                    prompts = []
+                    for box in validated.get(label, []):
+                        scaled = box * np.array([sx, sy, sx, sy], np.float32) + [x, y, x, y]
+                        prompts.append({"box": scaled.astype(np.float32)})
+                    if prompt is not None and class_mask(prompt, label).any():
+                        binary = prompt_canvas(class_mask(prompt, label), geometry, rgb.shape[0])
+                        prompts.append({"mask_input": mask_logits(binary), "box": mask_box(binary)})
+                    for kwargs in prompts:
+                        masks, scores, _ = self._predictor.predict(**kwargs, multimask_output=False, return_logits=True)
+                        if masks.shape != (1, *rgb.shape[:2]) or not np.isfinite(scores).all() or not np.isfinite(masks).all():
+                            raise RuntimeError("MedSAM2 produced an invalid mask or score")
+                        binary = (masks[0, y:y+h, x:x+w] > 0).astype(np.uint8)
+                        restored = np.asarray(Image.fromarray(binary).resize(
+                            (arr.shape[1], arr.shape[0]), Image.Resampling.NEAREST), dtype=bool)
+                        output[..., label - 1][restored] = label
             return output, self._version, (time.perf_counter() - start) * 1000

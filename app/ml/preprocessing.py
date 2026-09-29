@@ -26,8 +26,8 @@ def decode_png(data, limits, mask=False):
             if im.width * im.height > limits["max_pixels"]:
                 raise ImageTooLarge("PNG exceeds maximum pixel count")
             if mask:
-                if im.mode != "L":
-                    raise InvalidImage("Mask must be single-channel 8-bit grayscale PNG")
+                if im.mode not in ("L", "RGB"):
+                    raise InvalidImage("Mask must be 8-bit grayscale or discrete RGB PNG")
             elif im.mode in ("RGB", "RGBA"):
                 log.info("Converting RGB X-ray to grayscale for preprocessing")
                 im = im.convert("L")
@@ -45,11 +45,38 @@ def decode_png(data, limits, mask=False):
 
 
 def validate_mask(arr):
-    if arr.ndim != 2 or arr.dtype != np.uint8:
-        raise InvalidImage("Mask must be single-channel uint8")
-    values = np.unique(arr)
-    if not np.isin(values, [0, 1, 2]).all():
-        raise InvalidImage(f"Mask contains invalid labels: {values.tolist()}; expected only 0, 1, 2")
+    if arr.dtype != np.uint8:
+        raise InvalidImage("Mask must be uint8")
+    if arr.ndim == 2:
+        if not np.isin(arr, [0, 1, 2]).all():
+            raise InvalidImage("Mask contains invalid labels; expected only 0, 1, 2")
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        if not (np.isin(arr[..., 0], [0, 1]).all() and
+                np.isin(arr[..., 1], [0, 2]).all() and (arr[..., 2] == 0).all()):
+            raise InvalidImage("Discrete RGB mask requires R=0/1, G=0/2, B=0")
+    else:
+        raise InvalidImage("Mask must be grayscale HxW or discrete RGB HxWx3")
+
+
+def class_mask(arr, label):
+    return arr[..., label - 1] == label if arr.ndim == 3 else arr == label
+
+
+def mask_statistics(arr):
+    validate_mask(arr)
+    femur, tibia = class_mask(arr, 1), class_mask(arr, 2)
+    return {"femur_pixels": int(femur.sum()), "tibia_pixels": int(tibia.sum()),
+            "overlap_pixels": int((femur & tibia).sum())}
+
+
+def exclusive_mask(arr):
+    """Legacy UNet accepts only lossless conversion; overlap must never be discarded."""
+    validate_mask(arr)
+    if arr.ndim == 2:
+        return arr
+    if mask_statistics(arr)["overlap_pixels"]:
+        raise InvalidImage("Overlapping annotations require MedSAM2 fine-tuning; UNet is mutually exclusive")
+    return (arr[..., 0] + arr[..., 1]).astype(np.uint8)
 
 
 def encode_mask(arr):
@@ -83,6 +110,7 @@ def prepare(arr, config):
 
 
 def prepare_mask(mask, geometry):
+    mask = exclusive_mask(mask)
     rh, rw = geometry.resized
     ph, pw = geometry.padded
     resized = np.asarray(Image.fromarray(mask).resize((rw, rh), Image.Resampling.NEAREST))

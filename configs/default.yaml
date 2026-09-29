@@ -20,7 +20,10 @@ preprocessing:
 inference:
   device: auto
   mixed_precision: true
+sam2:
+  asset_directory: pretrained/medsam2_updated
 training:
+  model: unet
   epochs: 50
   batch_size: 4
   learning_rate: 0.0001

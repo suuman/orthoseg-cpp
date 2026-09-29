@@ -80,7 +80,7 @@ def test_bilateral_boxes_and_resize(config):
         def set_image(self, image):
             self.image_shape = image.shape
 
-        def predict(self, box, multimask_output):
+        def predict(self, box, multimask_output, return_logits):
             self.seen.append(box.tolist())
             mask = np.zeros((1, *self.image_shape[:2]), dtype=bool)
             mask[0, 100:200, 50:100] = True
@@ -93,9 +93,9 @@ def test_bilateral_boxes_and_resize(config):
     predictor = Sam2Predictor(config)
     predictor._predictor, predictor._version = fake, 'fake'
     mask, version, _ = predictor.predict(arr, {1: [[10, 20, 30, 60], [45, 80, 75, 150]]})
-    assert fake.image_shape == (1024, 512, 3)
+    assert fake.image_shape == (1024, 1024, 3)
     assert len(fake.seen) == 2
-    assert np.allclose(fake.seen[0], [51.2, 102.4, 153.6, 307.2])
-    assert mask.shape == arr.shape and set(np.unique(mask)) <= {0, 1} and version == 'fake'
+    assert np.allclose(fake.seen[0], [307.2, 102.4, 409.6, 307.2])
+    assert mask.shape == (*arr.shape, 3) and set(np.unique(mask)) <= {0, 1} and version == 'fake'
     assert len(parse_boxes([10, 20, 30, 60], arr.shape)) == 1
     assert len(parse_boxes([[10, 20, 30, 60], [45, 80, 75, 150]], arr.shape)) == 2

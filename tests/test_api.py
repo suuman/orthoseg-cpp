@@ -64,7 +64,7 @@ def test_submit_revision(client, pair):
 
 
 @pytest.mark.parametrize('mask', [np.zeros((1, 1), np.uint8), np.full((24, 37), 3, np.uint8),
-                                 np.zeros((24, 37, 3), np.uint8)])
+                                 np.full((24, 37, 3), 255, np.uint8)])
 def test_reject_masks(client, pair, mask):
     response = client.post('/training/cases', files={'image': ('x.png', pair[0]), 'mask': ('y.png', png(mask))})
     assert response.status_code == 422
@@ -97,3 +97,24 @@ def test_storage_failure_returns_507(client, pair, monkeypatch):
     monkeypatch.setattr(client.app.state.store, 'submit', fail)
     response = client.post('/training/cases', files={'image': ('x.png', pair[0]), 'mask': ('y.png', pair[1])})
     assert response.status_code == 507
+
+
+def test_health_does_not_wait_for_inference_locks(config):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import ExitStack
+    app = create_app(config)
+    with TestClient(app) as api, ThreadPoolExecutor(max_workers=1) as pool:
+        with ExitStack() as locks:
+            for predictor in (app.state.predictor, app.state.sam2, app.state.nnunet):
+                locks.enter_context(predictor._lock)
+            response = pool.submit(api.get, '/health').result(timeout=2)
+            assert response.status_code == 200
+            assert response.json()['status'] == 'ok'
+
+
+@pytest.mark.parametrize('box', ['[null]', '[null, [0,0,2,2]]', 'null'])
+def test_null_prompt_boxes_are_client_errors(config, pair, box):
+    with TestClient(create_app(config)) as api:
+        response = api.post('/segment/prompted',
+            files={'image': ('x.png', pair[0])}, data={'femur_box': box})
+        assert response.status_code == 422, response.text

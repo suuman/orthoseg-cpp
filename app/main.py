@@ -12,6 +12,7 @@ from app.core.config import load_config
 from app.core.logging import configure_logging
 from app.ml.predictor import Predictor
 from app.ml.sam2_predictor import Sam2Predictor
+from app.ml.sam2_model import sam2_config
 from app.ml.nnunet_predictor import NnUnetPredictor
 from app.ml.store import CaseStore
 
@@ -68,7 +69,14 @@ def create_app(config=None, predictor=None):
     app.state.sam2 = Sam2Predictor(config)
     app.state.nnunet = NnUnetPredictor(config)
     app.state.store = CaseStore(config)
-    app.state.management = Management(config, app.state.predictor)
+    # Keep UNet serving independent of the CLI-selected training family.
+    import copy
+    unet_config = copy.deepcopy(config)
+    unet_config["training"]["model"] = "unet"
+    if predictor is None:
+        app.state.predictor = Predictor(unet_config)
+    app.state.management = Management(unet_config, app.state.predictor)
+    app.state.sam2_management = Management(sam2_config(config), app.state.sam2)
     app.add_middleware(RequestLimit, maximum=config["limits"]["max_file_bytes"] * 2 + 65536)
     app.add_middleware(CORSMiddleware, allow_origins=config["server"]["cors_origins"],
                        allow_methods=["GET", "POST"], allow_headers=["Content-Type"],

@@ -6,7 +6,7 @@ from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from app.ml.predictor import ModelUnavailable
-from app.ml.preprocessing import ImageTooLarge, InvalidImage, decode_png, encode_mask
+from app.ml.preprocessing import ImageTooLarge, InvalidImage, decode_png, encode_mask, mask_statistics
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -23,14 +23,16 @@ async def read_file(file, config):
 def health(request: Request):
     predictor = request.app.state.predictor
     info = predictor.info()
+    sam2 = request.app.state.sam2.info()
+    nnunet = request.app.state.nnunet.info()
     import torch
     return {"status": "ok", "device": predictor.device.type,
             "gpu": torch.cuda.get_device_name() if predictor.device.type == "cuda" else None,
             **{k: info[k] for k in ("model_loaded", "model_version", "labels")},
-            "sam2_model_loaded": request.app.state.sam2.info()["model_loaded"],
-            "sam2_model_version": request.app.state.sam2.info()["model_version"],
-            "nnunet_model_loaded": request.app.state.nnunet.info()["model_loaded"],
-            "nnunet_model_version": request.app.state.nnunet.info()["model_version"]}
+            "sam2_model_loaded": sam2["model_loaded"],
+            "sam2_model_version": sam2["model_version"],
+            "nnunet_model_loaded": nnunet["model_loaded"],
+            "nnunet_model_version": nnunet["model_version"]}
 
 
 @router.get("/model/info")
@@ -101,8 +103,10 @@ async def segment_nnunet(request: Request, image: UploadFile = File(...),
 @router.post("/segment/prompted")
 async def segment_prompted(request: Request, image: UploadFile = File(...),
                            femur_box: str | None = Form(None, max_length=100),
-                           tibia_box: str | None = Form(None, max_length=100)):
+                           tibia_box: str | None = Form(None, max_length=100),
+                           mask: UploadFile | None = File(None)):
     data = await read_file(image, request.app.state.config)
+    prompt_data = await read_file(mask, request.app.state.config) if mask else None
     def run():
         arr = decode_png(data, request.app.state.config["limits"])
         boxes = {}
@@ -112,10 +116,17 @@ async def segment_prompted(request: Request, image: UploadFile = File(...),
                     boxes[label] = json.loads(raw)
                 except ValueError as exc:
                     raise InvalidImage("SAM2 boxes must be JSON arrays [x0,y0,x1,y1]") from exc
-        mask, version, elapsed = request.app.state.sam2.predict(arr, boxes)
-        if mask.shape != arr.shape:
+        prompt = decode_png(prompt_data, request.app.state.config["limits"], mask=True) if prompt_data else None
+        mask, version, elapsed = (request.app.state.sam2.predict(arr, boxes, prompt) if prompt is not None
+                                  else request.app.state.sam2.predict(arr, boxes))
+        if mask.shape[:2] != arr.shape:
             raise RuntimeError("SAM2 prediction dimensions do not match original image")
+        stats = mask_statistics(mask)
         return Response(encode_mask(mask), media_type="image/png", headers={
+            "X-Mask-Encoding": "rgb_discrete" if mask.ndim == 3 else "class_index",
+            "X-Femur-Pixels": str(stats["femur_pixels"]),
+            "X-Tibia-Pixels": str(stats["tibia_pixels"]),
+            "X-Overlap-Pixels": str(stats["overlap_pixels"]),
             "X-Model-Version": version, "X-Image-Width": str(arr.shape[1]),
             "X-Image-Height": str(arr.shape[0]), "X-Inference-Time-Ms": f"{elapsed:.3f}"})
     try:

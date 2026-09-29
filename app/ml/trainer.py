@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from app.core.config import LABELS, load_config
 from app.core.logging import configure_logging
 from app.core.paths import atomic_write, file_lock, write_json
-from app.ml.checkpoint import load_checkpoint, production_path, save_checkpoint
+from app.ml.checkpoint import load_checkpoint, production_path, save_checkpoint, model_root
 from app.ml.dataset import XrayDataset, pad_batch, snapshot
 from app.ml.metrics import segmentation_metrics
 from app.ml.model import build_model, get_device
@@ -67,7 +67,22 @@ def _train(config, store, source, checkpoint, dry_run, progress):
     device = get_device(config)
     set_determinism(seed=config["training"]["seed"])
     parent, payload = None, None
-    if source == "scratch":
+    sam2 = config["training"].get("model") == "medsam2"
+    adapter = None
+    if sam2:
+        from app.ml.sam2_model import load_active
+        from app.ml.sam2_training import Sam2TrainingAdapter
+        if source == "scratch":
+            raise ValueError("MedSAM2 fine-tuning requires the reference or an active checkpoint")
+        if source == "checkpoint":
+            model, parent, payload = load_checkpoint(Path(checkpoint))
+            if parent.get("architecture") != "medsam2":
+                raise ValueError("Expected a MedSAM2 checkpoint")
+            model.to(device)
+        else:
+            model, parent, payload = load_active(config, device)
+        adapter = Sam2TrainingAdapter(model, config, device)
+    elif source == "scratch":
         model = build_model(config)
     else:
         path = Path(checkpoint) if source == "checkpoint" else production_path(config)
@@ -88,7 +103,7 @@ def _train(config, store, source, checkpoint, dry_run, progress):
         return None
     t = config["training"]
     replay = training + [training[i] for i in new_indices for _ in range(t["new_case_repeat_factor"] - 1)]
-    loader = DataLoader(XrayDataset(replay, config, augment=True), batch_size=t["batch_size"],
+    loader = None if sam2 else DataLoader(XrayDataset(replay, config, augment=True), batch_size=t["batch_size"],
                         shuffle=True, num_workers=t["num_workers"], collate_fn=pad_batch,
                         generator=torch.Generator().manual_seed(t["seed"]))
     model.to(device)
@@ -102,8 +117,8 @@ def _train(config, store, source, checkpoint, dry_run, progress):
     loss_fn = DiceCELoss(include_background=t["include_background"], to_onehot_y=True, softmax=True)
     amp = device.type == "cuda" and t["mixed_precision"]
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
-    version = "femur_tibia_2d_" + uuid.uuid4().hex
-    candidate = Path(config["paths"]["models"]) / "candidates" / version
+    version = ("medsam2_" if sam2 else "femur_tibia_2d_") + uuid.uuid4().hex
+    candidate = model_root(config) / "candidates" / version
     candidate.mkdir(parents=True, exist_ok=False)
     progress(candidate_version=version, parent_model_version=parent["version"] if parent else None)
     atomic_write(candidate / "training_config.yaml", yaml.safe_dump(config).encode())
@@ -115,8 +130,8 @@ def _train(config, store, source, checkpoint, dry_run, progress):
     for epoch in range(t["epochs"]):
         progress(status="training", epoch=epoch + 1, epochs=t["epochs"])
         model.train()
-        losses = []
-        for batch in loader:
+        losses = adapter.train_epoch(replay, optimizer, scaler, amp, epoch) if adapter else []
+        for batch in loader or []:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp):
                 loss = loss_fn(model(batch["image"].to(device)), batch["label"].to(device))
@@ -128,7 +143,7 @@ def _train(config, store, source, checkpoint, dry_run, progress):
             losses.append(loss.item())
         scheduler.step()
         progress(status="validating")
-        metrics = evaluate(model, validation, config, device)
+        metrics = adapter.evaluate(validation) if adapter else evaluate(model, validation, config, device)
         score = metrics["mean_foreground_dice"]
         if score is None:
             raise ValueError("Validation metrics undefined: no foreground in predictions or reference labels")
@@ -138,7 +153,13 @@ def _train(config, store, source, checkpoint, dry_run, progress):
         if score > best:
             best = score
             metadata = {"version": version, "parent_model_version": parent["version"] if parent else None,
-                        "created_at": now(), "architecture": config["model"]["architecture"],
+                        "created_at": now(), "architecture": "medsam2" if sam2 else config["model"]["architecture"],
+                        "mask_encoding": "rgb_discrete" if sam2 else "class_index",
+                        "checkpoint_path": str(candidate / "best.pt"),
+                        "parent_checkpoint": parent.get("checkpoint_path") if parent else None,
+                        "dataset_snapshot": str(candidate / "dataset_snapshot.json"),
+                        "dataset_sha256": hashlib.sha256((candidate / "dataset_snapshot.json").read_bytes()).hexdigest(),
+                        "validation_prompt": "reference-derived boxes" if sam2 else None,
                         "training_case_count": len(training), "new_cases_incorporated": len(new_indices),
                         "validation_metrics": metrics, "best_epoch": epoch + 1, "labels": LABELS,
                         "config": config, "environment": environment(),
@@ -149,7 +170,7 @@ def _train(config, store, source, checkpoint, dry_run, progress):
         progress(best_validation_dice=best, metrics=metrics)
     write_json(candidate / "completed.json", {"version": version, "completed_at": now()})
     with file_lock(store.root / ".store.lock"):
-        write_json(store.root / "training_state.json", {"revisions": {r["case_id"]: r["revision"] for r in records},
+        write_json(store.state_path, {"revisions": {r["case_id"]: r["revision"] for r in records},
                    "last_training_time": now(), "latest_candidate_version": version})
     print(f"Best validation results: {json.loads((candidate / 'metrics.json').read_text())}\n"
           f"Candidate saved: {candidate / 'best.pt'}\nProduction model has NOT been replaced.", flush=True)
@@ -160,6 +181,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config")
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--model", choices=["unet", "medsam2"])
     parser.add_argument("--dry-run", action="store_true")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--from-production", action="store_true")
@@ -169,6 +191,8 @@ def main():
     configure_logging()
     try:
         config = load_config(args.config)
+        if args.model:
+            config["training"]["model"] = args.model
         if args.epochs is not None:
             if args.epochs < 1:
                 raise ValueError("epochs must be positive")

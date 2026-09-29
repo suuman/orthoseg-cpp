@@ -40,6 +40,8 @@ def load_config(path=None):
         raise ValueError("Invalid training configuration")
     if any(config["limits"][k] < 1 for k in ("max_file_bytes", "max_pixels")):
         raise ValueError("Upload limits must be positive")
+    if t["model"] not in ("unet", "medsam2"):
+        raise ValueError("training.model must be unet or medsam2")
     a = t["augmentation"]
     if not 0 <= a["probability"] <= 1 or any(a[k] < 0 for k in a if k != "probability"):
         raise ValueError("Invalid augmentation configuration")

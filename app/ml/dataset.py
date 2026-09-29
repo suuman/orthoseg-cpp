@@ -6,14 +6,16 @@ import torch
 from monai.transforms import Compose, RandAffined, RandGaussianNoised, RandScaleIntensityd
 from torch.utils.data import Dataset
 
-from app.ml.preprocessing import decode_png, prepare, prepare_mask
+from app.ml.preprocessing import decode_png, prepare, prepare_mask, exclusive_mask
 
 
 def validate_pair(image, mask, config):
     raw = image.read_bytes()
     x = decode_png(raw, config["limits"])
     y = decode_png(mask.read_bytes(), config["limits"], mask=True)
-    if x.shape != y.shape:
+    if config["training"].get("model") != "medsam2":
+        exclusive_mask(y)
+    if x.shape != y.shape[:2]:
         raise ValueError(f"Image/mask dimensions differ for {image.name}")
     return hashlib.sha256(raw).hexdigest()
 

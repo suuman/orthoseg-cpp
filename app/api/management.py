@@ -1,9 +1,10 @@
 """Opt-in local administrative endpoints, separate from annotation submission."""
 import ipaddress
 import logging
+from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, ConfigDict
 
 log = logging.getLogger(__name__)
@@ -28,17 +29,22 @@ router = APIRouter(dependencies=[Depends(local_admin)], tags=["Local administrat
 
 class DefaultsOnly(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    model: Literal["unet", "medsam2"] = "unet"
+
+
+def manager(request, model):
+    return request.app.state.sam2_management if model == "medsam2" else request.app.state.management
 
 
 @router.get("/management/status")
-def management_status(request: Request):
-    return request.app.state.management.summary()
+def management_status(request: Request, model: Literal["unet", "medsam2"] = "unet"):
+    return manager(request, model).summary()
 
 
 @router.post("/training/start", status_code=202)
 def start(request: Request, options: DefaultsOnly):
     try:
-        return request.app.state.management.start()
+        return manager(request, options.model).start()
     except BlockingIOError as exc:
         raise HTTPException(409, "Training is already active (API or local script)") from exc
     except ValueError as exc:
@@ -46,6 +52,12 @@ def start(request: Request, options: DefaultsOnly):
     except OSError as exc:
         log.exception("Unable to start administrative training job")
         raise HTTPException(503, "Unable to start training; check backend logs") from exc
+
+
+@router.get("/management/cases")
+def training_cases(request: Request, model: Literal["unet", "medsam2"] = "unet",
+                   offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
+    return manager(request, model).store.case_page(offset, limit)
 
 
 @router.get("/training/jobs/{job_id}")
@@ -59,7 +71,7 @@ def job(request: Request, job_id: str):
 @router.post("/models/{version}/promote")
 def promote(request: Request, version: str, options: DefaultsOnly):
     try:
-        return request.app.state.management.promote(version)
+        return manager(request, options.model).promote(version)
     except BlockingIOError as exc:
         raise HTTPException(409, "Wait for active training to finish before promotion") from exc
     except (ValueError, FileNotFoundError) as exc:

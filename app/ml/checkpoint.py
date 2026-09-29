@@ -28,7 +28,11 @@ def load_checkpoint(path):
     if meta["labels"] != LABELS:
         raise ValueError("Checkpoint label mapping mismatch")
     config = meta["config"]
-    model = build_model(config)
+    if meta.get("architecture") == "medsam2":
+        from app.ml.sam2_model import build_sam2_model
+        model = build_sam2_model(config)
+    else:
+        model = build_model(config)
     model.load_state_dict(payload["state_dict"], strict=True)
     if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
         raise ValueError("Checkpoint contains non-finite model parameters")
@@ -36,14 +40,25 @@ def load_checkpoint(path):
     return model, meta, payload
 
 
+def model_root(config):
+    root = Path(config["paths"]["models"])
+    return root / "medsam2" if config["training"].get("model") == "medsam2" else root
+
+
 def production_path(config):
-    return Path(config["paths"]["models"]) / "production" / "model.pt"
+    return model_root(config) / "production" / "model.pt"
 
 
 def validate_candidate(config, version):
     safe_id(version)
-    root = Path(config["paths"]["models"])
+    root = model_root(config)
     candidate = root / "candidates" / version
+    try:
+        completed = json.loads((candidate / "completed.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("Candidate training did not complete successfully") from exc
+    if not isinstance(completed, dict) or completed.get("version") != version or not completed.get("completed_at"):
+        raise ValueError("Invalid candidate completion marker")
     _, meta, _ = load_checkpoint(candidate / "best.pt")
     external = json.loads((candidate / "metadata.json").read_text())
     # JSON stringifies numeric dictionary keys.
@@ -63,7 +78,7 @@ def promote(config, version):
 
 def _promote(config, version):
     validate_candidate(config, version)
-    root = Path(config["paths"]["models"])
+    root = model_root(config)
     candidate = root / "candidates" / version
     with file_lock(root / ".promotion.lock"):
         release = root / "archive" / f"{version}-{uuid.uuid4().hex}"
@@ -84,8 +99,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("version")
     parser.add_argument("--config")
+    parser.add_argument("--model", choices=["unet", "medsam2"])
     args = parser.parse_args()
-    promote(load_config(args.config), args.version)
+    config = load_config(args.config)
+    if args.model:
+        config["training"]["model"] = args.model
+    promote(config, args.version)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,16 @@
 # Offline femur/tibia X-ray backend
 
-Local FastAPI service for an existing annotation UI. No UI, cloud services, telemetry, pretrained downloads, or automatic training. PNG mask IDs are **0 background, 1 femur, 2 tibia**. Output is single-channel uint8 at exactly the original image dimensions.
+Local FastAPI service for OrthoSeg. Automatic UNet/nnUNet routes return single-channel uint8 IDs **0 background, 1 femur, 2 tibia**. Prompted MedSAM2 returns independent discrete RGB channels **R=0/1, G=0/2, B=0**, including valid Femur/Tibia overlap `(1,2,0)`. Every prediction uses the original image dimensions. Training runs only on explicit request.
 
-## Local prompted SAM2 model
+## Local prompted MedSAM2 model
 
-The supplied SAM2.1 Hiera Tiny checkpoint and Python package from `/run/media/suman/Data/sam2` are installed under `models/pretrained/medsam2/`. This checkpoint needs a box prompt; it cannot serve the automatic `/segment` route or become a UNet production checkpoint. Its independent `/segment/prompted` route accepts one or both `femur_box` and `tibia_box` form fields as JSON arrays of original-image pixel coordinates, for example `[20,30,220,330]`. For bilateral anatomy, pass two boxes for a bone as `[[20,30,220,330],[300,30,500,330]]`. The image is explicitly resized to **1024 pixels high** with its aspect ratio preserved; boxes are scaled to the resized image, and the returned 0/1/2 PNG is restored to the original size. SAM2 then applies its own 1024×1024 model transform. When predictions overlap, the higher SAM2 score wins. Check `sam2_model_loaded` and `sam2_model_version` in `/health` or `prompted_model` in `/model/info`.
+The updated checkpoint, model configuration, Python package and reference inference code from `/run/media/suman/Data/medsam2` are installed under `models/pretrained/medsam2_updated/`. The original source checkpoint and the older installed assets remain unchanged. The initial version is `medsam2_hiera_t_8113ea7212e9`.
+
+`/segment/prompted` accepts Femur/Tibia boxes, including two boxes per bone for bilateral anatomy, or a multipart `mask` containing grayscale 0/1/2 or discrete RGB labels. OrthoSeg exposes Bounding Box, Paint Mask, Load Mask and Normal Fill Mask prompts for **MONAI MedSAM2 (boxes / masks)**. Pixels are predicted independently for each bone; overlap is never resolved by a winner.
+
+Images are resized to **1024 pixels high**, preserving aspect ratio, and centered on a square canvas before SAM2's transform. Box coordinates and mask prompts use the same geometry; masks are unpadded and restored with nearest-neighbor interpolation. As in the reference implementation, uint8 intensity is preserved and higher-depth images use min/max normalization. Mask refinement uses thresholded bilinear 256×256 logits of −10/+10 plus a mask-derived box. Check `/health` and `/model/info` for the loaded version, checkpoint, encoding and supported prompts.
+
+MedSAM2 uses the existing corrected-annotation pool, background job runner and model-management dialog. Choose **MedSAM2** in that dialog to train a new candidate, inspect progress and metrics, then promote it explicitly. Restart the backend to activate the promoted version. See [MEDSAM_UPDATE_IMPLEMENTATION.md](MEDSAM_UPDATE_IMPLEMENTATION.md) for the complete workflow, API examples, file list and tests.
 
 The default `.venv` does not contain all SAM2 dependencies. On this workstation, `/home/suman/deepnet/bin/python` has the required packages; `scripts/run_server_sam2.sh` selects it by default, or set `XRAY_PYTHON` to another compatible environment. Install `requirements.txt` and `requirements-sam2.txt` into that environment if needed. Startup is local and downloads nothing. Verify the checkpoint and API together with:
 
@@ -15,7 +21,7 @@ curl --fail-with-body -F image=@xray.png -F 'femur_box=[20,30,220,330]' \
   -F 'tibia_box=[150,280,430,580]' http://127.0.0.1:8000/segment/prompted -o mask.png
 ```
 
-Box coordinates must lie within the image and have positive area; at least one bone box is required and each bone accepts up to two boxes. The automatic `/segment` route still requires a separately trained production checkpoint. Each model reports readiness independently. The prompted checkpoint is used for inference only; model management and fine-tuning operate on the automatic MONAI UNet family.
+Box coordinates must lie within the original image and have positive area. Supply at least one bone box or a nonempty labeled mask. Each bone accepts up to two boxes. The automatic `/segment` route still requires a separately trained UNet checkpoint; model families report readiness independently.
 
 ## Local nnUNet v2 automatic model
 
@@ -80,7 +86,7 @@ Use `--config /path/to/override.yaml` or `XRAY_CONFIG` to override selected defa
 
 ## Images, geometry and labels
 
-8-bit and 16-bit grayscale X-rays retain their original stored bytes. RGB/RGBA images are deterministically converted to grayscale for processing and the conversion is logged. Alpha is ignored. Palette, binary, grayscale-alpha and animated images are rejected. Label masks must be 8-bit grayscale with only 0, 1, 2; RGB/palette/16-bit labels are rejected without conversion. Background-only labels are accepted because the service cannot infer anatomical correctness from pixels alone. Anatomical approval belongs to the annotator.
+8-bit and 16-bit grayscale X-rays retain their original stored bytes. RGB/RGBA images are deterministically converted to grayscale for processing and the conversion is logged. Alpha is ignored. Palette, binary, grayscale-alpha and animated images are rejected. Label masks accept 8-bit grayscale 0/1/2 or discrete RGB R=0/1, G=0/2, B=0. Palette, 16-bit and malformed RGB labels are rejected. The pool stores the original mask bytes, channel encoding and Femur/Tibia/overlap pixel counts. UNet accepts RGB only when it can convert without losing overlap; overlapping samples require MedSAM2 training. Background-only labels are accepted because the service cannot infer anatomical correctness from pixels alone. Anatomical approval belongs to the annotator.
 
 For the automatic UNet route, a single preprocessing module handles both training and inference: float32 conversion, percentile clipping, [0,1] scaling, aspect-preserving downscaling, and bottom/right zero padding to UNet stride compatibility. Constant images normalize to zero. Maximum side length defaults to 1024; images are never upscaled before automatic inference. Discrete labels use nearest-neighbor interpolation in both directions. Validation metrics are computed against unaugmented original-resolution labels after inverse mapping. Limits default to 32 MiB per file and 25 million decoded pixels, with an aggregate streamed request limit as well. Prompted SAM2 uses the separate 1024-high path described above.
 
@@ -120,11 +126,11 @@ Subsequent runs default to the deployed checkpoint:
 ./scripts/finetune.sh --config configs/default.yaml
 ```
 
-No production checkpoint means default fine-tuning fails with an actionable message. `--dry-run` checks the environment, parent checkpoint and complete dataset without training. Custom checkpoints must use this backend's state-dict/metadata format with the canonical labels. Model/preprocessing configuration must match the parent. The model factory isolates the architecture; a future architecture can be implemented there without changing the HTTP contract.
+For UNet, no production checkpoint means default fine-tuning fails with an actionable message. `--dry-run` checks the environment, parent checkpoint and complete dataset without training. Custom checkpoints must use this backend's state-dict/metadata format with the canonical labels. Model/preprocessing configuration must match the parent. The model factory isolates the architecture; a future architecture can be implemented there without changing the HTTP contract.
 
 Training includes every active historical example and repeats new/revised examples according to `new_case_repeat_factor`. Data snapshots reference immutable revisions, so concurrent annotation updates remain pending for the next training run. Only one trainer runs per data root. The fixed validation set selects the best epoch using dataset-global mean foreground Dice; femur/tibia Dice and IoU are also recorded. Classes empty in both reference and prediction have `null` scores and are excluded from the mean. All-undefined validation fails. HD95 is not implemented.
 
-Defaults use MONAI Dice+cross-entropy loss, AdamW, cosine learning-rate scheduling, deterministic seeding, and conservative paired affine/intensity/noise augmentations. Horizontal flipping is disabled. Variable shapes are padded within each batch. CUDA and mixed precision are used only when available/configured; CPU works without AMP. Optimizer/scheduler restoration is opt-in via `training.resume_optimizer`. This resumes optimization state, not the exact random-number sequence of an interrupted run. Seeds and snapshots aid reproducibility; cross-platform bitwise reproducibility is not guaranteed.
+UNet defaults use MONAI Dice+cross-entropy loss, AdamW, cosine learning-rate scheduling, deterministic seeding, and conservative paired affine/intensity/noise augmentations. Horizontal flipping is disabled. Variable shapes are padded within each batch. CUDA and mixed precision are used only when available/configured; CPU works without AMP. Optimizer/scheduler restoration is opt-in via `training.resume_optimizer`. This resumes optimization state, not the exact random-number sequence of an interrupted run. Seeds and snapshots aid reproducibility; cross-platform bitwise reproducibility is not guaranteed.
 
 Each run creates:
 
@@ -181,10 +187,10 @@ system. Do not proxy administrative routes to remote callers.
 
 | New route | Method | Purpose |
 | --- | --- | --- |
-| `/management/status` | GET | Production on disk, loaded version, dataset counts, validated latest completed candidate, latest job |
-| `/training/start` | POST `{}` | Start one asynchronous fine-tuning job from production with backend defaults |
+| `/management/status` | GET, optional `?model=medsam2` | Production on disk, loaded version, dataset counts, validated latest completed candidate, latest job |
+| `/training/start` | POST `{}` or `{"model":"medsam2"}` | Start one asynchronous fine-tuning job from production with backend defaults |
 | `/training/jobs/{id}` | GET | Job state, epoch, best Dice, error and bounded recent log |
-| `/models/{version}/promote` | POST `{}` | Deliberately promote the valid latest completed candidate |
+| `/models/{version}/promote` | POST `{}` or `{"model":"medsam2"}` | Deliberately promote the valid latest completed candidate |
 
 The worker calls the **existing trainer**, and promotion calls the **existing
 checkpoint promotion implementation**. Administrative jobs run on CPU with bounded
@@ -196,7 +202,7 @@ use the CLI for GPU training with appropriate workstation resource planning.
 The API reserves the same filesystem lock used by CLI training before launching a
 worker, then passes the locked descriptor to that worker. Duplicate API/CLI runs
 and promotion during training return HTTP 409. Missing bootstrap weights return
-422; use `finetune.sh --from-scratch` explicitly first. Bad datasets or training
+422; bootstrap UNet with `finetune.sh --from-scratch`, or install the supplied MedSAM2 reference assets. CLI MedSAM2 training uses `finetune.sh --model medsam2`; CLI promotion accepts `--model medsam2` as well. Bad datasets or training
 failures become failed jobs and never promote a model.
 
 Job snapshots/status/full logs live locally under `data/training/jobs/<id>/`.
@@ -227,3 +233,41 @@ PYTHONPATH=. .venv/bin/python scripts/management_smoke.py \
 
 See [ADDONS_IMPLEMENTATION.md](ADDONS_IMPLEMENTATION.md) for the change inventory
 and validation record.
+
+### Corrected-case reminders and manual fine-tuning
+
+Open OrthoSeg **Model Management**, select **UNet** or **MedSAM2**, and set
+**Remind me to fine-tune after corrected cases**. Zero disables reminders.
+The saved threshold counts distinct new/revised cases accepted through **Add to
+AI Training**, not brush strokes or exports. After an accepted upload reaches
+that model's threshold, the app offers to open Model Management. Declining does
+not prompt again until the next threshold milestone or a completed training run.
+Training starts only when the user selects **Fine-tune New Candidate** and
+confirms. Promotion remains a separate action and requires a backend restart.
+
+Enable the backend management API with `--config configs/management.yaml`.
+The toolbar's Model Management button appears when the backend grants access;
+`ORTHOSEG_ENABLE_MODEL_MANAGEMENT=1` also exposes the Tools menu entry.
+A fixed validation dataset and a parent model are required. UNet bootstrap from
+scratch remains a CLI operation. If UI management is unavailable, use
+`/run/media/suman/Data/monai/scripts/finetune.sh`:
+
+```bash
+# UNet fine-tuning from production; add --from-scratch for initial training.
+/run/media/suman/Data/monai/scripts/finetune.sh --model unet --dry-run
+/run/media/suman/Data/monai/scripts/finetune.sh --model unet --epochs 50
+
+# MedSAM2 fine-tuning using the installed compatible Python environment.
+XRAY_PYTHON=/home/suman/deepnet/bin/python /run/media/suman/Data/monai/scripts/finetune.sh --model medsam2 --dry-run
+XRAY_PYTHON=/home/suman/deepnet/bin/python /run/media/suman/Data/monai/scripts/finetune.sh --model medsam2 --epochs 50
+```
+
+Promotion now requires the matching `completed.json` marker as well as valid
+weights, metadata and metrics. Interrupted candidates cannot be promoted through
+the CLI. Health/status metadata remains readable while inference is running.
+
+Model Management also provides `GET /management/cases?model=unet&offset=0&limit=50`
+(or `model=medsam2`). It uses the same local-only management permission check.
+The paginated response contains filenames, actual labels, overlap pixels, and
+pending/incorporated status for each active corrected-case revision. Maximum
+page size is 100. OrthoSeg displays these cases in its model-management dialog.
