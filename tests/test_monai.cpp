@@ -1,5 +1,7 @@
 #include "MonaiClient.h"
 #include "MainWindow.h"
+#include "CanvasWidget.h"
+#include <QMouseEvent>
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QFile>
@@ -73,12 +75,13 @@ struct Server : QTcpServer {
                     if (lastPath == "/health" && status == 200) { body = "{\"status\":\"ok\",\"model_loaded\":true,\"sam2_model_loaded\":true,\"sam2_model_version\":\"sam2_test\",\"nnunet_model_loaded\":true,\"nnunet_model_version\":\"nnunet_test\"}"; type = "application/json"; }
                     if (lastPath == "/training/cases" && status == 200) { body = "{\"status\":\"accepted\",\"new_cases_since_last_training\":1}"; type = "application/json"; }
                     socket->write("HTTP/1.1 " + QByteArray::number(status) + " Result\r\nContent-Type: " + type +
-                                  "\r\nX-Model-Version: test_v1\r\nConnection: close\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                                  "\r\nX-Model-Version: " + version + "\r\nConnection: close\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body);
                     socket->disconnectFromHost();
                 });
             }
         });
     }
+    QByteArray version = "test_v1";
     QUrl url() const { return QUrl(QString("http://127.0.0.1:%1").arg(serverPort())); }
     QByteArray field(const QByteArray& name) const {
         const auto start = lastBody.indexOf("name=\"" + name + "\"");
@@ -119,9 +122,12 @@ struct Dialogs : QObject {
 
 int main(int argc, char** argv) {
     std::setbuf(stdout, nullptr);
+    QTemporaryDir settingsDirectory;
+    qputenv("XDG_CONFIG_HOME", settingsDirectory.path().toUtf8());
     QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc, argv);
-    if (app.arguments().contains("--live")) {
+    if (app.arguments().contains("--live") || app.arguments().contains("--live-medsam")) {
+        const bool medsam = app.arguments().contains("--live-medsam");
         const auto args = app.arguments();
         if (args.size() != 4) return 2;
         MainWindow live;
@@ -130,7 +136,15 @@ int main(int argc, char** argv) {
         dialogs.file = args[2];
         QMetaObject::invokeMethod(&live, "onUpload", Qt::DirectConnection);
         auto* button = live.findChild<QPushButton*>("monaiSegment");
-        button->click();
+        if (medsam) {
+            live.findChild<QPushButton*>("aiFillToolBtn")->click();
+            live.findChild<QComboBox*>("aiModelSelector")->setCurrentIndex(2);
+            const auto* doc = live.document();
+            const Box box{1, 1, float(doc->width()-2), float(doc->height()-2)};
+            live.document()->aiFill().femurBox = box;
+            live.document()->aiFill().tibiaBox = box;
+            live.findChild<QPushButton*>("runAIFill")->click();
+        } else button->click();
         CHECK(waitFor([&]{ return button->isEnabled(); }, 180000) && dialogs.errors == 0, "live MONAI prediction previewed");
         live.findChild<QPushButton*>("aiFillToolBtn")->click();
         live.findChild<QPushButton*>("applyAIResult")->click();
@@ -138,14 +152,32 @@ int main(int argc, char** argv) {
         CHECK(doc->hasImage() && doc->canUndo(), "live prediction is editable and undoable");
         if (dialogs.errors || !doc->hasImage()) return 1;
         doc->paintLine({4,4}, {4,4}, Label::Background, 2);
+        if (!medsam) doc->paintLine({15,15}, {15,15}, Label::Background, 2);
         doc->paintLine({15,15}, {15,15}, Label::Tibia, 2);
         // Exercise the unchanged AI Fill apply path, without requiring GPU weights.
         doc->aiFill().resultMask = cv::Mat::zeros(doc->mask().size(), CV_8UC1);
+        if (!medsam) doc->paintLine({20,20}, {20,20}, Label::Background, 1);
         doc->aiFill().resultMask.at<uchar>(20,20) = static_cast<uchar>(Label::Femur);
         doc->applyAIResult();
+        if (medsam) {
+            // Actual canvas brush events add both bones at the same source pixel.
+            auto* canvas = live.canvas();
+            canvas->setActiveTool(Tool::Brush);
+            canvas->setBrushSize(4);
+            const QPointF point = canvas->imageRect().center();
+            for (auto bone : {Label::Femur, Label::Tibia}) {
+                canvas->setActiveLabel(bone);
+                QMouseEvent press(QEvent::MouseButtonPress, point, point, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                QApplication::sendEvent(canvas, &press);
+                QMouseEvent release(QEvent::MouseButtonRelease, point, point, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                QApplication::sendEvent(canvas, &release);
+            }
+            CHECK(cv::countNonZero(doc->labelMask(Label::Femur) & doc->labelMask(Label::Tibia)) > 0,
+                  "canvas editing preserves Femur/Tibia overlap before export");
+        }
         QFile expected(args[3] + ".canonical.png");
         CHECK(expected.open(QIODevice::WriteOnly), "write expected current mask for backend verification");
-        expected.write(encodeMonaiMask(toMonaiLabels(doc->mask(), {0,1,2})));
+        expected.write(encodeMonaiMask(toMonaiLabels(doc->monaiAnatomyMask(), {0,1,2})));
         expected.close();
         dialogs.add = true;
         dialogs.file = args[3];
@@ -167,11 +199,15 @@ int main(int argc, char** argv) {
     rejects([&]{ decodeMonaiMask(png(canonical), {2,2}); }, "dimension mismatch rejected");
     rejects([&]{ decodeMonaiMask("bad", source.size()); }, "invalid PNG rejected");
     rejects([&]{ decodeMonaiMask(png(cv::Mat(source.size(), CV_8UC1, cv::Scalar(3))), source.size()); }, "invalid class rejected");
-    rejects([&]{ decodeMonaiMask(png(cv::Mat(source.size(), CV_8UC3, cv::Scalar(1,1,1))), source.size()); }, "RGB labels rejected");
+    rejects([&]{ decodeMonaiMask(png(cv::Mat(source.size(), CV_8UC3, cv::Scalar(1,1,1))), source.size()); }, "malformed RGB labels rejected");
     rejects([&]{ decodeMonaiMask(png(source), source.size()); }, "16-bit labels rejected");
     auto mapped = fromMonaiLabels(canonical, {0,5,8});
     CHECK(mapped.at<uchar>(4,4) == 5 && mapped.at<uchar>(6,23) == 8, "noncanonical editor label IDs mapped semantically");
     CHECK(same(toMonaiLabels(mapped, {0,5,8}), canonical), "reverse mapping uses current editor labels");
+    cv::Mat overlap(source.size(), CV_8UC3, cv::Scalar(0, 2, 1));
+    CHECK(same(decodeMonaiMask(encodeMonaiMask(overlap), source.size()), overlap),
+          "MONAI RGB response and training encoding preserve overlap");
+
     rejects([&]{ fromMonaiLabels(canonical, {0,-1,8}); }, "missing Femur rejected");
     rejects([&]{ fromMonaiLabels(canonical, {0,5,-1}); }, "missing Tibia rejected");
 
@@ -253,8 +289,10 @@ int main(int argc, char** argv) {
         return sideScroll && widget && widget->mapTo(sideScroll->viewport(),
             QPoint(widget->width(), 0)).x() <= sideScroll->viewport()->width();
     };
-    CHECK(withinSidebar(url) && withinSidebar(manage) && withinSidebar(apply),
+    CHECK(withinSidebar(url) && withinSidebar(apply),
           "MONAI controls fit inside the sidebar viewport");
+    CHECK(manage && manage->parentWidget() == window.findChild<QPushButton*>("batchModeButton")->parentWidget() && manage->isHidden(),
+          "unavailable management is hidden in the top toolbar");
     CHECK(run && run->text().contains("MONAI"), "AI Fill model choice routes its run action to MONAI");
     auto* doc=window.document();
     doc->paintLine({20,20},{20,20},Label::Fibula,2);
@@ -297,7 +335,7 @@ int main(int argc, char** argv) {
           "UI sends only drawn bone box");
     CHECK(doc->mask().at<uchar>(6,23)==before.at<uchar>(6,23),
           "single-bone prompt preserves unprompted Tibia");
-    CHECK(doc->aiFill().resultMask.at<uchar>(6,23)==before.at<uchar>(6,23),
+    CHECK(doc->aiFill().resultMask.at<cv::Vec3b>(6,23)[1]==(before.at<uchar>(6,23)==2 ? 2 : 0),
           "SAM2 preview retains the unprompted bone");
     apply->click();
     CHECK(doc->canUndo(), "SAM2 prediction is undoable after Apply");
@@ -307,6 +345,18 @@ int main(int argc, char** argv) {
           server.field("femur_box")=="[[1,1,16,17],[18,2,30,15]]",
           "bilateral Femur boxes are submitted together");
     clear->click();
+    auto* promptType = window.findChild<QComboBox*>("aiPromptType");
+    promptType->setCurrentIndex(1);
+    doc->aiFill().promptMask = cv::Mat(source.size(), CV_8UC1, cv::Scalar(255));
+    server.response = png(overlap);
+    run->click();
+    CHECK(waitFor([&]{return button->isEnabled();}) && !server.field("mask").isEmpty(),
+          "MONAI MedSAM2 Paint Mask sends the selected anatomy as an independent channel");
+    CHECK(doc->aiFill().resultMask.type() == CV_8UC3,
+          "overlapping MedSAM2 prediction remains RGB in the UI preview");
+    clear->click();
+    promptType->setCurrentIndex(0);
+    server.response = png(canonical);
     selector->setCurrentIndex(1);
     selector->setCurrentIndex(3);
     CHECK(waitFor([&]{return health->text().contains("ready");}) && run->text().contains("nnUNet"),
@@ -330,9 +380,25 @@ int main(int argc, char** argv) {
     CHECK(server.requests == requestsBeforeNative, "selecting native nnUNet makes no server request");
 #endif
     selector->setCurrentIndex(1);
+    server.version = "test_v2";
+    run->click();
+    CHECK(waitFor([&]{return button->isEnabled();}) && !doc->aiFill().resultMask.empty(),
+          "new model version is previewed before canvas auto-apply");
+    auto* editingCanvas = window.canvas();
+    editingCanvas->setActiveTool(Tool::Brush);
+    editingCanvas->setActiveLabel(Label::Femur);
+    editingCanvas->setBrushSize(1);
+    const auto rect = editingCanvas->imageRect();
+    const QPointF point(rect.left() + 18.5 * rect.width() / doc->width(),
+                        rect.top() + 10.5 * rect.height() / doc->height());
+    QMouseEvent press(QEvent::MouseButtonPress, point, point, point, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(editingCanvas, &press);
+    QMouseEvent release(QEvent::MouseButtonRelease, point, point, point, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(editingCanvas, &release);
+    CHECK(doc->aiFill().resultMask.empty(), "canvas gesture applies the prediction without the Apply button");
     doc->paintLine({4,4},{4,4},Label::Background,2);
     doc->paintLine({15,15},{15,15},Label::Tibia,2);
-    auto corrected=toMonaiLabels(doc->mask(),{0,1,2});
+    auto corrected=toMonaiLabels(doc->monaiAnatomyMask(),{0,1,2});
     int uploads=server.uploads;
     dialogs.file=temp.filePath("save-only.png");dialogs.add=false;
     QMetaObject::invokeMethod(&window,"onExport",Qt::DirectConnection);
@@ -342,14 +408,14 @@ int main(int argc, char** argv) {
     QMetaObject::invokeMethod(&window,"onExport",Qt::DirectConnection);
     CHECK(dialogs.trainingPrompts==prompts,"unchanged declined annotation not prompted again");
     doc->paintLine({16,16},{16,16},Label::Femur,2);
-    corrected=toMonaiLabels(doc->mask(),{0,1,2});
+    corrected=toMonaiLabels(doc->monaiAnatomyMask(),{0,1,2});
     dialogs.file=temp.filePath("corrected.png");dialogs.add=true;
     QMetaObject::invokeMethod(&window,"onExport",Qt::DirectConnection);
     CHECK(waitFor([&]{return server.uploads==uploads+1;}),"revised annotation can be submitted");
     CHECK(server.field("image")==original,"UI sends retained original PNG even after source file deletion");
     CHECK(same(decodeMonaiMask(server.field("mask"),source.size()),corrected),"UI training mask includes manual corrections, not initial prediction");
     waitFor([&]{return window.statusBar()->currentMessage().contains("added");});
-    CHECK(server.field("model_version")=="test_v1","UI preserves model version through edits");
+    CHECK(server.field("model_version")=="test_v2","canvas auto-apply preserves the new model version through training upload");
     prompts=dialogs.trainingPrompts;dialogs.file=temp.filePath("unchanged.png");
     QMetaObject::invokeMethod(&window,"onExport",Qt::DirectConnection);
     CHECK(dialogs.trainingPrompts==prompts,"unchanged submitted annotation not prompted again");

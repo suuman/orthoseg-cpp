@@ -3,6 +3,7 @@
 #include <QApplication>
 #include <QAction>
 #include <QLabel>
+#include <QComboBox>
 #include <QPushButton>
 #include <QMessageBox>
 #include <QJsonDocument>
@@ -13,6 +14,11 @@
 #include <QElapsedTimer>
 #include <QThread>
 #include <QTimer>
+#include <QSpinBox>
+#include <QSettings>
+#include <QTemporaryDir>
+#include <QFileDialog>
+#include <QFile>
 #include <memory>
 #include <cstdio>
 using namespace orthoseg;
@@ -27,7 +33,8 @@ struct Backend : QTcpServer {
     QJsonObject state;
     int starts=0,promotions=0,reads=0;
     bool failPromotion=false;
-    QByteArray promotionPath;
+    QByteArray casesPath;
+    QByteArray promotionPath, selectedModel;
     Backend() {
         const QJsonObject metrics{{"mean_foreground_dice",.92},{"femur_dice",.94},{"tibia_dice",.90}};
         state = {{"backend",QJsonObject{{"status","ok"},{"device","cpu"},{"model_loaded",true}}},
@@ -51,7 +58,18 @@ struct Backend : QTcpServer {
                     socket->setProperty("done",true);
                     auto method=header.split(' ').value(0);auto path=header.split(' ').value(1);
                     int code=200;QJsonObject result;
-                    if(method=="GET" && path=="/management/status"){ ++reads;result=state; }
+                    if(method=="GET" && path.startsWith("/management/status")){ ++reads;result=state; selectedModel = path; }
+                    else if(method=="GET" && path.startsWith("/management/cases")) {
+                        casesPath = path;
+                        const bool second = path.contains("offset=50");
+                        QJsonArray items;
+                        for (int i=0; i<(second ? 1 : 50); ++i)
+                            items.append(QJsonObject{{"case_id", QString("case%1").arg(i)},
+                                {"filename", second ? "last.png" : "knee.png"},
+                                {"labels", QJsonArray{"Femur", "Tibia"}}, {"overlap_pixels", 12},
+                                {"status", path.contains("model=medsam2") ? "pending" : "incorporated"}});
+                        result = {{"items",items},{"total",51},{"offset",second ? 50 : 0},{"limit",50}};
+                    }
                     else if(method=="POST" && path=="/training/start"){
                         ++starts;code=202;result={{"id",QString(32,'a')},{"status","queued"}};
                         state["job"]=result;state["training_active"]=true;state["can_start"]=false;
@@ -74,8 +92,10 @@ struct Backend : QTcpServer {
 int main(int argc,char** argv){
     std::setbuf(stdout,nullptr);
     QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
+    QTemporaryDir settingsDirectory;
+    qputenv("XDG_CONFIG_HOME", settingsDirectory.path().toUtf8());
     QApplication app(argc,argv);
-    if (app.arguments().contains("--live")) {
+    if (app.arguments().contains("--live") || app.arguments().contains("--live-medsam")) {
         qputenv("ORTHOSEG_ENABLE_MODEL_MANAGEMENT", "1");
         MainWindow window; window.show();
         auto* action=window.findChild<QAction*>("modelManagementAction");
@@ -84,6 +104,8 @@ int main(int argc,char** argv){
         if (!managementButton || !managementButton->isEnabled()) return 1;
         action->trigger();
         auto* panel=dynamic_cast<ModelManagementDialog*>(window.findChild<QDialog*>("modelManagementDialog"));
+        if (app.arguments().contains("--live-medsam"))
+            panel->findChild<QComboBox*>("managementModel")->setCurrentIndex(1);
         auto* train=panel->findChild<QPushButton*>("managementTrain");
         auto* promote=panel->findChild<QPushButton*>("managementPromote");
         auto* refresh=panel->findChild<QPushButton*>("managementRefresh");
@@ -100,7 +122,7 @@ int main(int argc,char** argv){
         if(!train->isEnabled())return 1;
         train->click();
         QElapsedTimer elapsed;elapsed.start();
-        while(!promote->isEnabled() && elapsed.elapsed()<60000 && !errors){
+        while(!promote->isEnabled() && elapsed.elapsed()<600000 && !errors){
             QApplication::processEvents();QThread::msleep(10);
         }
         CHECK(promote->isEnabled() && !errors, "live manual training completes with candidate");
@@ -119,7 +141,7 @@ int main(int argc,char** argv){
     MainWindow normal;
     CHECK(!normal.findChild<QAction*>("modelManagementAction"),"normal annotator has no management controls");
     auto* normalButton=normal.findChild<QPushButton*>("modelManagementButton");
-    CHECK(normalButton && !normalButton->isEnabled(),"management button starts disabled without backend privilege");
+    CHECK(normalButton && !normalButton->isEnabled() && normalButton->isHidden(),"management button starts hidden without backend privilege");
     Backend server;
     qputenv("MONAI_BACKEND_URL",QString("http://127.0.0.1:%1").arg(server.serverPort()).toUtf8());
     qputenv("ORTHOSEG_ENABLE_MODEL_MANAGEMENT","1");
@@ -129,6 +151,11 @@ int main(int argc,char** argv){
     auto* managementButton=admin.findChild<QPushButton*>("modelManagementButton");
     CHECK(managementButton && waitFor([&]{return managementButton->isEnabled();}),
           "management button enabled by backend permission");
+    CHECK(managementButton->isVisible(), "authorized management button is visible in top toolbar");
+    auto* toolbarBatch = admin.findChild<QPushButton*>("batchModeButton");
+    CHECK(toolbarBatch && toolbarBatch->parentWidget() == managementButton->parentWidget() &&
+          toolbarBatch->geometry().right() < managementButton->geometry().left(),
+          "management button follows Batch Mode");
     action->trigger();
     auto* panel=dynamic_cast<ModelManagementDialog*>(admin.findChild<QDialog*>("modelManagementDialog"));
     CHECK(panel && !panel->isModal(),"management dialog is separate and modeless");if(!panel)return 1;
@@ -138,6 +165,87 @@ int main(int argc,char** argv){
     auto label=[panel](const char* name){return panel->findChild<QLabel*>(name)->text();};
     CHECK(waitFor([&]{return train->isEnabled();}),"status loaded asynchronously");
     CHECK(server.starts==0 && server.promotions==0,"opening management never trains or promotes");
+    auto* model = panel->findChild<QComboBox*>("managementModel");
+    CHECK(model && model->count() == 2, "management offers UNet and MedSAM2 in the existing dialog");
+    model->setCurrentIndex(1);
+    CHECK(waitFor([&]{return train->isEnabled();}) && server.selectedModel.contains("model=medsam2"),
+          "MedSAM2 selection requests its own lifecycle metadata");
+    model->setCurrentIndex(0);
+    CHECK(waitFor([&]{return train->isEnabled();}), "UNet management remains available");
+    auto* reminder = panel->findChild<QSpinBox*>("fineTuneReminderCases");
+    CHECK(reminder && reminder->value() == 0, "fine-tuning reminders are opt-in");
+    reminder->setValue(3);
+    model->setCurrentIndex(1);
+    CHECK(waitFor([&]{return train->isEnabled();}) && reminder->value() == 0,
+          "reminder thresholds are separate for each model family");
+    model->setCurrentIndex(0);
+    CHECK(waitFor([&]{return train->isEnabled();}) && reminder->value() == 3,
+          "user-selected corrected-case threshold is persisted");
+    int reminders = 0;
+    QTimer reminderDialogs;
+    QObject::connect(&reminderDialogs, &QTimer::timeout, &app, [&] {
+        auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+        if (box && box->windowTitle() == "Fine-tuning Reminder") {
+            ++reminders;
+            CHECK(box->text().contains("3 new or revised cases"), "reminder uses backend corrected-case count");
+            box->button(QMessageBox::No)->click();
+        }
+    });
+    reminderDialogs.start(5);
+    QMetaObject::invokeMethod(&admin, "offerFineTuningReminder", Qt::DirectConnection);
+    CHECK(waitFor([&]{return reminders == 1;}) && server.starts == 0,
+          "threshold prompts the user without starting fine-tuning");
+    int readsBefore = server.reads;
+    QMetaObject::invokeMethod(&admin, "offerFineTuningReminder", Qt::DirectConnection);
+    waitFor([&]{return server.reads > readsBefore;});
+    QApplication::processEvents();
+    CHECK(reminders == 1 && server.starts == 0, "same threshold milestone does not repeatedly prompt");
+    reminder->setValue(4);
+    readsBefore = server.reads;
+    QMetaObject::invokeMethod(&admin, "offerFineTuningReminder", Qt::DirectConnection);
+    waitFor([&]{return server.reads > readsBefore;});
+    QApplication::processEvents();
+    CHECK(reminders == 1, "below-threshold cases do not trigger reminders");
+    reminder->setValue(0);
+    reminderDialogs.stop();
+    auto* files = panel->findChild<QTableWidget*>("managementCases");
+    auto* nextFiles = panel->findChild<QPushButton*>("nextTrainingCases");
+    auto* previousFiles = panel->findChild<QPushButton*>("previousTrainingCases");
+    CHECK(files && waitFor([&]{return files->rowCount() == 50 && nextFiles->isEnabled();}), "submitted files load in bounded pages");
+    CHECK(files->item(0,0)->text() == "knee.png" && files->item(0,1)->text() == "Femur, Tibia" &&
+          files->item(0,2)->text() == "12" && files->item(0,3)->text() == "Incorporated",
+          "training table shows filename, labels, overlap and per-model status");
+    nextFiles->click();
+    CHECK(waitFor([&]{return files->rowCount() == 1 && previousFiles->isEnabled();}) && files->item(0,0)->text() == "last.png",
+          "training table can navigate to later uploaded files");
+    CHECK(!nextFiles->isEnabled(), "last training page disables Next");
+    auto* exportList = panel->findChild<QPushButton*>("exportTrainingCases");
+    QTemporaryDir exported;
+    const auto csvPath = exported.filePath("training.csv");
+    QTimer exportDialog;
+    QObject::connect(&exportDialog, &QTimer::timeout, &app, [&] {
+        if (auto* dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget())) {
+            dialog->selectFile(csvPath);
+            QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection);
+        }
+    });
+    exportDialog.start(5);
+    CHECK(exportList && exportList->isEnabled(), "file list export available");
+    exportList->click();
+    CHECK(waitFor([&]{return QFile::exists(csvPath) && exportList->isEnabled();}), "CSV export completes");
+    exportDialog.stop();
+    QFile csv(csvPath); csv.open(QIODevice::ReadOnly);
+    const auto contents = csv.readAll();
+    CHECK(contents.count('\n') == 52 && contents.contains("last.png") && contents.contains("knee.png"),
+          "export from last table page includes all 51 files plus header");
+    CHECK(contents.contains("\"Femur, Tibia\"") && contents.contains("\"Incorporated\",\"unet\""),
+          "CSV quotes multi-label cells and includes selected model training status");
+    model->setCurrentIndex(1);
+    CHECK(waitFor([&]{return files->rowCount() == 50 && nextFiles->isEnabled();}) &&
+          server.casesPath.contains("model=medsam2") && files->item(0,3)->text() == "Pending",
+          "switching model resets the file page and retrieves its incorporation state");
+    model->setCurrentIndex(0);
+    CHECK(waitFor([&]{return train->isEnabled() && files->rowCount() == 50 && !previousFiles->isEnabled();}), "UNet table returns to its first page");
     CHECK(label("managementProduction").contains("production001"),"production metadata displayed");
     CHECK(label("managementDataset").contains("15") && label("managementDataset").contains("3"),"backend dataset counts displayed");
     auto* metrics=panel->findChild<QTableWidget*>("managementMetrics");

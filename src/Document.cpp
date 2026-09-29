@@ -2,6 +2,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -20,6 +21,7 @@ bool Document::loadImage(const std::string& path) {
         cv::transform(color, gray, cv::Matx13f(1.f / 3, 1.f / 3, 1.f / 3));
         cv::Mat edges = computeEdgeMap(gray);
         cv::Mat mask = cv::Mat::zeros(gray.size(), CV_8UC1);
+        cv::Mat channels = cv::Mat::zeros(gray.size(), CV_8UC3);
         cv::Mat seeds(gray.size(), CV_8UC1, cv::Scalar(kNoSeed));
 
         // Retain exact PNG bytes independently of the unchanged display path.
@@ -38,6 +40,7 @@ bool Document::loadImage(const std::string& path) {
         sourceGray_ = gray;
         edgeMap_ = edges;
         mask_ = mask;
+        channels_ = channels;
         seeds_ = seeds;
         history_.clear();
         aiFill_ = AIFillState{};
@@ -48,19 +51,16 @@ bool Document::loadImage(const std::string& path) {
 }
 
 bool Document::exportMask(const std::string& path) const {
-    if (mask_.empty()) return false;
-    // Render the indexed mask to a BGR image using label colors.
-    cv::Mat out(mask_.size(), CV_8UC3, cv::Scalar(0, 0, 0));
-    for (int y = 0; y < mask_.rows; ++y) {
-        const uchar* mrow = mask_.ptr<uchar>(y);
-        cv::Vec3b* orow = out.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < mask_.cols; ++x) {
-            if (mrow[x] != 0)
-                orow[x] = labelInfo(static_cast<Label>(mrow[x])).colorBGR;
-        }
-    }
+    if (channels_.empty()) return false;
+    // PNG stores RGB channel values exactly: R=1, G=2, B=3. Lossy formats
+    // would corrupt these discrete IDs, so never silently write one.
+    const auto dot = path.find_last_of('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (ext != ".png") return false;
     try {
-        return cv::imwrite(path, out);
+        return cv::imwrite(path, channels_);
     } catch (const cv::Exception&) {
         // Missing/unsupported extensions and encoder failures can throw rather
         // than return false. Let the UI show its export error in either case.
@@ -68,30 +68,136 @@ bool Document::exportMask(const std::string& path) const {
     }
 }
 
+bool Document::importMask(const std::string& path) {
+    if (!hasImage()) return false;
+    cv::Mat input;
+    try { input = cv::imread(path, cv::IMREAD_UNCHANGED); }
+    catch (const cv::Exception&) { return false; }
+    if (input.empty() || input.size() != mask_.size() || input.depth() != CV_8U ||
+        (input.channels() != 1 && input.channels() != 3 && input.channels() != 4)) return false;
+    cv::Mat decoded = cv::Mat::zeros(input.size(), CV_8UC3);
+    bool grayscale = input.channels() == 1;
+    if (!grayscale) {
+        grayscale = true;
+        for (int y = 0; y < input.rows && grayscale; ++y) {
+            for (int x = 0; x < input.cols; ++x) {
+                const auto* p = input.ptr<uchar>(y) + x * input.channels();
+                if (p[0] != p[1] || p[1] != p[2]) { grayscale = false; break; }
+            }
+        }
+    }
+    for (int y = 0; y < input.rows; ++y) {
+        auto* out = decoded.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < input.cols; ++x) {
+            const auto* p = input.ptr<uchar>(y) + x * input.channels();
+            if (grayscale) {
+                const uchar id = p[0];
+                if (id > 3) return false;
+                if (id) out[x][3 - id] = id;
+            } else {
+                if ((p[0] != 0 && p[0] != 3) || (p[1] != 0 && p[1] != 2) ||
+                    (p[2] != 0 && p[2] != 1)) return false;
+                out[x] = cv::Vec3b(p[0], p[1], p[2]);
+            }
+        }
+    }
+    pushHistory();
+    channels_ = std::move(decoded);
+    syncIndexed(cv::Rect(0, 0, width(), height()));
+    return true;
+}
+
+void Document::syncIndexed(const cv::Rect& area) {
+    for (int y = area.y; y < area.y + area.height; ++y) {
+        const auto* src = channels_.ptr<cv::Vec3b>(y);
+        auto* dst = mask_.ptr<uchar>(y);
+        for (int x = area.x; x < area.x + area.width; ++x)
+            dst[x] = src[x][0] ? 3 : src[x][1] ? 2 : src[x][2] ? 1 : 0;
+    }
+}
+
+cv::Mat Document::labelMask(Label label) const {
+    if (channels_.empty()) return {};
+    cv::Mat out(channels_.size(), CV_8UC1, cv::Scalar(0));
+    if (label == Label::Background) return mask_ == 0;
+    const int channel = 3 - static_cast<int>(label);
+    cv::extractChannel(channels_, out, channel);
+    return out != 0;
+}
+
+cv::Mat Document::monaiAnatomyMask() const {
+    if (channels_.empty()) return {};
+    cv::Mat out = channels_.clone();
+    cv::insertChannel(cv::Mat::zeros(channels_.size(), CV_8UC1), out, 0);
+    return out;
+}
+
+void Document::applyRegion(const cv::Mat& region, Label label, bool eraseOnly) {
+    CV_Assert(region.type() == CV_8UC1 && region.size() == channels_.size());
+    const int id = static_cast<int>(label);
+    for (int y = 0; y < region.rows; ++y) {
+        const auto* r = region.ptr<uchar>(y);
+        auto* dst = channels_.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < region.cols; ++x) {
+            if (!r[x]) continue;
+            if (id == 0) dst[x] = cv::Vec3b(0, 0, 0);
+            else dst[x][3 - id] = eraseOnly ? 0 : static_cast<uchar>(id);
+        }
+    }
+    syncIndexed(cv::Rect(0, 0, width(), height()));
+}
+
 bool Document::replaceAnatomyMask(const cv::Mat& mapped) {
     const int bg = static_cast<int>(Label::Background);
     const int femur = static_cast<int>(Label::Femur);
     const int tibia = static_cast<int>(Label::Tibia);
-    if (!hasImage() || mapped.size() != mask_.size() || mapped.type() != CV_8UC1 ||
+    if (!hasImage() || mapped.size() != mask_.size()) return false;
+    if (mapped.type() == CV_8UC3) {
+        std::vector<cv::Mat> channels;
+        cv::split(mapped, channels);
+        if (cv::countNonZero(channels[0]) || cv::countNonZero(channels[2] > 1) ||
+            cv::countNonZero((channels[1] != 0) & (channels[1] != 2))) return false;
+    } else if (mapped.type() != CV_8UC1 ||
         cv::countNonZero((mapped != bg) & (mapped != femur) & (mapped != tibia))) return false;
-    cv::Mat next = mask_.clone();
-    mapped.copyTo(next, (mask_ == bg) | (mask_ == femur) | (mask_ == tibia));
     pushHistory();
-    mask_ = std::move(next);
+    for (int y = 0; y < height(); ++y) {
+        auto* dst = channels_.ptr<cv::Vec3b>(y);
+        const auto* src = mapped.ptr<uchar>(y);
+        for (int x = 0; x < width(); ++x) {
+            dst[x][2] = mapped.type() == CV_8UC3 ? mapped.at<cv::Vec3b>(y, x)[2] : src[x] == femur ? 1 : 0;
+            dst[x][1] = mapped.type() == CV_8UC3 ? mapped.at<cv::Vec3b>(y, x)[1] : src[x] == tibia ? 2 : 0;
+        }
+    }
+    syncIndexed(cv::Rect(0, 0, width(), height()));
     return true;
 }
 
 void Document::applyAIResult() {
     if (aiFill_.resultMask.empty()) return;
     const cv::Mat& result = aiFill_.resultMask;
-    if (result.size() != mask_.size() || result.type() != CV_8UC1) return;
+    if (result.size() != mask_.size()) return;
     if (aiFill_.resultReplacesAnatomy) {
         if (!replaceAnatomyMask(result)) return;
     } else {
+        if (result.type() != CV_8UC1 || cv::countNonZero(result > 3)) return;
+        auto labels = aiFill_.resultLabels;
+        if (labels.empty()) {
+            for (int id = 1; id <= 3; ++id)
+                if (cv::countNonZero(result == id)) labels.push_back(id);
+        }
+        for (int id : labels) if (id < 1 || id > 3) return;
         pushHistory();
-        result.copyTo(mask_, result != 0);
+        for (int y = 0; y < height(); ++y) {
+            const auto* src = result.ptr<uchar>(y);
+            auto* dst = channels_.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < width(); ++x)
+                for (int id : labels)
+                    dst[x][3 - id] = src[x] == id ? id : 0;
+        }
+        syncIndexed(cv::Rect(0, 0, width(), height()));
     }
     aiFill_.resultMask.release();
+    aiFill_.resultLabels.clear();
     aiFill_.resultReplacesAnatomy = false;
 }
 
@@ -101,46 +207,121 @@ void Document::paintAIPrompt(cv::Point a, cv::Point b, bool erase, int brushSize
         aiFill_.promptMask = cv::Mat::zeros(sourceGray_.size(), CV_8UC1);
     const cv::Scalar value(erase ? 0 : 255);
     cv::line(aiFill_.promptMask, a, b, value, brushSize, cv::LINE_8);
-    const int radius = std::max(1, brushSize / 2);
+    const int radius = std::max(0, brushSize / 2);
     cv::circle(aiFill_.promptMask, a, radius, value, cv::FILLED);
     cv::circle(aiFill_.promptMask, b, radius, value, cv::FILLED);
 }
 
-void Document::paintLine(cv::Point a, cv::Point b, Label label, int brushSize) {
-    if (mask_.empty()) return;
-    const uchar id = static_cast<uchar>(label);
-    cv::line(mask_, a, b, cv::Scalar(id), brushSize, cv::LINE_8);
-    // Round caps so consecutive segments join smoothly.
-    int r = std::max(1, brushSize / 2);
-    cv::circle(mask_, a, r, cv::Scalar(id), cv::FILLED);
-    cv::circle(mask_, b, r, cv::Scalar(id), cv::FILLED);
+cv::Mat Document::edgeRegion(cv::Point seed, int threshold) const {
+    if (!hasImage()) return {};
+    cv::Mat region = edgeMap_ <= threshold;
+    // The shared fill edge map has an artificial zero border. Extend the nearest
+    // interior barrier here so a stroke cannot bypass an edge around the frame.
+    if (region.rows > 2 && region.cols > 2) {
+        region.row(1).copyTo(region.row(0));
+        region.row(region.rows - 2).copyTo(region.row(region.rows - 1));
+        region.col(1).copyTo(region.col(0));
+        region.col(region.cols - 2).copyTo(region.col(region.cols - 1));
+    }
+    if (seed.x < 0 || seed.y < 0 || seed.x >= width() || seed.y >= height() ||
+        !region.at<uchar>(seed)) return cv::Mat::zeros(edgeMap_.size(), CV_8UC1);
+    cv::floodFill(region, seed, cv::Scalar(128), nullptr, cv::Scalar(), cv::Scalar(), 4);
+    return region == 128;
+}
+
+void Document::paintLine(cv::Point a, cv::Point b, Label label, int brushSize, const cv::Mat& allowed) {
+    stroke(a, b, label, brushSize, false, allowed);
+}
+
+void Document::eraseLabelLine(cv::Point a, cv::Point b, Label label, int brushSize, const cv::Mat& allowed) {
+    stroke(a, b, label, brushSize, true, allowed);
+}
+
+void Document::stroke(cv::Point a, cv::Point b, Label label, int brushSize, bool eraseOnly, const cv::Mat& allowed) {
+    if (channels_.empty()) return;
+    const int radius = std::max(0, brushSize / 2);
+    const int pad = radius + std::max(1, brushSize) + 1;
+    const cv::Rect area = cv::Rect(std::min(a.x, b.x) - pad, std::min(a.y, b.y) - pad,
+        std::abs(a.x - b.x) + 2 * pad + 1, std::abs(a.y - b.y) + 2 * pad + 1) &
+        cv::Rect(0, 0, width(), height());
+    if (area.empty()) return;
+    cv::Mat strokeMask(area.size(), CV_8UC1, cv::Scalar(0));
+    const cv::Point origin(area.x, area.y);
+    cv::line(strokeMask, a - origin, b - origin, cv::Scalar(255), std::max(1, brushSize), cv::LINE_8);
+    cv::circle(strokeMask, a - origin, radius, cv::Scalar(255), cv::FILLED);
+    cv::circle(strokeMask, b - origin, radius, cv::Scalar(255), cv::FILLED);
+    if (!allowed.empty()) cv::bitwise_and(strokeMask, allowed(area), strokeMask);
+    const int id = static_cast<int>(label);
+    for (int y = 0; y < area.height; ++y) {
+        const auto* r = strokeMask.ptr<uchar>(y);
+        auto* dst = channels_.ptr<cv::Vec3b>(area.y + y);
+        for (int x = 0; x < area.width; ++x) {
+            if (!r[x]) continue;
+            auto& pixel = dst[area.x + x];
+            if (id == 0) pixel = cv::Vec3b(0, 0, 0);
+            else pixel[3 - id] = eraseOnly ? 0 : static_cast<uchar>(id);
+        }
+    }
+    syncIndexed(area);
+}
+
+void Document::fillPolygon(const std::vector<cv::Point>& points, Label label, bool recordHistory, const cv::Mat& allowed) {
+    if (channels_.empty() || points.size() < 3) return;
+    cv::Mat region = cv::Mat::zeros(mask_.size(), CV_8UC1);
+    std::vector<std::vector<cv::Point>> polygons{points};
+    cv::fillPoly(region, polygons, cv::Scalar(255));
+    if (!allowed.empty()) cv::bitwise_and(region, allowed, region);
+    if (recordHistory) pushHistory();
+    applyRegion(region, label);
+}
+
+bool Document::fillEnclosedAt(cv::Point seed, Label label, const cv::Mat& allowed) {
+    if (channels_.empty() || label == Label::Background || seed.x < 0 || seed.y < 0 ||
+        seed.x >= width() || seed.y >= height()) return false;
+    cv::Mat active = labelMask(label);
+    if (active.at<uchar>(seed)) return false;
+    cv::Mat region = active == 0;
+    if (!allowed.empty()) cv::bitwise_and(region, allowed, region);
+    if (!region.at<uchar>(seed)) return false;
+    cv::floodFill(region, seed, cv::Scalar(128), nullptr, cv::Scalar(), cv::Scalar(), 4);
+    if (cv::countNonZero(region.row(0) == 128) || cv::countNonZero(region.row(height() - 1) == 128) ||
+        cv::countNonZero(region.col(0) == 128) || cv::countNonZero(region.col(width() - 1) == 128))
+        return false;
+    pushHistory();
+    applyRegion(region == 128, label);
+    return true;
 }
 
 void Document::fill(cv::Point seed, Label label, FillAlgorithm algo,
                     int intensityThreshold, int edgePenaltyThreshold) {
     if (mask_.empty()) return;
+    cv::Mat region = cv::Mat::zeros(mask_.size(), CV_8UC1);
+    const Label marker = label == Label::Background ? Label::Femur : label;
     switch (algo) {
         case FillAlgorithm::Standard:
-            regionGrowStandard(sourceGray_, mask_, seed, label,
+            regionGrowStandard(sourceGray_, region, seed, marker,
                                intensityThreshold);
             break;
         case FillAlgorithm::EdgeEmbedded:
-            regionGrowEdgeEmbedded(sourceGray_, mask_, seed, label,
+            regionGrowEdgeEmbedded(sourceGray_, region, seed, marker,
                                    intensityThreshold, edgePenaltyThreshold,
                                    edgeMap_);
             break;
         case FillAlgorithm::SplitMerge:
-            regionGrowSplitMerge(sourceGray_, mask_, seed, label,
+            regionGrowSplitMerge(sourceGray_, region, seed, marker,
                                  intensityThreshold, edgePenaltyThreshold,
                                  4, edgeMap_);
             break;
         default:
-            break; // Scribble algorithms require runSeedSegmentation().
+            return; // Scribble algorithms require runSeedSegmentation().
     }
+    // Background uses a temporary foreground marker, then clears all channels.
+    applyRegion(region, label);
 }
 
 void Document::clearMask() {
     if (mask_.empty()) return;
+    channels_.setTo(cv::Scalar(0, 0, 0));
     mask_.setTo(cv::Scalar(0));
 }
 
@@ -148,7 +329,7 @@ void Document::paintSeedLine(cv::Point a, cv::Point b, Label label, int brushSiz
     if (seeds_.empty()) return;
     const uchar id = static_cast<uchar>(label); // Background (0) is a real seed
     cv::line(seeds_, a, b, cv::Scalar(id), brushSize, cv::LINE_8);
-    int r = std::max(1, brushSize / 2);
+    int r = std::max(0, brushSize / 2);
     cv::circle(seeds_, a, r, cv::Scalar(id), cv::FILLED);
     cv::circle(seeds_, b, r, cv::Scalar(id), cv::FILLED);
 }
@@ -260,23 +441,37 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
         cv::Mat selected = result == fg;
         selected.setTo(0, (seeds_ != kNoSeed) & (seeds_ != fg));
         selected.setTo(255, seeds_ == fg);
-        result = mask_.clone();
-        result.setTo(0, (mask_ == fg) & (selected == 0));
-        result.setTo(fg, selected);
+        pushHistory();
+        for (int y = 0; y < height(); ++y) {
+            const auto* s = selected.ptr<uchar>(y);
+            auto* dst = channels_.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < width(); ++x)
+                dst[x][3 - fg] = s[x] ? fg : 0;
+        }
     } else {
         // Working-grid collisions must not override explicit full-size seeds.
         seeds_.copyTo(result, seeds_ != kNoSeed);
+        const bool updateFemur = hasSeedForLabel(Label::Femur);
+        const bool updateTibia = hasSeedForLabel(Label::Tibia);
+        const bool updateFibula = hasSeedForLabel(Label::Fibula);
+        pushHistory();
+        for (int y = 0; y < height(); ++y) {
+            const auto* src = result.ptr<uchar>(y);
+            auto* dst = channels_.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < width(); ++x) {
+                if (updateFemur) dst[x][2] = src[x] == 1 ? 1 : 0;
+                if (updateTibia) dst[x][1] = src[x] == 2 ? 2 : 0;
+                if (updateFibula) dst[x][0] = src[x] == 3 ? 3 : 0;
+            }
+        }
     }
-
-    // Snapshot only a successful run, immediately before committing its result.
-    pushHistory();
-    mask_ = result;
+    syncIndexed(cv::Rect(0, 0, width(), height()));
     return true;
 }
 
 void Document::pushHistory() {
     if (mask_.empty()) return;
-    history_.push_back({mask_.clone(), seeds_.clone()});
+    history_.push_back({channels_.clone(), seeds_.clone()});
     while (history_.size() > kMaxHistory) history_.pop_front();
 }
 
@@ -286,7 +481,8 @@ void Document::undo() {
     // most recent one returns mask + seeds to before the last edit.
     Snapshot s = history_.back();
     history_.pop_back();
-    s.mask.copyTo(mask_);
+    s.channels.copyTo(channels_);
+    syncIndexed(cv::Rect(0, 0, width(), height()));
     s.seeds.copyTo(seeds_);
 }
 

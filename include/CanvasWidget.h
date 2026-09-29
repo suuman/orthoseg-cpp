@@ -4,6 +4,7 @@
 #include <QWidget>
 #include <QImage>
 #include <QPoint>
+#include <vector>
 
 namespace orthoseg {
 
@@ -14,14 +15,26 @@ class CanvasWidget : public QWidget {
 public:
     explicit CanvasWidget(Document* doc, QWidget* parent = nullptr);
 
-    void setActiveTool(Tool t)          { drawing_ = false; tool_ = t; update(); }
-    void setActiveLabel(Label l)        { label_ = l; }
+    void setActiveTool(Tool t)          { drawing_ = false; outline_.clear(); tool_ = t; update(); }
+    void setActiveLabel(Label l)        { label_ = l; update(); }
+    void setIsolatedView(bool enabled)  { isolatedView_ = enabled; update(); }
+    bool isolatedView() const           { return isolatedView_; }
+    void setDrawFillHoles(bool enabled) { drawFillHoles_ = enabled; outline_.clear(); update(); }
+    void setAutoFillOutline(bool enabled) { autoFillOutline_ = enabled; }
+    void fillCurrentOutline();
+    void clearOutline() { outline_.clear(); update(); }
     void setBrushSize(int s)            { brushSize_ = s; }
+    void setAIPromptEditing(bool enabled) { aiPromptEditing_ = enabled; drawing_ = false; }
     void setAIPromptErase(bool erase)   { aiPromptErase_ = erase; }
     void setMaskOpacity(float o)        { opacity_ = o; update(); }
     void setFillAlgorithm(FillAlgorithm a) { fillAlgo_ = a; update(); }
     void setIntensityThreshold(int t)   { intensityThreshold_ = t; }
     void setEdgePenaltyThreshold(int t) { edgePenalty_ = t; }
+
+    void setEdgeConstrained(bool enabled) { edgeConstrained_ = enabled; }
+    void setPanMode(bool enabled);
+    void panBy(const QPointF& delta);
+    void centerImageEnd(bool bottom);
 
     bool claheEnabled() const           { return claheEnabled_; }
     void setClaheEnabled(bool enabled);
@@ -42,6 +55,8 @@ public:
     QRectF imageRect() const;
 
 signals:
+    void aiResultApplied();
+    void panModeChanged(bool enabled);
     void maskChanged();   // emitted after any edit so the window can refresh UI
     void zoomChanged(float z);
 
@@ -54,11 +69,12 @@ protected:
 
 private:
     void rebuildSourceImage();
+    void zoomAt(const QPointF& anchor, double factor);
 
     Document* doc_;
     QImage    sourceQt_;       // cached BGR->RGB source
 
-    Tool          tool_       = Tool::Brush;
+    Tool          tool_       = Tool::None;
     Label         label_      = Label::Femur;
     int           brushSize_  = 20;
     float         opacity_    = 0.5f;
@@ -73,7 +89,16 @@ private:
     QPointF panOffset_;
     QPointF lastPanPos_;
     bool panning_ = false;
+    bool panMode_ = false;
+    bool edgeConstrained_ = false;
+    cv::Mat gestureRegion_;
+    Qt::MouseButton panButton_ = Qt::NoButton;
     bool aiPromptErase_ = false;
+    bool aiPromptEditing_ = true;
+    bool isolatedView_ = false;
+    bool drawFillHoles_ = false;
+    bool autoFillOutline_ = false;
+    std::vector<cv::Point> outline_;
 
     bool   claheEnabled_   = false;
     double claheClipLimit_ = 2.0;

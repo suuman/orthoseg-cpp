@@ -19,7 +19,8 @@ struct AIFillState {
     int activeBoxNumber = 1;     // Which box receives the next canvas drag
     bool showSecondaryBoxes = false;
     cv::Mat promptMask; // Source-resolution binary 0/255, separate from annotations.
-    cv::Mat resultMask; // Source-resolution indexed labels.
+    cv::Mat resultMask; // Source-resolution indexed labels or discrete BGR channels.
+    std::vector<int> resultLabels; // Local refinement replaces these bone channels, including empty results.
     bool resultReplacesAnatomy = false; // Automatic models also clear old Femur/Tibia pixels.
     bool showResult = true;
     bool showPrompt = true;

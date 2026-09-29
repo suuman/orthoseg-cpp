@@ -77,8 +77,10 @@ def main():
                     actual = np.asarray(Image.open(training/record['mask']))
                     expected = np.asarray(Image.open(str(output)+'.canonical.png'))
                     np.testing.assert_array_equal(actual, expected)
-                    assert actual.dtype == np.uint8 and actual.shape == (24,37)
-                    assert actual[4,4] == 0 and actual[15,15] == 2 and actual[20,20] == 1
+                    assert actual.dtype == np.uint8 and actual.shape == (24,37,3)
+                    assert (actual[4,4] == [0,0,0]).all()
+                    assert (actual[15,15] == [0,2,0]).all()
+                    assert (actual[20,20] == [1,0,0]).all()
                     assert record['model_version'] == 'synthetic_integration_only'
                     assert np.asarray(Image.open(output)).shape == (24,37,3)
                     status = client.get('/training/status').json()

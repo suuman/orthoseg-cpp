@@ -24,14 +24,15 @@ public:
     QUrl baseUrl() const { return base_; }
     void setBaseUrl(QUrl base) { base_ = std::move(base); }
     void health(JsonCallback done);
-    void managementStatus(JsonCallback done);
-    void startTraining(JsonCallback done);
+    void managementStatus(JsonCallback done, const QString& model = "unet");
+    void startTraining(JsonCallback done, const QString& model = "unet");
+    void trainingCases(JsonCallback done, const QString& model = "unet", int offset = 0);
     void trainingJob(const QString& id, JsonCallback done);
-    void promoteCandidate(const QString& version, JsonCallback done);
+    void promoteCandidate(const QString& version, JsonCallback done, const QString& model = "unet");
     bool segment(const QByteArray& original, cv::Size expected, SegmentCallback done);
     bool segmentNnUnet(const QByteArray& original, cv::Size expected, SegmentCallback done);
     bool segmentPrompted(const QByteArray& original, cv::Size expected, const QJsonArray& femurBox,
-                         const QJsonArray& tibiaBox, SegmentCallback done);
+                         const QJsonArray& tibiaBox, SegmentCallback done, const cv::Mat& prompt = {});
     bool submitTrainingCase(const QByteArray& original, const cv::Mat& currentCanonical,
                             const QString& filename, const QString& version, JsonCallback done);
     bool segmentRunning() const { return segmentRunning_; }
@@ -41,7 +42,7 @@ private:
     void request(const QString& path, const QByteArray& original, const QByteArray& mask,
                  const QString& filename, const QString& version, ReplyCallback done, const QByteArray& jsonBody = {},
                  const QByteArray& femurBox = {}, const QByteArray& tibiaBox = {});
-    void adminRequest(const QString& path, bool post, JsonCallback done);
+    void adminRequest(const QString& path, bool post, JsonCallback done, const QString& model = "unet");
     QNetworkAccessManager network_;
     QUrl base_;
     int timeoutMs_;

@@ -15,8 +15,15 @@
 namespace orthoseg {
 namespace {
 void validate(const cv::Mat& mask) {
-    if (mask.empty() || mask.type() != CV_8UC1 || cv::countNonZero(mask > 2))
-        throw std::runtime_error("MONAI mask must be single-channel uint8 with only labels 0, 1, 2.");
+    if (mask.empty()) throw std::runtime_error("Empty MONAI mask.");
+    if (mask.type() == CV_8UC1 && !cv::countNonZero(mask > 2)) return;
+    if (mask.type() == CV_8UC3) {
+        std::vector<cv::Mat> channels;
+        cv::split(mask, channels); // OpenCV BGR: B=0, G=0/2, R=0/1.
+        if (!cv::countNonZero(channels[0]) && !cv::countNonZero((channels[1] != 0) & (channels[1] != 2)) &&
+            !cv::countNonZero(channels[2] > 1)) return;
+    }
+    throw std::runtime_error("MONAI mask requires grayscale 0/1/2 or RGB R=0/1, G=0/2, B=0.");
 }
 void validateLabels(MonaiLabels l) {
     if (l.background < 0 || l.background > 255 || l.femur < 0 || l.femur > 255 ||
@@ -37,10 +44,10 @@ void validateOriginal(const QByteArray& bytes) {
 }
 }
 cv::Mat decodeMonaiMask(const QByteArray& png, cv::Size expected) {
-    // Check IHDR first: never silently convert RGB, palette or 16-bit labels.
+    // Accept exact grayscale or RGB labels; never silently convert palette or 16-bit labels.
     if (png.size() < 33 || !png.startsWith(QByteArray::fromHex("89504e470d0a1a0a")) ||
-        png.mid(12, 4) != "IHDR" || static_cast<unsigned char>(png[24]) != 8 || png[25] != 0)
-        throw std::runtime_error("MONAI response is not an 8-bit grayscale class-ID PNG.");
+        png.mid(12, 4) != "IHDR" || static_cast<unsigned char>(png[24]) != 8 || (png[25] != 0 && png[25] != 2))
+        throw std::runtime_error("MONAI response is not an 8-bit grayscale or discrete RGB PNG.");
     auto width = qFromBigEndian<quint32>(reinterpret_cast<const uchar*>(png.constData() + 16));
     auto height = qFromBigEndian<quint32>(reinterpret_cast<const uchar*>(png.constData() + 20));
     if (expected.width <= 0 || expected.height <= 0 || width != quint32(expected.width) || height != quint32(expected.height))
@@ -54,6 +61,7 @@ cv::Mat decodeMonaiMask(const QByteArray& png, cv::Size expected) {
 cv::Mat fromMonaiLabels(const cv::Mat& canonical, MonaiLabels labels) {
     validate(canonical);
     validateLabels(labels);
+    if (canonical.type() == CV_8UC3) return canonical.clone();
     cv::Mat mapped(canonical.size(), CV_8UC1, cv::Scalar(labels.background));
     mapped.setTo(labels.femur, canonical == 1);
     mapped.setTo(labels.tibia, canonical == 2);
@@ -61,6 +69,7 @@ cv::Mat fromMonaiLabels(const cv::Mat& canonical, MonaiLabels labels) {
 }
 cv::Mat toMonaiLabels(const cv::Mat& current, MonaiLabels labels) {
     validateLabels(labels);
+    if (current.type() == CV_8UC3) { validate(current); return current.clone(); }
     if (current.empty() || current.type() != CV_8UC1)
         throw std::runtime_error("Current annotation must be a single-channel uint8 mask.");
     cv::Mat canonical(current.size(), CV_8UC1, cv::Scalar(0));
@@ -97,10 +106,11 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
     auto url = base_;
     QString prefix = url.path();
     while (prefix.endsWith('/')) prefix.chop(1);
-    url.setPath(prefix + path);
+    url.setPath(prefix + path.section('?', 0, 0));
+    if (path.contains('?')) url.setQuery(path.section('?', 1));
     QNetworkRequest req(url);
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
-    const int deadline = (path == "/health" || path == "/management/status") ?
+    const int deadline = (path == "/health" || path.section('?', 0, 0) == "/management/status") ?
         std::min(timeoutMs_, 5000) : timeoutMs_;
     req.setTransferTimeout(deadline);
     QNetworkReply* reply;
@@ -167,24 +177,28 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
         done(*body, versionHeader, error);
     });
 }
-void MonaiClient::adminRequest(const QString& path, bool post, JsonCallback done) {
+void MonaiClient::adminRequest(const QString& path, bool post, JsonCallback done, const QString& model) {
     request(path, {}, {}, {}, {}, [done](const QByteArray& bytes, const QByteArray&, const QString& error) {
         if (!error.isEmpty()) { done({}, error); return; }
         QJsonObject result;
         try { result = parseJson(bytes); }
         catch (const std::exception& e) { done({}, QString::fromUtf8(e.what())); return; }
         done(result, {});
-    }, post ? QByteArray("{}") : QByteArray());
+    }, post ? (model == "unet" ? QByteArray("{}") : QJsonDocument(QJsonObject{{"model", model}}).toJson(QJsonDocument::Compact)) : QByteArray());
 }
-void MonaiClient::managementStatus(JsonCallback done) { adminRequest("/management/status", false, std::move(done)); }
-void MonaiClient::startTraining(JsonCallback done) { adminRequest("/training/start", true, std::move(done)); }
+void MonaiClient::managementStatus(JsonCallback done, const QString& model) { adminRequest(model == "unet" ? "/management/status" : "/management/status?model=medsam2", false, std::move(done)); }
+void MonaiClient::startTraining(JsonCallback done, const QString& model) { adminRequest("/training/start", true, std::move(done), model); }
+void MonaiClient::trainingCases(JsonCallback done, const QString& model, int offset) {
+    adminRequest(QString("/management/cases?model=%1&offset=%2&limit=50")
+        .arg(model == "medsam2" ? "medsam2" : "unet").arg(std::max(0, offset)), false, std::move(done));
+}
 void MonaiClient::trainingJob(const QString& id, JsonCallback done) {
     if (!QRegularExpression("^[a-f0-9]{32}$").match(id).hasMatch()) { done({}, "Invalid job identifier."); return; }
     adminRequest("/training/jobs/" + id, false, std::move(done));
 }
-void MonaiClient::promoteCandidate(const QString& version, JsonCallback done) {
+void MonaiClient::promoteCandidate(const QString& version, JsonCallback done, const QString& model) {
     if (!QRegularExpression("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$").match(version).hasMatch()) { done({}, "Invalid candidate version."); return; }
-    adminRequest("/models/" + version + "/promote", true, std::move(done));
+    adminRequest("/models/" + version + "/promote", true, std::move(done), model);
 }
 
 void MonaiClient::health(JsonCallback done) {
@@ -224,13 +238,14 @@ bool MonaiClient::segmentNnUnet(const QByteArray& original, cv::Size expected, S
     return true;
 }
 bool MonaiClient::segmentPrompted(const QByteArray& original, cv::Size expected, const QJsonArray& femurBox,
-                                  const QJsonArray& tibiaBox, SegmentCallback done) {
+                                  const QJsonArray& tibiaBox, SegmentCallback done, const cv::Mat& prompt) {
     if (segmentRunning_) return false;
     validateOriginal(original);
-    if (femurBox.isEmpty() && tibiaBox.isEmpty())
-        throw std::runtime_error("Draw a Femur or Tibia box before running MONAI SAM2.");
+    if (femurBox.isEmpty() && tibiaBox.isEmpty() && prompt.empty())
+        throw std::runtime_error("Draw a Femur/Tibia box or supply a labeled mask before running MONAI MedSAM2.");
+    const auto promptPng = prompt.empty() ? QByteArray() : encodeMonaiMask(prompt);
     segmentRunning_ = true;
-    request("/segment/prompted", original, {}, {}, {},
+    request("/segment/prompted", original, promptPng, {}, {},
         [this, expected, done](const QByteArray& bytes, const QByteArray& version, const QString& error) {
             segmentRunning_ = false;
             if (!error.isEmpty()) { done({}, {}, error); return; }

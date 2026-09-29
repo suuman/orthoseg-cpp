@@ -1,5 +1,6 @@
 #include "CanvasWidget.h"
 #include <QPainter>
+#include <QPainterPath>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <opencv2/imgproc.hpp>
@@ -11,8 +12,9 @@ namespace orthoseg {
 CanvasWidget::CanvasWidget(Document* doc, QWidget* parent)
     : QWidget(parent), doc_(doc) {
     setMouseTracking(true);
-    setCursor(Qt::CrossCursor);
+    setCursor(panMode_ ? Qt::OpenHandCursor : Qt::CrossCursor);
     setMinimumSize(400, 400);
+    setToolTip("Wheel: zoom at pointer. Right-drag, middle-drag, or Ctrl+left-drag: pan.");
 }
 
 void CanvasWidget::setClaheEnabled(bool enabled) {
@@ -82,13 +84,12 @@ void CanvasWidget::refresh() {
 
 QRectF CanvasWidget::imageRect() const {
     if (!doc_->hasImage()) return QRectF();
-    const float iw = doc_->width(), ih = doc_->height();
-    // Fit-to-widget base scale, then apply zoom, centered.
-    float base = std::min(width() / iw, height() / ih);
-    float scale = base * zoom_;
-    float dw = iw * scale, dh = ih * scale;
-    return QRectF((width() - dw) / 2.f + panOffset_.x(),
-                  (height() - dh) / 2.f + panOffset_.y(), dw, dh);
+    const double iw = doc_->width(), ih = doc_->height();
+    // Fit-to-widget base scale, then apply zoom and the user's pan offset.
+    const double base = std::min(width() / iw, height() / ih);
+    const double dw = iw * base * zoom_, dh = ih * base * zoom_;
+    return QRectF((width() - dw) / 2.0 + panOffset_.x(),
+                  (height() - dh) / 2.0 + panOffset_.y(), dw, dh);
 }
 
 QPoint CanvasWidget::widgetToImage(const QPointF& p) const {
@@ -115,46 +116,50 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
     p.setRenderHint(QPainter::SmoothPixmapTransform, false);
     p.drawImage(dst, sourceQt_);
 
-    // Build the color overlay from the indexed mask on the fly.
-    const cv::Mat& mask = doc_->mask();
+    // Each structure has an independent discrete channel. Rendering binary
+    // occupancy in primary colors makes overlaps additive (R+G=yellow, etc.).
+    const cv::Mat& mask = doc_->maskChannels();
     const auto& ai = doc_->aiFill();
+    const bool validPreview = ai.showResult &&
+        !ai.resultMask.empty() && ai.resultMask.size() == mask.size() &&
+        (ai.resultMask.type() == CV_8UC1 || ai.resultMask.type() == CV_8UC3);
     QImage overlay(mask.cols, mask.rows, QImage::Format_ARGB32);
     overlay.fill(Qt::transparent);
     const int a = static_cast<int>(opacity_ * 255);
     for (int y = 0; y < mask.rows; ++y) {
-        const uchar* mrow = mask.ptr<uchar>(y);
+        const auto* mrow = mask.ptr<cv::Vec3b>(y);
         QRgb* orow = reinterpret_cast<QRgb*>(overlay.scanLine(y));
         for (int x = 0; x < mask.cols; ++x) {
-            uchar id = mrow[x];
-            if (ai.showResult && ai.resultReplacesAnatomy && !ai.resultMask.empty() &&
-                (id == static_cast<uchar>(Label::Femur) || id == static_cast<uchar>(Label::Tibia)))
-                id = 0;
-            if (id == 0) { orow[x] = qRgba(0, 0, 0, 0); continue; }
-            cv::Vec3b bgr = labelInfo(static_cast<Label>(id)).colorBGR;
-            orow[x] = qRgba(bgr[2], bgr[1], bgr[0], a);
+            bool femur = mrow[x][2] != 0;
+            bool tibia = mrow[x][1] != 0;
+            bool fibula = mrow[x][0] != 0;
+            if (validPreview && ai.resultReplacesAnatomy) {
+                if (ai.resultMask.type() == CV_8UC3) {
+                    const auto predicted = ai.resultMask.at<cv::Vec3b>(y, x);
+                    femur = predicted[2] == 1;
+                    tibia = predicted[1] == 2;
+                } else {
+                    const uchar predicted = ai.resultMask.at<uchar>(y, x);
+                    femur = predicted == 1;
+                    tibia = predicted == 2;
+                }
+            } else if (validPreview) {
+                const uchar predicted = ai.resultMask.at<uchar>(y, x);
+                femur |= predicted == 1;
+                tibia |= predicted == 2;
+                fibula |= predicted == 3;
+            }
+            if (isolatedView_) {
+                femur &= label_ == Label::Femur;
+                tibia &= label_ == Label::Tibia;
+                fibula &= label_ == Label::Fibula;
+            }
+            orow[x] = qRgba(femur ? 255 : 0, tibia ? 255 : 0, fibula ? 255 : 0,
+                              femur || tibia || fibula ? a : 0);
         }
     }
     p.drawImage(dst, overlay);
 
-    if (ai.showResult && !ai.resultMask.empty()) {
-        overlay.fill(Qt::transparent);
-        for (int y = 0; y < ai.resultMask.rows; ++y) {
-            auto* row = reinterpret_cast<QRgb*>(overlay.scanLine(y));
-            const auto* maskRow = ai.resultMask.ptr<uchar>(y);
-            for (int x = 0; x < ai.resultMask.cols; ++x) {
-                uchar val = maskRow[x];
-                if (val == 0) continue;
-                cv::Vec3b bgr;
-                if (val == 1 || val == 2 || val == 3) {
-                    bgr = labelInfo(static_cast<Label>(val)).colorBGR;
-                } else {
-                    bgr = labelInfo(label_).colorBGR;
-                }
-                row[x] = qRgba(bgr[2], bgr[1], bgr[0], a);
-            }
-        }
-        p.drawImage(dst, overlay);
-    }
     if (tool_ == Tool::AIFill && ai.showPrompt && ai.promptType != AIFillPromptType::BoundingBox && !ai.promptMask.empty()) {
         overlay.fill(Qt::transparent);
         const cv::Vec3b activeBgr = labelInfo(label_).colorBGR;
@@ -239,15 +244,41 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
             p.drawImage(dst, sov);
         }
     }
+    if ((tool_ == Tool::DrawFill || tool_ == Tool::Lasso) && !outline_.empty()) {
+        const double sx = dst.width() / doc_->width();
+        const double sy = dst.height() / doc_->height();
+        QPainterPath path;
+        path.moveTo(dst.left() + outline_[0].x * sx, dst.top() + outline_[0].y * sy);
+        for (size_t i = 1; i < outline_.size(); ++i)
+            path.lineTo(dst.left() + outline_[i].x * sx, dst.top() + outline_[i].y * sy);
+        p.setPen(QPen(QColor(56, 189, 248), 2, Qt::DashLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawPath(path);
+    }
+}
+
+void CanvasWidget::fillCurrentOutline() {
+    if (outline_.size() < 3 || !doc_->hasImage()) return;
+    doc_->fillPolygon(outline_, label_, true,
+        edgeConstrained_ && tool_ == Tool::Lasso ? doc_->edgeRegion(outline_.front(), edgePenalty_) : cv::Mat());
+    outline_.clear();
+    emit maskChanged();
+    update();
 }
 
 void CanvasWidget::mousePressEvent(QMouseEvent* e) {
-    if (doc_->hasImage() && e->button() == Qt::MiddleButton) {
+    if (doc_->hasImage() && (e->button() == Qt::MiddleButton ||
+        e->button() == Qt::RightButton ||
+        (e->button() == Qt::LeftButton && (panMode_ || (e->modifiers() & Qt::ControlModifier))))) {
         panning_ = true;
+        panButton_ = e->button();
         lastPanPos_ = e->position();
+        setCursor(Qt::ClosedHandCursor);
+        e->accept();
         return;
     }
-    if (!doc_->hasImage() || e->button() != Qt::LeftButton) return;
+    if (!doc_->hasImage() || e->button() != Qt::LeftButton || tool_ == Tool::None ||
+        (tool_ == Tool::AIFill && !aiPromptEditing_)) return;
     QPoint ip = widgetToImage(e->position());
     if (ip.x() < 0 || ip.y() < 0 ||
         ip.x() >= doc_->width() || ip.y() >= doc_->height()) return;
@@ -278,7 +309,13 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
             // When editing paint prompt, if promptMask is empty and AI resultMask exists,
             // initialize promptMask with resultMask so edits directly modify the AI mask!
             if (doc_->aiFill().promptMask.empty() && !doc_->aiFill().resultMask.empty()) {
-                doc_->aiFill().promptMask = doc_->aiFill().resultMask.clone();
+                if (doc_->aiFill().resultMask.type() == CV_8UC3 && label_ != Label::Background) {
+                    cv::Mat bone;
+                    cv::extractChannel(doc_->aiFill().resultMask, bone, 3 - static_cast<int>(label_));
+                    doc_->aiFill().promptMask = bone != 0;
+                } else if (doc_->aiFill().resultMask.type() == CV_8UC1) {
+                    doc_->aiFill().promptMask = doc_->aiFill().resultMask.clone();
+                }
             }
             lastImgPt_ = ip;
             doc_->paintAIPrompt({ip.x(), ip.y()}, {ip.x(), ip.y()}, aiPromptErase_, brushSize_);
@@ -289,9 +326,34 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
 
     // If an AI result mask exists and user begins editing with Brush, Eraser, or Fill,
     // automatically apply AI result into doc_->mask() so user edits the actual AI mask!
-    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser || tool_ == Tool::Fill) &&
+    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser || tool_ == Tool::Fill ||
+         tool_ == Tool::DrawFill || tool_ == Tool::Lasso) &&
         !doc_->aiFill().resultMask.empty()) {
         doc_->applyAIResult();
+        if (doc_->aiFill().resultMask.empty()) emit aiResultApplied();
+    }
+
+    gestureRegion_ = edgeConstrained_ && tool_ != Tool::Fill
+        ? doc_->edgeRegion({ip.x(), ip.y()}, edgePenalty_) : cv::Mat();
+
+    if (tool_ == Tool::DrawFill || tool_ == Tool::Lasso) {
+        if (tool_ == Tool::DrawFill && drawFillHoles_) {
+            if (doc_->fillEnclosedAt(cv::Point(ip.x(), ip.y()), label_)) {
+                emit maskChanged();
+                update();
+            }
+            return;
+        }
+        drawing_ = true;
+        outline_.clear();
+        outline_.push_back(cv::Point(ip.x(), ip.y()));
+        lastImgPt_ = ip;
+        if (tool_ == Tool::DrawFill) {
+            doc_->pushHistory();
+            doc_->paintLine(cv::Point(ip.x(), ip.y()), cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
+        }
+        update();
+        return;
     }
 
     if (tool_ == Tool::Fill && isScribbleAlgorithm(fillAlgo_)) {
@@ -318,9 +380,10 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
     doc_->pushHistory();
     drawing_ = true;
     lastImgPt_ = ip;
-    Label paintLabel = (tool_ == Tool::Eraser) ? Label::Background : label_;
-    doc_->paintLine(cv::Point(ip.x(), ip.y()), cv::Point(ip.x(), ip.y()),
-                    paintLabel, brushSize_);
+    if (tool_ == Tool::Eraser)
+        doc_->eraseLabelLine(cv::Point(ip.x(), ip.y()), cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
+    else
+        doc_->paintLine(cv::Point(ip.x(), ip.y()), cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
     update();
 }
 
@@ -333,6 +396,18 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
     }
     if (!drawing_) return;
     QPoint ip = widgetToImage(e->position());
+    if (tool_ == Tool::DrawFill || tool_ == Tool::Lasso) {
+        ip.setX(std::clamp(ip.x(), 0, doc_->width() - 1));
+        ip.setY(std::clamp(ip.y(), 0, doc_->height() - 1));
+        if (ip == lastImgPt_) return;
+        if (tool_ == Tool::DrawFill)
+            doc_->paintLine(cv::Point(lastImgPt_.x(), lastImgPt_.y()),
+                cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
+        outline_.push_back(cv::Point(ip.x(), ip.y()));
+        lastImgPt_ = ip;
+        update();
+        return;
+    }
     if (tool_ == Tool::AIFill) {
         if (doc_->aiFill().promptType == AIFillPromptType::BoundingBox) {
             ip.setX(std::clamp(ip.x(), 0, doc_->width() - 1));
@@ -365,31 +440,101 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
         doc_->paintSeedLine(cv::Point(lastImgPt_.x(), lastImgPt_.y()),
                             cv::Point(ip.x(), ip.y()), label_, brushSize_);
     } else {
-        Label paintLabel = (tool_ == Tool::Eraser) ? Label::Background : label_;
-        doc_->paintLine(cv::Point(lastImgPt_.x(), lastImgPt_.y()),
-                        cv::Point(ip.x(), ip.y()), paintLabel, brushSize_);
+        if (tool_ == Tool::Eraser)
+            doc_->eraseLabelLine(cv::Point(lastImgPt_.x(), lastImgPt_.y()),
+                cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
+        else
+            doc_->paintLine(cv::Point(lastImgPt_.x(), lastImgPt_.y()),
+                            cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
     }
     lastImgPt_ = ip;
     update();
 }
 
 void CanvasWidget::mouseReleaseEvent(QMouseEvent* e) {
-    if (e->button() == Qt::MiddleButton) { panning_ = false; return; }
+    if (panning_ && e->button() == panButton_) {
+        panning_ = false;
+        panButton_ = Qt::NoButton;
+        setCursor(panMode_ ? Qt::OpenHandCursor : Qt::CrossCursor);
+        e->accept();
+        return;
+    }
     if (e->button() != Qt::LeftButton) return;
     if (drawing_) {
-        if (tool_ == Tool::AIFill) mouseMoveEvent(e);
+        if (tool_ == Tool::AIFill || tool_ == Tool::DrawFill || tool_ == Tool::Lasso)
+            mouseMoveEvent(e);
         drawing_ = false;
+        if ((tool_ == Tool::DrawFill || tool_ == Tool::Lasso) && autoFillOutline_ && outline_.size() >= 3) {
+            doc_->fillPolygon(outline_, label_, tool_ != Tool::DrawFill,
+                tool_ == Tool::Lasso ? gestureRegion_ : cv::Mat());
+            outline_.clear();
+        }
         emit maskChanged();
     }
 }
 
 void CanvasWidget::wheelEvent(QWheelEvent* e) {
-    if (e->angleDelta().y() > 0) zoomIn();
-    else zoomOut();
+    const int angle = e->angleDelta().y();
+    const int pixels = e->pixelDelta().y();
+    if (angle == 0 && pixels == 0) return;
+    const double factor = angle != 0 ? std::pow(1.2, angle / 120.0)
+                                     : std::exp(pixels / 600.0);
+    const QRectF current = imageRect();
+    const QPointF anchor = current.contains(e->position())
+        ? e->position() : QPointF(width() / 2.0, height() / 2.0);
+    zoomAt(anchor, factor);
+    e->accept();
 }
 
-void CanvasWidget::zoomIn()    { zoom_ = std::min(zoom_ + 0.25f, 4.0f);  emit zoomChanged(zoom_); update(); }
-void CanvasWidget::zoomOut()   { zoom_ = std::max(zoom_ - 0.25f, 0.25f); emit zoomChanged(zoom_); update(); }
-void CanvasWidget::zoomReset() { zoom_ = 1.0f; panOffset_ = {}; drawing_ = false; panning_ = false; emit zoomChanged(zoom_); update(); }
+void CanvasWidget::zoomAt(const QPointF& anchor, double factor) {
+    const QRectF before = imageRect();
+    if (before.isEmpty()) return;
+    const double next = std::clamp(static_cast<double>(zoom_) * factor, 0.1, 32.0);
+    if (next == zoom_) return;
+
+    // Preserve the source point under the pointer as the image grows or shrinks.
+    const double imageX = (anchor.x() - before.left()) / before.width();
+    const double imageY = (anchor.y() - before.top()) / before.height();
+    zoom_ = static_cast<float>(next);
+    const QRectF after = imageRect();
+    panOffset_ += anchor - QPointF(after.left() + imageX * after.width(),
+                                   after.top() + imageY * after.height());
+    emit zoomChanged(zoom_);
+    update();
+}
+
+void CanvasWidget::setPanMode(bool enabled) {
+    if (panMode_ == enabled) return;
+    panMode_ = enabled;
+    drawing_ = false;
+    setCursor(enabled ? Qt::OpenHandCursor : Qt::CrossCursor);
+    emit panModeChanged(enabled);
+}
+
+void CanvasWidget::panBy(const QPointF& delta) {
+    if (!doc_->hasImage()) return;
+    panOffset_ += delta;
+    update();
+}
+
+void CanvasWidget::centerImageEnd(bool bottom) {
+    if (!doc_->hasImage()) return;
+    const QRectF image = imageRect();
+    panBy(QPointF(width() / 2.0, height() / 2.0) -
+          QPointF(image.center().x(), bottom ? image.bottom() : image.top()));
+}
+
+void CanvasWidget::zoomIn()  { zoomAt(QPointF(width() / 2.0, height() / 2.0), 1.2); }
+void CanvasWidget::zoomOut() { zoomAt(QPointF(width() / 2.0, height() / 2.0), 1.0 / 1.2); }
+void CanvasWidget::zoomReset() {
+    zoom_ = 1.0f;
+    panOffset_ = {};
+    drawing_ = false;
+    panning_ = false;
+    panButton_ = Qt::NoButton;
+    setCursor(panMode_ ? Qt::OpenHandCursor : Qt::CrossCursor);
+    emit zoomChanged(zoom_);
+    update();
+}
 
 } // namespace orthoseg

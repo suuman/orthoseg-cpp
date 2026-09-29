@@ -14,13 +14,14 @@ The instructions below describe the native application; see
 
 ## Features
 
-- Brush and eraser tools with adjustable stroke size.
+- Brush and channel-specific eraser tools with adjustable stroke size.
+- Draw & Fill and Lasso outline tools, plus an isolated view of the selected label.
 - Three fills that grow a region from a single click.
 - Three algorithms that segment from labeled scribbles, including background seeds.
-- Color mask overlay with adjustable opacity, zoom, and middle-button panning.
+- Color mask overlay with adjustable opacity, pointer-centered zoom, and free panning.
 - AI Fill with bounding-box, painted-mask, and loaded-mask prompts for femur/tibia.
 - Undo for the last 20 edits, restoring both the mask and seed layer.
-- Export of a color PNG mask at the source image dimensions.
+- Lossless RGB label-channel PNG import/export at the source image dimensions.
 
 ## Build and run
 
@@ -84,15 +85,40 @@ segmentation engine checks, use `./build/test_seg` from the repository root.
 1. Click **Upload X-ray** and open a PNG, JPEG, BMP, or TIFF image.
 2. Select **Femur**, **Tibia**, or **Fibula** under **Select Anatomy**.
 3. Choose **Brush**, set **Brush Size**, and drag with the left mouse button to
-   paint. Choose **Eraser**, or paint with **Background**, to remove labels.
+   paint. Painting another bone adds its channel in overlapping regions. **Eraser**
+   removes only the selected bone; painting with **Background** clears all channels.
 4. Use **Mask Opacity** to adjust the overlay. The mouse wheel and toolbar
    **+**/**−** buttons change zoom; **Reset Zoom** returns to the fitted view.
 5. Click **Export Mask** to save the result. The default filename is
    `bone_segmentation_mask.png`.
 
+Use **Show only selected label** to hide the other bone overlays while editing.
+**Draw & Fill** traces a brush outline; **Fill Outline** closes and fills it.
+Its **Fill enclosed hole** mode fills a closed gap in the selected bone after a
+click. **Lasso** traces an area without painting its edge; use **Fill Outline**
+or **Auto fill on release** to add the selected label inside it. These fills
+preserve other labels beneath the selected bone.
+
 Opening another image starts a new mask and seed layer and resets undo history.
 Annotations are held in memory, so export the mask before changing images or
 closing the application.
+
+### Batch editing nnUNet pairs
+
+Click **Batch Mode** in the top bar and choose the X-ray images folder, input
+label-mask folder, and destination folder. A label such as `abc.png` pairs with
+`abc_0000.png` in the images folder. **Start / Resume** loads the first pair
+whose destination `abc.png` does not already exist. Missing image pairs are
+skipped. Input labels use the same exact RGB channel or grayscale 0–3 format as
+**Import Mask** and must match their X-ray dimensions.
+
+While a batch is active, **Export Mask** becomes **Save Mask & Next**. It saves
+the current mask as `abc.png` in the destination and loads the next unsaved
+pair. The save is atomic; a failed save keeps the current case open. Apply or
+clear an AI preview before saving. The last save ends batch mode. **Upload X-ray**
+also ends batch mode after a successful manual image load. Click **Batch Mode**
+again with the same folders to resume; masks already present in the destination
+are not reopened or overwritten.
 
 ### Fill from a click
 
@@ -152,7 +178,9 @@ pixels are retained. Foreground pixels can overwrite another label.
    overwrite other labels at foreground pixels; pixels outside the AI foreground
    are retained. The preview is consumed on apply. Unapplied previews are not exported.
 
-Use the mouse wheel or existing buttons to zoom; middle-drag pans in any tool.
+Use the mouse wheel to zoom around the pointer, or the +/− buttons to zoom around
+the view center. Right-drag, middle-drag, or Ctrl+left-drag pans in any tool, so
+you can move the upper or lower image region to the center before zooming again.
 Reset Zoom also resets pan. Mouse events and drawing share Qt logical coordinates,
 so zoom, fit, aspect ratio, pan, and HiDPI do not change source prompt coordinates.
 Box endpoints follow `ocv`'s inclusive pixel convention (`0..width-1`, `0..height-1`).
@@ -225,7 +253,7 @@ must still be verified on a machine with an available NVIDIA driver/device.
 | Edge Penalty | 1–255 / 30 | Edge cutoff for Embedded Boundary and Split-and-Merge; lower values block growth at weaker edges. |
 | Edge Sensitivity (β) | 1–100 / 30 | Grow from Seeds and Random Walker only; larger values reduce propagation across intensity changes. Internally, β = slider value × 0.0001. |
 | Mask Opacity | 10–100% / 50% | Display opacity; exported mask colors stay fully opaque. |
-| Zoom | 25–400% / 100% | Changes in 25 percentage-point steps relative to the fitted view. |
+| Zoom | 10–3200% / 100% | Wheel follows the pointer; buttons change zoom by 20% around the view center. |
 | Undo | Up to 20 edits | Restores the mask and seeds before a stroke, fill, segmentation run, or clear action. |
 | Clear Seeds | — | Removes seed strokes while retaining the result mask. |
 | Clear All | — | Clears both the mask and seeds while keeping the source image. |
@@ -259,29 +287,33 @@ when the intensity threshold permits it.
 ## Image and mask formats
 
 The native loader reads images as 8-bit BGR color and computes grayscale intensity
-as the mean of the three channels. The internal mask is a single-channel
-`CV_8UC1` image containing these label IDs:
+as the mean of the three channels. The editable mask stores **three independent
+channels**, so overlapping bones remain separate. The canvas renders each present
+channel at full red, green, or blue, producing yellow, cyan, magenta, or white
+where bones overlap. The 0–3 indexed mask is retained only as a compatibility
+view for exclusive-label segmentation algorithms; overlapping pixels choose
+Fibula, then Tibia, then Femur in that view.
 
-| ID | Label | Export color (RGB hex) |
+| Bone | Label ID | PNG RGB channel value |
 | --- | --- | --- |
-| 0 | Background | `#000000` |
-| 1 | Femur | `#ef4444` |
-| 2 | Tibia | `#22c55e` |
-| 3 | Fibula | `#3b82f6` |
+| Background | 0 | `(0, 0, 0)` |
+| Femur | 1 | `(1, 0, 0)` |
+| Tibia | 2 | `(0, 2, 0)` |
+| Fibula | 3 | `(0, 0, 3)` |
 
-The separate seed layer uses IDs 0–3 and `255` for unseeded pixels. In the result
-mask, ID 0 means background; in the seed layer, ID 0 is an explicit background
-seed.
+**Export Mask** writes an exact 8-bit RGB PNG. Overlaps add channel values, for
+example Tibia + Fibula is `(0, 2, 3)` and all three is `(1, 2, 3)`.
+**Import Mask** accepts those exact channel values and combinations, or an 8-bit
+grayscale mask with IDs 0–3 (including RGB files where all three values are
+equal). The imported mask must match the open X-ray's dimensions. Invalid
+values leave the current annotation unchanged. Exported masks contain no source
+X-ray, seed strokes, or transparency. Lossy output formats are not supported.
 
-**Export Mask** writes a three-channel color PNG with a black background. It
-contains the mask only, with no source X-ray, seed strokes, or transparency. To
-recover label IDs from an exported PNG, map its RGB colors using the table above.
-
-The current application works with individual raster images. It has no direct
-DICOM reader, project save/reload, or indexed-label export. AI Fill imports binary
-prompt masks but does not import a full multi-label annotation project. Convert
-DICOM images to a supported raster format before opening them; original
-high-bit-depth image values are not preserved by the current loader.
+The separate seed layer uses IDs 0–3 and `255` for unseeded pixels; ID 0 is an
+explicit background seed. The application works with raster images and has no
+direct DICOM reader or project save/reload. Convert DICOM images to a supported
+raster format before opening them; original high-bit-depth image values are not
+preserved by the display loader.
 
 ## Project layout
 
@@ -316,7 +348,7 @@ checks UI rendering; it does not load an image or run segmentation.
 
 The browser version provides Brush, Eraser, and the three click-fill algorithms.
 Its annotation logic runs in the browser using canvas; the native application
-adds the scribble algorithms and stores labels in an indexed mask. The web
+adds the scribble algorithms and stores overlapping labels in separate channels. The web
 version exports a canvas PNG with transparent background pixels.
 
 With Node.js and npm installed, run from the repository root:
@@ -368,10 +400,10 @@ was not available for verification on this workstation.
 ## Optional MONAI AI Segment integration
 
 The **AI Fill** panel also offers **MedSAM2**, **MONAI production (UNet)**,
-**MONAI SAM2 (boxes)**, and **MONAI nnUNet v2**. Both MONAI production and nnUNet v2
+**MONAI MedSAM2 (boxes / masks)**, and **MONAI nnUNet v2**. Both MONAI production and nnUNet v2
 provide automatic Femur/Tibia predictions. The supplied nnUNet checkpoint has
 the right labels but a different architecture from the MONAI production UNet,
-so it is a separate model choice. MONAI SAM2 uses Femur/Tibia boxes; MedSAM2
+so it is a separate model choice. MONAI MedSAM2 uses Femur/Tibia boxes or mask prompts; MedSAM2
 keeps its ONNX prompt workflow. The top-bar **AI Segment** action runs the
 MONAI production UNet.
 The build additionally requires the Qt 6 `Network` component (provided by
@@ -434,25 +466,24 @@ the image to 2048 pixels high with its aspect ratio preserved, runs 2D sliding
 window inference, and restores the 0/1/2 mask to the original size. This
 prediction follows the same editable, undoable, and exportable mask workflow.
 Its health indicator and version are independent of the MONAI production UNet.
-Model Management trains and promotes the MONAI production UNet only.
+Model Management has separate UNet and MedSAM2 selections; nnUNet remains inference-only.
 
-For prompted inference, open a PNG X-ray, choose **MONAI SAM2 (boxes)** in AI Fill,
+For prompted inference, open a PNG X-ray, choose **MONAI MedSAM2 (boxes / masks)** in AI Fill,
 select Femur or Tibia, and drag a box on the image. For a bilateral case, click
 **Next bounding box (2)** and draw the second box for that bone; repeat after
 selecting the other bone if needed. The button switches back to box 1 for edits,
 and each box has its own Clear control. Click **Run MONAI SAM2**. The server
 resizes the image to 1024 pixels high while preserving aspect ratio, maps the
 boxes into that image, and restores the mask to the original dimensions. The
-source-sized 0/1/2 result becomes one
+source-sized independent RGB result (R=1 Femur, G=2 Tibia, B=0) preserves overlap and becomes one
 undoable annotation edit and can be exported with **Export Mask**. If only one
 bone is prompted, the current annotation for the other bone is preserved.
 SAM2 model readiness and version are separate from the automatic production
-model. The model management window manages the automatic production model and
-its training jobs, not this prompted checkpoint.
+model. Paint Mask, Load Mask and Normal Fill Mask are also available; mask refinement targets the selected bone and preserves the other bone. Model Management can fine-tune and promote MedSAM2 using the same corrected-annotation workflow. The image is centered on a square canvas before inference; output is cropped back to its source geometry.
 
 After a successful **Export Mask**, **Add to AI Training** optionally uploads
-the original PNG plus a fresh canonical 0/1/2 mask made from the current editable
-annotation. The existing colored PNG export remains authoritative and unchanged.
+the original PNG plus a fresh discrete RGB mask made from the current editable
+Femur/Tibia channels, including overlap. Batch Save Mask & Next offers the same upload before advancing. The existing colored PNG export remains authoritative and unchanged.
 Apply AI Fill previews before export as usual. Fibula is background in the
 Femur/Tibia training mask and remains present in the normal export.
 **Save Only** sends nothing. Unchanged accepted/declined annotations are not
@@ -491,3 +522,67 @@ refresh every five seconds while the panel is visible. Closing the UI does not
 cancel backend training. [MODEL_MANAGEMENT.md](MODEL_MANAGEMENT.md) documents the
 API and validation. CTest now includes the focused `management` suite as well as
 all existing annotation and MONAI integration tests.
+
+### Edge-aware editing and image navigation
+
+Brush, Eraser, Lasso, and Draw & Fill offer **Stop at image edges** (off by default).
+Enable it to limit a gesture to the source-image region connected to its starting
+point. Start inside the region, not on its boundary. **Edge Threshold** ranges
+from 0 to 255: lower values stop at weaker edges; 255 allows every edge. Detected
+boundaries must close off the region to prevent growth around gaps. For Draw & Fill, edge stopping applies only to drawing. Fill closed area fills
+inside the drawn mask boundary; Fill Outline and auto-fill fill the traced polygon
+without any source-image edge constraint. Brush size now starts at one
+image pixel.
+
+Use **Drag image** in the top toolbar to drag repeatedly with the left mouse button, or use right/middle drag or
+Ctrl+left drag at any time.
+Wheel zoom stays anchored under the pointer; zoom buttons retain the viewport
+center. Drag remains active after release, keeping editing suspended. Click Drag image
+again to resume the previous tool, or select an editing tool to exit drag mode
+and activate that tool.
+
+**Model Management** appears immediately after **Batch Mode** in the top toolbar
+when the configured MONAI backend grants management access; otherwise it is hidden.
+
+### Starting edits and exporting masks
+
+New images (including each batch image) start with no editing tool active. Select
+Brush, Fill, Eraser, Draw & Fill, or Lasso before editing. Opening AI Fill only
+opens its controls: explicitly choose the prompt mode in its list to enable
+box drawing or prompt painting. Returning to AI Fill pauses prompt editing again.
+
+Image, mask, and prompt file pickers remember their last successfully opened
+folders across restarts. Export remembers its destination separately and offers
+a text field for typing or pasting an existing destination folder. Its File name
+field also accepts a full path. A source named `abc_0000.png` defaults to mask
+`abc.png`; trailing four-digit channel suffixes are removed. Images without a
+channel suffix keep their base name. Export refuses to overwrite the source X-ray.
+
+## Browsing and editing preferences
+
+Image, mask and export browsers use the same file list with keyboard Up/Down,
+with the left arrow going up one folder and the right arrow opening the selected
+child folder. These arrows work without navigation history. Successful normal
+and batch exports remember their destination folder across launches. Cancelling
+or failing an export does not replace the last successful save folder.
+
+After a mask is saved, reopening its source X-ray in the same window/session
+shows the saved mask path and asks for confirmation. Cancel preserves the current
+image and annotation. The processed-file list resets on application restart.
+
+Brush and Eraser share brush size, edge threshold and the edge-stop checkbox.
+Lasso, Fill, Draw & Fill and AI prompt painting retain separate tool settings
+while switching tools. Draw & Fill always opens in Draw outline mode.
+
+Model Management lists files accepted into the backend training pool with their
+actual Femur/Tibia labels, overlap pixel counts and pending/incorporated state
+for the selected model. Use Previous files/Next files for datasets over 50 cases.
+Saved masks appear here only after accepting **Add to AI Training** and a
+successful backend upload. Refresh retrieves the current pool.
+
+Use **Export list (CSV)** in Model Management to save all submitted files, across
+all pages, with their labels, overlap counts, training status, model and case IDs.
+
+The **Upload X-ray** dialog previews the highlighted image before opening it,
+with its filename and pixel dimensions. Mouse and keyboard selection update the
+preview; folders or unreadable files clear it. Previewing does not alter the current image or mask.

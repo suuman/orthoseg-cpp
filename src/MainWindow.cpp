@@ -1,8 +1,13 @@
 #include "MainWindow.h"
+#include "FileBrowser.h"
+#include "ImageFilePreview.h"
+#include <QSignalBlocker>
 #include "ModelManagementDialog.h"
 #include <QMenuBar>
 #include <QApplication>
 #include <QFileInfo>
+#include <QDir>
+#include <QSaveFile>
 #include <QStatusBar>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -12,6 +17,9 @@
 #include <QComboBox>
 #include <QLabel>
 #include <QFileDialog>
+#include <QSettings>
+#include <QRegularExpression>
+#include <QGridLayout>
 #include <QMessageBox>
 #include <QFrame>
 #include <QButtonGroup>
@@ -27,8 +35,30 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <stdexcept>
+#include <utility>
 
 namespace orthoseg {
+
+static cv::Mat selectedBonePrompt(const cv::Mat& mask, Label label) {
+    if (mask.empty()) return {};
+    if (label != Label::Femur && label != Label::Tibia)
+        throw std::runtime_error("Select Femur or Tibia for the mask prompt.");
+    if (mask.type() == CV_8UC3) {
+        std::vector<cv::Mat> channels;
+        cv::split(mask, channels);
+        if (cv::norm(channels[0], channels[1], cv::NORM_INF) == 0 &&
+            cv::norm(channels[1], channels[2], cv::NORM_INF) == 0)
+            return selectedBonePrompt(channels[0], label);
+        if (cv::countNonZero((channels[0] != 0) & (channels[0] != 3)) ||
+            cv::countNonZero((channels[1] != 0) & (channels[1] != 2)) || cv::countNonZero(channels[2] > 1))
+            throw std::runtime_error("Use a grayscale binary/label prompt or discrete RGB label channels.");
+        return channels[3 - static_cast<int>(label)] == static_cast<int>(label);
+    }
+    if (mask.type() == CV_8UC1 && !cv::countNonZero(mask > 3))
+        return mask == static_cast<int>(label);
+    return binaryPromptMask(mask, mask.size());
+}
+
 
 // Accent color from the web reference (#38bdf8) and slate palette.
 static const char* kAccent = "#38bdf8";
@@ -57,12 +87,14 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     aiModels_->setToolTip("Directory containing medsam2_image_encoder.onnx and medsam2_mask_decoder.onnx");
 
     canvas_ = new CanvasWidget(doc_.get());
+    connect(canvas_, &CanvasWidget::aiResultApplied, this, &MainWindow::recordAppliedMonaiResult);
     connect(canvas_, &CanvasWidget::maskChanged, this, [this] {
         updateUndoState();
         updateAIPromptStatus();
-        if (doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0 &&
+        if (doc_->hasImage() && activeLabel_ != Label::Background &&
+            cv::countNonZero(doc_->labelMask(activeLabel_)) > 0 &&
             !(activeTool_ == Tool::AIFill && doc_->aiFill().promptType == AIFillPromptType::BoundingBox)) {
-            doc_->aiFill().promptMask = doc_->mask().clone();
+            doc_->aiFill().promptMask = doc_->labelMask(activeLabel_);
             doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
             if (aiPromptCombo_) {
                 aiPromptCombo_->blockSignals(true);
@@ -93,7 +125,7 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
     setCentralWidget(central);
     central->setStyleSheet("background:#0f172a; color:#e2e8f0;");
 
-    selectTool(Tool::Brush);
+    selectTool(Tool::None);
     selectLabel(Label::Femur);
     updateSettingsVisibility();
     updateUndoState();
@@ -115,6 +147,7 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
             return;
         }
         doc_->aiFill().resultMask = result;
+        doc_->aiFill().resultLabels = submittedLabels_;
         doc_->aiFill().resultReplacesAnatomy = false;
         pendingMonaiVersionKey_.clear();
         pendingMonaiVersion_.clear();
@@ -142,8 +175,8 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
         statusBar()->clearMessage();
         if (nativeNnUnetGeneration_ != imageGeneration_ || !doc_->hasImage() ||
             result.size() != nativeNnUnetBefore_.size() ||
-            doc_->mask().size() != nativeNnUnetBefore_.size() ||
-            cv::norm(doc_->mask(), nativeNnUnetBefore_, cv::NORM_INF) != 0) {
+            doc_->maskChannels().size() != nativeNnUnetBefore_.size() ||
+            cv::norm(doc_->maskChannels(), nativeNnUnetBefore_, cv::NORM_INF) != 0) {
             aiStatus_->setText("Native nnUNet result discarded because the image or annotation changed.");
             nativeNnUnetBefore_.release();
             return;
@@ -227,14 +260,19 @@ QWidget* MainWindow::buildSidebar() {
         labelGrid->addWidget(btn, i / 2, i % 2);
     }
     v->addLayout(labelGrid);
+    auto* isolate = new QCheckBox("Show only selected label");
+    isolate->setObjectName("isolatedLabelView");
+    isolate->setToolTip("Hide other bone overlays while editing; all labels remain in the mask and export.");
+    connect(isolate, &QCheckBox::toggled, canvas_, &CanvasWidget::setIsolatedView);
+    v->addWidget(isolate);
 
     // --- Toolbox ---
     v->addWidget(sectionLabel("Toolbox"));
-    auto* toolRow = new QHBoxLayout;
-    toolRow->setSpacing(8);
-    const char* toolNames[4] = {"Brush", "Fill", "Eraser", "AI Fill"};
-    const char* toolIcons[4] = {"🖌", "🪣", "🧽", "✦"};
-    for (int i = 0; i < 4; ++i) {
+    auto* toolGrid = new QGridLayout;
+    toolGrid->setSpacing(8);
+    const char* toolNames[6] = {"Brush", "Fill", "Eraser", "AI Fill", "Draw && Fill", "Lasso"};
+    const char* toolIcons[6] = {"🖌", "🪣", "🧽", "✦", "✎", "⬡"};
+    for (int i = 0; i < 6; ++i) {
         Tool tid = static_cast<Tool>(i);
         auto* btn = new QPushButton(QString("%1\n%2").arg(toolIcons[i], toolNames[i]));
         btn->setCheckable(true);
@@ -249,6 +287,8 @@ QWidget* MainWindow::buildSidebar() {
                 "QPushButton:checked{ background:#22c55e; border:2px solid #16a34a;"
                 " color:#0f172a; font-weight:700; }");
         } else {
+            if (i == 4) btn->setObjectName("drawFillToolBtn");
+            if (i == 5) btn->setObjectName("lassoToolBtn");
             btn->setStyleSheet(QString(
                 "QPushButton{ border-radius:12px; border:1px solid #1e293b;"
                 " background:#1e293b4d; color:#94a3b8; font-size:11px; }"
@@ -258,9 +298,9 @@ QWidget* MainWindow::buildSidebar() {
         }
         toolButtons_[i] = btn;
         connect(btn, &QPushButton::clicked, this, [this, tid] { selectTool(tid); });
-        toolRow->addWidget(btn);
+        toolGrid->addWidget(btn, i / 3, i % 3);
     }
-    v->addLayout(toolRow);
+    v->addLayout(toolGrid);
 
     // Divider
     auto* divider = new QFrame;
@@ -282,7 +322,8 @@ QWidget* MainWindow::buildSidebar() {
         hdr->addWidget(brushValue_);
         bl->addLayout(hdr);
         brushSlider_ = new QSlider(Qt::Horizontal);
-        brushSlider_->setRange(2, 100);
+        brushSlider_->setObjectName("brushSizeSlider");
+        brushSlider_->setRange(1, 100);
         brushSlider_->setValue(20);
         connect(brushSlider_, &QSlider::valueChanged, this, [this](int v) {
             canvas_->setBrushSize(v);
@@ -291,6 +332,15 @@ QWidget* MainWindow::buildSidebar() {
         bl->addWidget(brushSlider_);
     }
     v->addWidget(brushPanel_);
+
+    constrainEdges_ = new QCheckBox("Stop at image edges");
+    constrainEdges_->setObjectName("constrainToEdges");
+    constrainEdges_->setToolTip("Start inside the intended region. Edits stay connected to the starting point without crossing image edges. Lower thresholds stop at weaker edges; 255 permits all edges.");
+    connect(constrainEdges_, &QCheckBox::toggled, this, [this](bool enabled) {
+        canvas_->setEdgeConstrained(enabled);
+        updateSettingsVisibility();
+    });
+    v->addWidget(constrainEdges_);
 
     // --- Fill panel ---
     fillPanel_ = new QWidget;
@@ -342,21 +392,22 @@ QWidget* MainWindow::buildSidebar() {
         el->setContentsMargins(0, 0, 0, 0);
         el->setSpacing(8);
         auto* ehdr = new QHBoxLayout;
-        ehdr->addWidget(sectionLabel("Edge Penalty"));
+        ehdr->addWidget(sectionLabel("Edge Threshold"));
         edgeValue_ = new QLabel("30");
         edgeValue_->setStyleSheet(QString("color:%1; font-size:12px;").arg(kAccent));
         ehdr->addStretch();
         ehdr->addWidget(edgeValue_);
         el->addLayout(ehdr);
         edgeSlider_ = new QSlider(Qt::Horizontal);
-        edgeSlider_->setRange(1, 255);
+        edgeSlider_->setObjectName("edgeThresholdSlider");
+        edgeSlider_->setRange(0, 255);
         edgeSlider_->setValue(30);
         connect(edgeSlider_, &QSlider::valueChanged, this, [this](int v) {
             canvas_->setEdgePenaltyThreshold(v);
             edgeValue_->setText(QString::number(v));
         });
         el->addWidget(edgeSlider_);
-        fl->addWidget(edgePanel_);
+
 
         // --- Edge sensitivity (β) for scribble algorithms ---
         betaPanel_ = new QWidget;
@@ -421,6 +472,48 @@ QWidget* MainWindow::buildSidebar() {
         fl->addWidget(seedPanel_);
     }
     v->addWidget(fillPanel_);
+    v->addWidget(edgePanel_);
+    drawFillPanel_ = new QWidget;
+    {
+        auto* dl = new QVBoxLayout(drawFillPanel_);
+        dl->setContentsMargins(0, 0, 0, 0);
+        dl->setSpacing(8);
+        dl->addWidget(sectionLabel("Outline tools"));
+        drawOutlineButton_ = new QPushButton("Draw Outline");
+        drawOutlineButton_->setObjectName("drawOutlineButton");
+        drawOutlineButton_->setCheckable(true);
+        drawOutlineButton_->setChecked(true);
+        fillClosedAreaButton_ = new QPushButton("Fill Closed Area");
+        fillClosedAreaButton_->setObjectName("fillClosedAreaButton");
+        fillClosedAreaButton_->setCheckable(true);
+        auto* modes = new QButtonGroup(drawFillPanel_);
+        modes->addButton(drawOutlineButton_);
+        modes->addButton(fillClosedAreaButton_);
+        connect(drawOutlineButton_, &QPushButton::toggled, canvas_, [this](bool checked) { if (checked) canvas_->setDrawFillHoles(false); });
+        connect(fillClosedAreaButton_, &QPushButton::toggled, canvas_, [this](bool checked) { if (checked) canvas_->setDrawFillHoles(true); });
+        dl->addWidget(drawOutlineButton_);
+        lassoHint_ = new QLabel("Lasso selects an area without painting its edge.");
+        lassoHint_->setWordWrap(true);
+        dl->addWidget(lassoHint_);
+        auto* autoFill = new QCheckBox("Auto fill on Release");
+        autoFill->setObjectName("autoFillOutline");
+        connect(autoFill, &QCheckBox::toggled, canvas_, &CanvasWidget::setAutoFillOutline);
+        dl->addWidget(autoFill);
+        fillOutlineButton_ = new QPushButton("Fill Outline");
+        fillOutlineButton_->setObjectName("fillOutlineButton");
+        connect(fillOutlineButton_, &QPushButton::clicked, canvas_, &CanvasWidget::fillCurrentOutline);
+        connect(drawOutlineButton_, &QPushButton::clicked, this, [this] { setFillOutlineHighlight(true); });
+        connect(drawOutlineButton_, &QPushButton::toggled, this, &MainWindow::setFillOutlineHighlight);
+        dl->addWidget(fillOutlineButton_);
+        auto* clearOutline = new QPushButton("Clear Outline");
+        clearOutline->setObjectName("clearOutlineButton");
+        connect(clearOutline, &QPushButton::clicked, canvas_, &CanvasWidget::clearOutline);
+        connect(clearOutline, &QPushButton::clicked, this, [this] { setFillOutlineHighlight(false); });
+        connect(fillClosedAreaButton_, &QPushButton::clicked, this, [this] { setFillOutlineHighlight(false); });
+        dl->addWidget(clearOutline);
+        dl->addWidget(fillClosedAreaButton_);
+    }
+    v->addWidget(drawFillPanel_);
     aiPanel_ = buildAIPanel();
     v->addWidget(aiPanel_);
 
@@ -447,6 +540,7 @@ QWidget* MainWindow::buildSidebar() {
 
     // --- Action footer ---
     auto* exportBtn = new QPushButton("⬇  Export Mask");
+    exportMaskBtn_ = exportBtn;
     exportBtn->setCursor(Qt::PointingHandCursor);
     exportBtn->setMinimumHeight(44);
     exportBtn->setStyleSheet(QString(
@@ -455,6 +549,13 @@ QWidget* MainWindow::buildSidebar() {
         .arg(kAccent));
     connect(exportBtn, &QPushButton::clicked, this, &MainWindow::onExport);
     v->addWidget(exportBtn);
+
+    auto* importBtn = new QPushButton("⬆  Import Mask");
+    importBtn->setObjectName("importMaskButton");
+    importBtn->setMinimumHeight(40);
+    importBtn->setToolTip("Import exact RGB label channels or a grayscale 0–3 mask matching the X-ray size.");
+    connect(importBtn, &QPushButton::clicked, this, &MainWindow::onImportMask);
+    v->addWidget(importBtn);
 
     auto* uploadBtn = new QPushButton("⬆  Upload X-ray");
     uploadBtn->setCursor(Qt::PointingHandCursor);
@@ -500,12 +601,37 @@ QWidget* MainWindow::buildTopBar() {
     bar->setFixedHeight(56);
     bar->setStyleSheet("background:#0f172a; border-bottom:1px solid #1e293b;");
     auto* h = new QHBoxLayout(bar);
-    h->setContentsMargins(24, 0, 24, 0);
+    h->setContentsMargins(12, 0, 12, 0);
+    h->setSpacing(5);
 
     auto* status = new QLabel("● ACTIVE SESSION");
     status->setStyleSheet("color:#22c55e; font-size:10px; letter-spacing:2px;"
                           " font-weight:700;");
     h->addWidget(status);
+    batchModeBtn_ = new QPushButton("Batch Mode");
+    batchModeBtn_->setObjectName("batchModeButton");
+    batchModeBtn_->setToolTip("Choose X-ray, label-mask, and destination folders for batch editing");
+    batchModeBtn_->setCursor(Qt::PointingHandCursor);
+    batchModeBtn_->setStyleSheet(
+        "QPushButton{ background:#1e293b; color:#cbd5e1; border:1px solid #334155;"
+        " border-radius:8px; padding:6px 10px; font-size:11px; font-weight:600; }"
+        "QPushButton:hover{ background:#334155; color:#ffffff; }");
+    connect(batchModeBtn_, &QPushButton::clicked, this, &MainWindow::onBatchMode);
+    h->addWidget(batchModeBtn_);
+    managementButton_->setStyleSheet(batchModeBtn_->styleSheet());
+    h->addWidget(managementButton_);
+    auto* pan = new QPushButton("Drag image");
+    pan->setObjectName("panImageButton");
+    pan->setCheckable(true);
+    pan->setStyleSheet(batchModeBtn_->styleSheet() + "QPushButton:checked{ background:#0369a1; color:white; }");
+    pan->setToolTip("Drag the image without editing. Drag stays active until you click this button again or select an editing tool.");
+    connect(pan, &QPushButton::toggled, canvas_, &CanvasWidget::setPanMode);
+    connect(canvas_, &CanvasWidget::panModeChanged, pan, &QPushButton::setChecked);
+    connect(canvas_, &CanvasWidget::panModeChanged, this, [this](bool enabled) {
+        for (int i = 0; i < 6; ++i)
+            static_cast<QPushButton*>(toolButtons_[i])->setChecked(!enabled && i == static_cast<int>(activeTool_));
+    });
+    h->addWidget(pan);
     h->addStretch();
 
     dimLabel_ = new QLabel("NO_IMAGE");
@@ -606,12 +732,12 @@ QWidget* MainWindow::buildAIPanel() {
     layout->addWidget(sectionLabel("AI model"));
     aiModelSelector_ = new QComboBox;
     aiModelSelector_->setObjectName("aiModelSelector");
-    aiModelSelector_->addItems({"MedSAM2", "MONAI production (UNet)", "MONAI SAM2 (boxes)", "MONAI nnUNet v2"});
+    aiModelSelector_->addItems({"MedSAM2", "MONAI production (UNet)", "MONAI MedSAM2 (boxes / masks)", "MONAI nnUNet v2"});
 #ifdef ORTHOSEG_NATIVE_NNUNET
     aiModelSelector_->addItem("Native nnUNet v2 (OpenCV 5)");
 #endif
     connect(aiModelSelector_, &QComboBox::currentIndexChanged, this, [this] {
-        if (medSamControls_) medSamControls_->setVisible(aiModelSelector_->currentIndex() == 0);
+        if (medSamControls_) medSamControls_->setVisible(aiModelSelector_->currentIndex() == 0 || aiModelSelector_->currentIndex() == 2);
         if (monaiControls_) monaiControls_->setVisible(aiModelSelector_->currentIndex() != 0
 #ifdef ORTHOSEG_NATIVE_NNUNET
                                                        && aiModelSelector_->currentIndex() != 4
@@ -625,7 +751,7 @@ QWidget* MainWindow::buildAIPanel() {
                                    aiModelSelector_->currentIndex() == 2 ? "▶ Run MONAI SAM2" :
                                    aiModelSelector_->currentIndex() == 3 ? "▶ Run nnUNet v2" : "▶ Run Native nnUNet");
         if (aiModelSelector_->currentIndex() == 2) {
-            doc_->aiFill().promptType = AIFillPromptType::BoundingBox;
+            doc_->aiFill().promptType = static_cast<AIFillPromptType>(aiPromptCombo_->currentIndex());
             doc_->aiFill().showPrompt = true;
             doc_->aiFill().showSecondaryBoxes = true;
             canvas_->setActiveTool(activeTool_);
@@ -671,13 +797,15 @@ QWidget* MainWindow::buildAIPanel() {
     managementButton_ = new QPushButton("Model Management");
     managementButton_->setObjectName("modelManagementButton");
     managementButton_->setEnabled(false);
+    managementButton_->hide();
     managementButton_->setToolTip("Available when the local MONAI backend grants management access");
     connect(managementButton_, &QPushButton::clicked, this, &MainWindow::openModelManagement);
-    monaiLayout->addWidget(managementButton_);
+
     connect(monaiUrl_, &QLineEdit::textChanged, this, [this] {
         ++monaiCheckSerial_;
         monaiReady_ = false;
         managementButton_->setEnabled(false);
+    managementButton_->hide();
         if (managementAction_) managementAction_->setEnabled(false);
         if (monai_) monai_->setBaseUrl(QUrl(monaiUrl_->text().trimmed()));
         monaiStatus_->setStyleSheet("color:#f87171;");
@@ -718,8 +846,8 @@ QWidget* MainWindow::buildAIPanel() {
         doc_->aiFill().promptType = type;
         if (type == AIFillPromptType::NormalFillMask) {
             if (doc_->hasImage()) {
-                doc_->aiFill().promptMask = doc_->mask().empty() ?
-                    cv::Mat::zeros(doc_->sourceColor().size(), CV_8UC1) : doc_->mask().clone();
+                doc_->aiFill().promptMask = activeLabel_ == Label::Background ?
+                    cv::Mat::zeros(doc_->sourceColor().size(), CV_8UC1) : doc_->labelMask(activeLabel_);
                 doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
                 doc_->aiFill().showPrompt = true;
                 if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
@@ -756,6 +884,10 @@ QWidget* MainWindow::buildAIPanel() {
         }
         canvas_->setActiveTool(activeTool_);
         updateSettingsVisibility();
+    });
+    connect(aiPromptCombo_, &QComboBox::activated, this, [this](int) {
+        canvas_->setAIPromptEditing(true);
+        aiPromptHint_->setText("Selected prompt mode is active. Draw boxes or paint a mask on the image as appropriate.");
     });
     medSamLayout->addWidget(aiPromptCombo_);
 
@@ -855,6 +987,7 @@ QWidget* MainWindow::buildAIPanel() {
 
     aiErase_ = new QCheckBox("Erase Prompt (unchecked = brush)");
     connect(aiErase_, &QCheckBox::toggled, canvas_, &CanvasWidget::setAIPromptErase);
+    connect(aiErase_, &QCheckBox::clicked, this, [this] { canvas_->setAIPromptEditing(true); });
     medSamLayout->addWidget(aiErase_);
     aiLoadMask_ = new QPushButton("Load Prompt Mask");
     connect(aiLoadMask_, &QPushButton::clicked, this, &MainWindow::onLoadPromptMask);
@@ -873,7 +1006,7 @@ QWidget* MainWindow::buildAIPanel() {
     copyNormalMaskBtn_->setToolTip("Copy normal fill annotations to the paint prompt layer for manual editing.");
     connect(copyNormalMaskBtn_, &QPushButton::clicked, this, [this] {
         if (!doc_->hasImage() || doc_->mask().empty()) return;
-        doc_->aiFill().promptMask = doc_->mask().clone();
+        doc_->aiFill().promptMask = doc_->labelMask(activeLabel_);
         doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
         doc_->aiFill().showPrompt = true;
         if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
@@ -886,11 +1019,18 @@ QWidget* MainWindow::buildAIPanel() {
     useResultAsPromptBtn_ = new QPushButton("Use AI Result as Next Prompt");
     useResultAsPromptBtn_->setToolTip("Use the current AI segmentation output as the prompt for the next refinement pass.");
     connect(useResultAsPromptBtn_, &QPushButton::clicked, this, [this] {
-        if (doc_->aiFill().resultMask.empty() || cv::countNonZero(doc_->aiFill().resultMask) == 0) {
+        if (activeLabel_ != Label::Femur && activeLabel_ != Label::Tibia) {
+            QMessageBox::information(this, "AI Fill", "Select Femur or Tibia for refinement.");
+            return;
+        }
+        if (doc_->aiFill().resultMask.empty() || cv::countNonZero(doc_->aiFill().resultMask.reshape(1)) == 0) {
             QMessageBox::information(this, "AI Fill", "No AI segmentation result to use as prompt.");
             return;
         }
-        doc_->aiFill().promptMask = doc_->aiFill().resultMask.clone();
+        doc_->aiFill().promptMask = selectedBonePrompt(doc_->aiFill().resultMask, activeLabel_);
+        doc_->applyAIResult();
+        recordAppliedMonaiResult();
+        updateUndoState();
         doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
         doc_->aiFill().showPrompt = true;
         if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
@@ -974,12 +1114,9 @@ QWidget* MainWindow::buildAIPanel() {
         const bool hadResult = !doc_->aiFill().resultMask.empty();
         const bool automatic = doc_->aiFill().resultReplacesAnatomy;
         doc_->applyAIResult();
-        if (hadResult && doc_->aiFill().resultMask.empty() && !pendingMonaiVersionKey_.isEmpty())
-            monaiVersions_[pendingMonaiVersionKey_] = pendingMonaiVersion_;
-        pendingMonaiVersionKey_.clear();
-        pendingMonaiVersion_.clear();
+        recordAppliedMonaiResult();
         if (hadResult && !automatic && doc_->hasImage() && !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
-            doc_->aiFill().promptMask = doc_->mask().clone();
+            doc_->aiFill().promptMask = doc_->labelMask(activeLabel_);
             doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
             doc_->aiFill().showPrompt = true;
             if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
@@ -1018,12 +1155,13 @@ void MainWindow::onRunAIFill() {
                 if (!ai.promptMask.empty() && cv::countNonZero(ai.promptMask) > 0) {
                     request.type = AIFillPromptType::PaintedMask;
                     request.promptMask = ai.promptMask.clone();
-                } else if (!doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
+                } else if (activeLabel_ != Label::Background &&
+                           cv::countNonZero(doc_->labelMask(activeLabel_)) > 0) {
                     request.type = AIFillPromptType::PaintedMask;
-                    request.promptMask = doc_->mask().clone();
-                } else if (!ai.resultMask.empty() && cv::countNonZero(ai.resultMask) > 0) {
+                    request.promptMask = doc_->labelMask(activeLabel_);
+                } else if (!ai.resultMask.empty() && cv::countNonZero(ai.resultMask.reshape(1)) > 0) {
                     request.type = AIFillPromptType::PaintedMask;
-                    request.promptMask = ai.resultMask.clone();
+                    request.promptMask = selectedBonePrompt(ai.resultMask, activeLabel_);
                 } else {
                     throw std::runtime_error("Draw at least one bounding box (Femur or Tibia) first.");
                 }
@@ -1036,9 +1174,9 @@ void MainWindow::onRunAIFill() {
                     request.box = validatedBox(*request.box, request.imageBGR.size());
             }
         } else if (request.type == AIFillPromptType::NormalFillMask) {
-            if (cv::countNonZero(doc_->mask()) == 0)
+            if (activeLabel_ == Label::Background || cv::countNonZero(doc_->labelMask(activeLabel_)) == 0)
                 throw std::runtime_error("Normal fill mask has no annotations yet. Fill or paint some bone regions first.");
-            doc_->aiFill().promptMask = doc_->mask().clone();
+            doc_->aiFill().promptMask = doc_->labelMask(activeLabel_);
             doc_->aiFill().promptType = AIFillPromptType::PaintedMask;
             request.promptMask = doc_->aiFill().promptMask.clone();
             request.type = AIFillPromptType::PaintedMask;
@@ -1050,15 +1188,18 @@ void MainWindow::onRunAIFill() {
                 throw std::runtime_error("Select Femur or Tibia under Select Anatomy.");
             request.promptMask = ai.promptMask.clone();
             if ((request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0) &&
-                !doc_->mask().empty() && cv::countNonZero(doc_->mask()) > 0) {
-                request.promptMask = doc_->mask().clone();
+                activeLabel_ != Label::Background && cv::countNonZero(doc_->labelMask(activeLabel_)) > 0) {
+                request.promptMask = doc_->labelMask(activeLabel_);
             } else if ((request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0) &&
-                !ai.resultMask.empty() && cv::countNonZero(ai.resultMask) > 0) {
-                request.promptMask = ai.resultMask.clone();
+                !ai.resultMask.empty() && cv::countNonZero(ai.resultMask.reshape(1)) > 0) {
+                request.promptMask = selectedBonePrompt(ai.resultMask, activeLabel_);
             }
             if (request.promptMask.empty() || cv::countNonZero(request.promptMask) == 0)
                 throw std::runtime_error("Paint or load a non-empty prompt mask first.");
         }
+        submittedLabels_.clear();
+        for (const auto& prompt : MedSAM2Inference::preparePrompts(request))
+            submittedLabels_.push_back(prompt.class_id);
         submittedGeneration_ = imageGeneration_;
         aiController_->run(std::move(request));
         aiRun_->setEnabled(false);
@@ -1085,8 +1226,7 @@ void MainWindow::onRunNativeNnUnet() {
         const auto width = std::max(1, int(std::round(double(source.cols) * 2048 / source.rows)));
         if (qint64(width) * 2048 > 25'000'000)
             throw std::runtime_error("The resized nnUNet image exceeds the 25-million-pixel limit.");
-        if (cv::countNonZero((doc_->mask() == static_cast<int>(Label::Femur)) |
-                             (doc_->mask() == static_cast<int>(Label::Tibia))) &&
+        if (cv::countNonZero(doc_->labelMask(Label::Femur) | doc_->labelMask(Label::Tibia)) &&
             QMessageBox::question(this, "Native nnUNet", "Replace the current Femur/Tibia segmentation?",
                                   QMessageBox::Yes | QMessageBox::Cancel,
                                   QMessageBox::Cancel) != QMessageBox::Yes) return;
@@ -1094,7 +1234,7 @@ void MainWindow::onRunNativeNnUnet() {
         request.imageBGR = source;
         request.modelPath = path.toStdString();
         request.device = nativeNnUnetDeviceKey_.toStdString();
-        nativeNnUnetBefore_ = doc_->mask().clone();
+        nativeNnUnetBefore_ = doc_->maskChannels().clone();
         nativeNnUnetGeneration_ = imageGeneration_;
         if (!aiController_->runNative(std::move(request))) return;
         aiRun_->setEnabled(false);
@@ -1113,17 +1253,21 @@ void MainWindow::onLoadPromptMask() {
         QMessageBox::information(this, "AI Fill", "Load an image first.");
         return;
     }
-    const auto path = QFileDialog::getOpenFileName(this, "Load Prompt Mask", {},
+    const auto path = browseFile(this, "Load Prompt Mask", QSettings("OrthoSeg", "OrthoSeg").value("folders/prompts", QFileInfo(QString::fromStdString(doc_->sourcePath())).absolutePath()).toString(),
         "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)");
     if (path.isEmpty()) return;
     try {
         // Preserve bit depth: a 16-bit label value of 1 is foreground, not zero.
         cv::Mat raw = cv::imread(path.toStdString(), cv::IMREAD_UNCHANGED);
-        cv::Mat binary = binaryPromptMask(raw, doc_->sourceColor().size());
+        if (raw.size() != doc_->sourceColor().size())
+            throw std::runtime_error("Prompt dimensions must match the X-ray.");
+        cv::Mat binary = aiModelSelector_->currentIndex() == 2 ? selectedBonePrompt(raw, activeLabel_) :
+            binaryPromptMask(raw, doc_->sourceColor().size());
         doc_->aiFill().promptMask = std::move(binary);
         doc_->aiFill().showPrompt = true;
         if (aiShowPrompt_) aiShowPrompt_->setChecked(true);
         aiPromptCombo_->setCurrentIndex(static_cast<int>(AIFillPromptType::LoadedMask));
+        QSettings("OrthoSeg", "OrthoSeg").setValue("folders/prompts", QFileInfo(path).absolutePath());
         aiStatus_->setText("Prompt loaded: nonzero pixels mark the selected anatomy.");
         canvas_->update();
     } catch (const std::exception& error) {
@@ -1226,7 +1370,7 @@ void MainWindow::onOpenModelDirDialog() {
     nativeRow->addWidget(nativeBrowse);
     l->addLayout(nativeRow);
     connect(nativeBrowse, &QPushButton::clicked, &dlg, [nativeModelEdit, &dlg] {
-        const auto path = QFileDialog::getOpenFileName(&dlg, "Select nnUNet ONNX Model",
+        const auto path = browseFile(&dlg, "Select nnUNet ONNX Model",
             QFileInfo(nativeModelEdit->text()).absolutePath(), "ONNX models (*.onnx)");
         if (!path.isEmpty()) nativeModelEdit->setText(path);
     });
@@ -1465,6 +1609,10 @@ void MainWindow::showFillAlgorithm(int comboIndex) {
 }
 
 void MainWindow::selectLabel(Label l) {
+    if (l != activeLabel_ && !doc_->aiFill().promptMask.empty()) {
+        doc_->aiFill().promptMask.release();
+        if (aiStatus_) aiStatus_->setText("Mask prompt cleared after changing anatomy. Paint or load a prompt for the selected bone.");
+    }
     activeLabel_ = l;
     doc_->aiFill().activeBoxNumber = 1;
     canvas_->setActiveLabel(l);
@@ -1474,10 +1622,33 @@ void MainWindow::selectLabel(Label l) {
     updateAIPromptStatus();
 }
 
+void MainWindow::setFillOutlineHighlight(bool highlighted) {
+    fillOutlineButton_->setStyleSheet(highlighted ?
+        QString("QPushButton{background:%1;color:#0f172a;font-weight:600;border:1px solid %1;border-radius:4px;}"
+                "QPushButton:hover{background:#0ea5e9;}").arg(kAccent) : QString());
+}
+
 void MainWindow::selectTool(Tool t) {
+    auto profile = [](Tool tool) { return static_cast<int>(tool == Tool::Eraser ? Tool::Brush : tool); };
+    auto& previous = toolSettings_[profile(activeTool_)];
+    previous = {brushSlider_->value(), edgeSlider_->value(), constrainEdges_->isChecked()};
     activeTool_ = t;
+    const auto& next = toolSettings_[profile(t)];
+    brushSlider_->setValue(next.size);
+    edgeSlider_->setValue(next.edge);
+    constrainEdges_->setChecked(next.constrained);
+    if (t == Tool::DrawFill) {
+        drawOutlineButton_->setChecked(true);
+        canvas_->setDrawFillHoles(false);
+    }
+    setFillOutlineHighlight(t == Tool::DrawFill);
+    canvas_->setPanMode(false);
     canvas_->setActiveTool(t);
-    for (int i = 0; i < 4; ++i)
+    if (t == Tool::AIFill) {
+        canvas_->setAIPromptEditing(false);
+        aiPromptHint_->setText("Choose a prompt mode from the list to start drawing or painting. Opening AI Fill does not edit the image.");
+    }
+    for (int i = 0; i < 6; ++i)
         static_cast<QPushButton*>(toolButtons_[i])
             ->setChecked(i == static_cast<int>(t));
     updateSettingsVisibility();
@@ -1487,9 +1658,9 @@ void MainWindow::updateSettingsVisibility() {
     bool isFill = (activeTool_ == Tool::Fill);
     bool isAI = (activeTool_ == Tool::AIFill);
     aiPanel_->setVisible(isAI);
-    bool medSam = !aiModelSelector_ || aiModelSelector_->currentIndex() == 0;
+    bool medSam = !aiModelSelector_ || aiModelSelector_->currentIndex() == 0 || aiModelSelector_->currentIndex() == 2;
     if (medSamControls_) medSamControls_->setVisible(isAI && medSam);
-    if (monaiControls_) monaiControls_->setVisible(isAI && !medSam
+    if (monaiControls_) monaiControls_->setVisible(isAI && aiModelSelector_->currentIndex() != 0
 #ifdef ORTHOSEG_NATIVE_NNUNET
                                                   && aiModelSelector_->currentIndex() != 4
 #endif
@@ -1498,8 +1669,7 @@ void MainWindow::updateSettingsVisibility() {
     if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(isAI && aiModelSelector_->currentIndex() == 4);
 #endif
     if (aiResultControls_) aiResultControls_->setVisible(isAI);
-    bool isBox = isAI && (aiModelSelector_ && aiModelSelector_->currentIndex() == 2 ||
-                        medSam && doc_->aiFill().promptType == AIFillPromptType::BoundingBox);
+    bool isBox = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::BoundingBox;
     bool isPaint = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::PaintedMask;
     bool isLoad = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::LoadedMask;
     bool isNormalMask = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::NormalFillMask;
@@ -1515,10 +1685,18 @@ void MainWindow::updateSettingsVisibility() {
     if (normalMaskControls_) normalMaskControls_->setVisible(isNormalMask);
     if (aiShowPrompt_) aiShowPrompt_->setVisible(isAI && medSam);
     if (useResultAsPromptBtn_) useResultAsPromptBtn_->setVisible(isAI && medSam &&
-        !doc_->aiFill().resultReplacesAnatomy && !doc_->aiFill().resultMask.empty());
-    brushPanel_->setVisible((!isFill && !isAI) || isPaint);
+        !doc_->aiFill().resultMask.empty());
+    brushPanel_->setVisible((!isFill && !isAI && activeTool_ != Tool::None) || isPaint);
     fillPanel_->setVisible(isFill);
+    if (drawFillPanel_) drawFillPanel_->setVisible(activeTool_ == Tool::DrawFill || activeTool_ == Tool::Lasso);
+    drawOutlineButton_->setVisible(activeTool_ == Tool::DrawFill);
+    fillClosedAreaButton_->setVisible(activeTool_ == Tool::DrawFill);
+    lassoHint_->setVisible(activeTool_ == Tool::Lasso);
     updateAIPromptStatus();
+    const bool manualEdit = activeTool_ == Tool::Brush || activeTool_ == Tool::Eraser ||
+                            activeTool_ == Tool::DrawFill || activeTool_ == Tool::Lasso;
+    constrainEdges_->setVisible(manualEdit);
+    edgePanel_->setVisible(manualEdit && constrainEdges_->isChecked());
     if (!isFill || !algoCombo_) return;
 
     FillAlgorithm algo = static_cast<FillAlgorithm>(algoCombo_->currentIndex());
@@ -1580,8 +1758,8 @@ void MainWindow::updateAIPromptStatus() {
         if (!doc_->hasImage() || doc_->mask().empty()) {
             normalMaskStatus_->setText("No image or mask loaded.");
         } else {
-            int femurCount = cv::countNonZero(doc_->mask() == static_cast<int>(Label::Femur));
-            int tibiaCount = cv::countNonZero(doc_->mask() == static_cast<int>(Label::Tibia));
+            int femurCount = cv::countNonZero(doc_->labelMask(Label::Femur));
+            int tibiaCount = cv::countNonZero(doc_->labelMask(Label::Tibia));
             normalMaskStatus_->setText(QString("Normal mask ready: Femur (%1 px), Tibia (%2 px)")
                 .arg(femurCount).arg(tibiaCount));
         }
@@ -1606,24 +1784,246 @@ void MainWindow::updateStatus() {
         dimLabel_->setText("NO_IMAGE");
 }
 
+bool MainWindow::confirmOpenProcessed(const QString& path) {
+    const QFileInfo file(path);
+    const QString key = file.canonicalFilePath().isEmpty() ? file.absoluteFilePath() : file.canonicalFilePath();
+    if (!processedFiles_.contains(key)) return true;
+    return QMessageBox::question(this, "Already processed this session",
+        QString("%1 was already processed in this session.\nSaved mask: %2\n\nOpen it again?")
+            .arg(file.fileName(), processedFiles_.value(key)),
+        QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) == QMessageBox::Yes;
+}
+
+void MainWindow::markProcessed(const QString& maskPath) {
+    const QFileInfo source(QString::fromStdString(doc_->sourcePath()));
+    const QString key = source.canonicalFilePath().isEmpty() ? source.absoluteFilePath() : source.canonicalFilePath();
+    processedFiles_[key] = QFileInfo(maskPath).absoluteFilePath();
+    QSettings("OrthoSeg", "OrthoSeg").setValue("folders/export", QFileInfo(maskPath).absolutePath());
+}
+
 void MainWindow::onUpload() {
-    QString path = QFileDialog::getOpenFileName(
-        this, "Open X-ray", QString(),
+    QFileDialog dialog(this, "Open X-ray", QSettings("OrthoSeg", "OrthoSeg").value("folders/images").toString(),
         "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)");
+    dialog.setFileMode(QFileDialog::ExistingFile);
+    configureFileBrowser(dialog);
+    new ImageFilePreview(dialog);
+    if (dialog.exec() != QDialog::Accepted) return;
+    const QString path = dialog.selectedFiles().value(0);
     if (path.isEmpty()) return;
+    if (!confirmOpenProcessed(path)) return;
     if (!doc_->loadImage(path.toStdString())) {
         QMessageBox::warning(this, "OrthoSeg", "Failed to load image.");
         return;
     }
+    QSettings("OrthoSeg", "OrthoSeg").setValue("folders/images", QFileInfo(path).absolutePath());
+    const bool wasBatch = batchActive_;
+    if (wasBatch) endBatchMode();
+    finishImageLoad();
+    if (wasBatch) statusBar()->showMessage("Batch mode ended. Select Batch Mode to resume.", 8000);
+}
+
+void MainWindow::finishImageLoad() {
     canvas_->zoomReset();
     ++imageGeneration_;
+    pendingMonaiVersionKey_.clear();
+    pendingMonaiVersion_.clear();
     aiPromptCombo_->setCurrentIndex(0);
     doc_->aiFill().showSecondaryBoxes = aiModelSelector_ && aiModelSelector_->currentIndex() == 2;
     aiShow_->setChecked(true);
+    selectTool(Tool::None);
+    canvas_->setAIPromptEditing(false);
     canvas_->refresh();
     updateAIPromptStatus();
     updateUndoState();
     updateStatus();
+}
+
+void MainWindow::updateBatchUi() {
+    if (!batchModeBtn_ || !exportMaskBtn_) return;
+    if (batchActive_ && batchIndex_ < batchItems_.size()) {
+        const auto& item = batchItems_[batchIndex_];
+        const QString stem = QFileInfo(item.labelPath).completeBaseName();
+        batchModeBtn_->setText(QString("Batch %1/%2").arg(batchIndex_ + 1).arg(batchItems_.size()));
+        batchModeBtn_->setToolTip(QString("Current case: %1\nSaving to: %2\nClick to configure a new batch")
+            .arg(stem, item.outputPath));
+        exportMaskBtn_->setText("Save Mask & Next");
+        exportMaskBtn_->setToolTip(QString("Save %1 and load the next unsaved pair").arg(item.outputPath));
+        setWindowTitle(QString("OrthoSeg — Batch %1/%2 — %3")
+            .arg(batchIndex_ + 1).arg(batchItems_.size()).arg(stem));
+    } else {
+        batchModeBtn_->setText("Batch Mode");
+        batchModeBtn_->setToolTip("Choose X-ray, label-mask, and destination folders for batch editing");
+        exportMaskBtn_->setText("⬇  Export Mask");
+        exportMaskBtn_->setToolTip({});
+        setWindowTitle("OrthoSeg — Medical Imaging");
+    }
+}
+
+void MainWindow::endBatchMode() {
+    batchActive_ = false;
+    batchItems_.clear();
+    batchIndex_ = 0;
+    updateBatchUi();
+}
+
+bool MainWindow::loadBatchItem() {
+    if (!batchActive_ || batchIndex_ >= batchItems_.size()) return false;
+    const auto item = batchItems_[batchIndex_];
+    if (!confirmOpenProcessed(item.imagePath)) { endBatchMode(); return false; }
+    Document next;
+    if (!next.loadImage(item.imagePath.toStdString()) ||
+        !next.importMask(item.labelPath.toStdString())) {
+        endBatchMode();
+        QMessageBox::warning(this, "Batch Mode",
+            QString("Could not load this X-ray and label pair. The mask must match the image size and use exact label values.\n\nX-ray: %1\nLabel: %2")
+                .arg(item.imagePath, item.labelPath));
+        return false;
+    }
+    next.clearUndoHistory();
+    *doc_ = std::move(next);
+    finishImageLoad();
+    updateBatchUi();
+    statusBar()->showMessage(QString("Batch %1/%2: %3")
+        .arg(batchIndex_ + 1).arg(batchItems_.size())
+        .arg(QFileInfo(item.labelPath).fileName()), 8000);
+    return true;
+}
+
+void MainWindow::onBatchMode() {
+    QDialog dlg(this);
+    dlg.setObjectName("batchModeDialog");
+    dlg.setWindowTitle("Batch Mode");
+    dlg.setMinimumWidth(600);
+    dlg.setStyleSheet(
+        "QDialog{ background:#0f172a; color:#e2e8f0; }"
+        "QLineEdit{ background:#1e293b; color:#f1f5f9; border:1px solid #334155;"
+        " border-radius:8px; padding:7px; }"
+        "QPushButton{ background:#1e293b; color:#cbd5e1; border:1px solid #334155;"
+        " border-radius:8px; padding:7px 12px; }"
+        "QPushButton:hover{ background:#334155; }");
+    auto* layout = new QVBoxLayout(&dlg);
+    layout->setContentsMargins(20, 20, 20, 20);
+    layout->setSpacing(12);
+    auto* description = new QLabel(
+        "Label abc.png pairs with X-ray abc_0000.png. Edited masks are saved as abc.png "
+        "in the destination folder. Pairs with an existing destination mask are skipped.", &dlg);
+    description->setWordWrap(true);
+    layout->addWidget(description);
+
+    auto addFolder = [&](const QString& title, const QString& objectName,
+                         const QString& initial) -> QLineEdit* {
+        layout->addWidget(new QLabel(title, &dlg));
+        auto* row = new QHBoxLayout;
+        auto* edit = new QLineEdit(initial, &dlg);
+        edit->setObjectName(objectName);
+        edit->setPlaceholderText("Choose a folder");
+        row->addWidget(edit, 1);
+        auto* browse = new QPushButton("Browse…", &dlg);
+        connect(browse, &QPushButton::clicked, &dlg, [edit, title, &dlg] {
+            const QString chosen = QFileDialog::getExistingDirectory(&dlg, title, edit->text());
+            if (!chosen.isEmpty()) edit->setText(chosen);
+        });
+        row->addWidget(browse);
+        layout->addLayout(row);
+        return edit;
+    };
+    auto* imagesEdit = addFolder("X-ray images folder", "batchImagesDir", batchImagesDir_);
+    auto* labelsEdit = addFolder("Input label masks folder", "batchLabelsDir", batchLabelsDir_);
+    auto* outputEdit = addFolder("Saved masks destination", "batchOutputDir", batchOutputDir_);
+    auto* feedback = new QLabel(&dlg);
+    feedback->setObjectName("batchSetupFeedback");
+    feedback->setWordWrap(true);
+    feedback->setStyleSheet("color:#fbbf24;");
+    layout->addWidget(feedback);
+    auto* buttons = new QHBoxLayout;
+    buttons->addStretch();
+    auto* cancel = new QPushButton("Cancel", &dlg);
+    connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+    buttons->addWidget(cancel);
+    auto* start = new QPushButton("Start / Resume", &dlg);
+    start->setObjectName("batchStartButton");
+    start->setStyleSheet("background:#38bdf8; color:#0f172a; font-weight:700;");
+    buttons->addWidget(start);
+    layout->addLayout(buttons);
+
+    std::vector<BatchItem> selected;
+    QString selectedImages, selectedLabels, selectedOutput;
+    connect(start, &QPushButton::clicked, &dlg, [&] {
+        const QString imagePath = QDir::cleanPath(imagesEdit->text().trimmed());
+        const QString labelPath = QDir::cleanPath(labelsEdit->text().trimmed());
+        const QString outputPath = QDir::cleanPath(outputEdit->text().trimmed());
+        if (imagesEdit->text().trimmed().isEmpty() || labelsEdit->text().trimmed().isEmpty() ||
+            outputEdit->text().trimmed().isEmpty() || !QDir(imagePath).exists() || !QDir(labelPath).exists()) {
+            feedback->setText("Choose existing X-ray and label folders, plus a destination folder.");
+            return;
+        }
+        if (!QDir().mkpath(outputPath)) {
+            feedback->setText("Could not create the destination folder.");
+            return;
+        }
+        if (QDir(labelPath).canonicalPath() == QDir(outputPath).canonicalPath()) {
+            feedback->setText("Choose a destination different from the input label folder.");
+            return;
+        }
+        std::vector<BatchItem> pending;
+        int alreadySaved = 0, missingImages = 0, labelsFound = 0;
+        const QDir imageDir(imagePath), labelDir(labelPath), outputDir(outputPath);
+        for (const QFileInfo& label : labelDir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name)) {
+            if (label.suffix().compare("png", Qt::CaseInsensitive) != 0) continue;
+            ++labelsFound;
+            const QString stem = label.completeBaseName();
+            const QString xray = imageDir.filePath(stem + "_0000.png");
+            const QString saved = outputDir.filePath(stem + ".png");
+            if (!QFileInfo(xray).isFile()) { ++missingImages; continue; }
+            if (QFileInfo::exists(saved)) { ++alreadySaved; continue; }
+            pending.push_back({xray, label.absoluteFilePath(), saved});
+        }
+        if (pending.empty()) {
+            feedback->setText(QString("No unsaved image/label pairs found. Labels: %1; already saved: %2; missing X-rays: %3.")
+                .arg(labelsFound).arg(alreadySaved).arg(missingImages));
+            return;
+        }
+        selected = std::move(pending);
+        selectedImages = imagePath;
+        selectedLabels = labelPath;
+        selectedOutput = outputPath;
+        dlg.accept();
+    });
+
+    if (dlg.exec() != QDialog::Accepted || selected.empty()) return;
+    batchImagesDir_ = selectedImages;
+    batchLabelsDir_ = selectedLabels;
+    batchOutputDir_ = selectedOutput;
+    batchItems_ = std::move(selected);
+    batchIndex_ = 0;
+    batchActive_ = true;
+    loadBatchItem();
+}
+
+void MainWindow::onImportMask() {
+    if (!doc_->hasImage()) {
+        QMessageBox::information(this, "Import Mask", "Open an X-ray before importing a mask.");
+        return;
+    }
+    const QString path = browseFile(this, "Import Mask", QSettings("OrthoSeg", "OrthoSeg").value("folders/masks", QFileInfo(QString::fromStdString(doc_->sourcePath())).absolutePath()).toString(),
+        "Lossless masks (*.png *.bmp *.tif *.tiff)");
+    if (path.isEmpty()) return;
+    if (!doc_->importMask(path.toStdString())) {
+        QMessageBox::warning(this, "Import Mask",
+            "Mask must match the X-ray size and contain exact RGB channel labels "
+            "(R=1 Femur, G=2 Tibia, B=3 Fibula), or grayscale labels 0–3.");
+        return;
+    }
+    QSettings("OrthoSeg", "OrthoSeg").setValue("folders/masks", QFileInfo(path).absolutePath());
+    ++imageGeneration_;
+    doc_->aiFill().resultMask.release();
+    doc_->aiFill().resultReplacesAnatomy = false;
+    pendingMonaiVersionKey_.clear();
+    pendingMonaiVersion_.clear();
+    canvas_->update();
+    updateUndoState();
+    updateAIPromptStatus();
+    statusBar()->showMessage("Mask imported. Overlapping labels are preserved.", 5000);
 }
 
 void MainWindow::onExport() {
@@ -1631,17 +2031,101 @@ void MainWindow::onExport() {
         QMessageBox::information(this, "OrthoSeg", "Load an image first.");
         return;
     }
+    if (!doc_->aiFill().resultMask.empty()) {
+        QMessageBox::information(this, "Export Mask",
+            "Apply or clear the AI segmentation preview before saving this mask.");
+        return;
+    }
+    if (batchActive_) {
+        if (batchIndex_ >= batchItems_.size()) { endBatchMode(); return; }
+        const QString savedPath = batchItems_[batchIndex_].outputPath;
+        if (QFileInfo::exists(savedPath)) {
+            endBatchMode();
+            QMessageBox::warning(this, "Batch Mode",
+                "A saved mask appeared for the current case, so batch mode stopped without overwriting it. Select Batch Mode to resume.");
+            return;
+        }
+        std::vector<uchar> encoded;
+        bool encodedOkay = false;
+        try { encodedOkay = cv::imencode(".png", doc_->maskChannels(), encoded); }
+        catch (const cv::Exception&) {
+            QMessageBox::warning(this, "Batch Mode", "Could not encode the current mask as PNG.");
+            return;
+        }
+        if (!encodedOkay || encoded.empty()) {
+            QMessageBox::warning(this, "Batch Mode", "Could not encode the current mask as PNG.");
+            return;
+        }
+        QSaveFile file(savedPath);
+        if (!file.open(QIODevice::WriteOnly) ||
+            file.write(reinterpret_cast<const char*>(encoded.data()), qint64(encoded.size())) != qint64(encoded.size()) ||
+            !file.commit()) {
+            QMessageBox::warning(this, "Batch Mode", "Could not save the mask to:\n" + savedPath);
+            return;
+        }
+        markProcessed(savedPath);
+        offerMonaiTraining();
+        ++batchIndex_;
+        while (batchIndex_ < batchItems_.size() &&
+               QFileInfo::exists(batchItems_[batchIndex_].outputPath)) ++batchIndex_;
+        if (batchIndex_ >= batchItems_.size()) {
+            const auto count = batchItems_.size();
+            endBatchMode();
+            statusBar()->showMessage(QString("Batch complete: %1 masks saved. Select Batch Mode to start another batch.")
+                .arg(count), 12000);
+        } else {
+            loadBatchItem();
+        }
+        return;
+    }
     QFileDialog dialog(this, "Export Mask");
+    configureFileBrowser(dialog);
     dialog.setAcceptMode(QFileDialog::AcceptSave);
     dialog.setNameFilter("PNG (*.png)");
     dialog.setDefaultSuffix("png");
-    dialog.selectFile("bone_segmentation_mask.png");
+    const QFileInfo source(QString::fromStdString(doc_->sourcePath()));
+    QString stem = source.completeBaseName();
+    stem.remove(QRegularExpression("_[0-9]{4}$"));
+    if (stem.isEmpty()) stem = source.completeBaseName();
+    const auto savedFolder = QSettings("OrthoSeg", "OrthoSeg").value("folders/export", source.absolutePath()).toString();
+    dialog.setDirectory(QDir(savedFolder).exists() ? savedFolder : source.absolutePath());
+    dialog.selectFile(stem + ".png");
+    auto* destination = new QLineEdit(dialog.directory().absolutePath(), &dialog);
+    destination->setObjectName("exportDestinationFolder");
+    destination->setToolTip("Type or paste an existing destination folder. You can also enter a full path in File name.");
+    auto* grid = qobject_cast<QGridLayout*>(dialog.layout());
+    if (grid) {
+        const int row = grid->rowCount();
+        grid->addWidget(new QLabel("Destination folder:", &dialog), row, 0);
+        grid->addWidget(destination, row, 1, 1, grid->columnCount() - 1);
+    }
+    connect(destination, &QLineEdit::textChanged, &dialog, [&dialog](const QString& text) {
+        const QString folder = text.trimmed();
+        if (!folder.isEmpty() && QDir(folder).exists() && QDir(folder).absolutePath() != dialog.directory().absolutePath()) {
+            const QString name = QFileInfo(dialog.selectedFiles().value(0)).fileName();
+            dialog.setDirectory(folder);
+            if (!name.isEmpty()) dialog.selectFile(name);
+        }
+    });
+    connect(&dialog, &QFileDialog::directoryEntered, destination, [destination](const QString& folder) {
+        const QSignalBlocker blocker(destination);
+        destination->setText(folder);
+    });
     if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) return;
     const QString path = dialog.selectedFiles().first();
+    if (!QDir(destination->text().trimmed()).exists()) {
+        QMessageBox::warning(this, "Export Mask", "The destination folder does not exist. Choose or create a folder before saving.");
+        return;
+    }
+    if (QFileInfo(path).canonicalFilePath() == source.canonicalFilePath() && source.exists()) {
+        QMessageBox::warning(this, "Export Mask", "Choose a different folder or filename so the mask does not overwrite the source X-ray.");
+        return;
+    }
     if (!doc_->exportMask(path.toStdString())) {
         QMessageBox::warning(this, "OrthoSeg", "Failed to export mask.");
         return;
     }
+    markProcessed(path);
     offerMonaiTraining();
 }
 
@@ -1686,6 +2170,7 @@ void MainWindow::checkMonaiStatus() {
     if (modelManagement_) modelManagement_->setBackendUrl(base);
     monaiReady_ = false;
     managementButton_->setEnabled(false);
+    managementButton_->hide();
     if (managementAction_) managementAction_->setEnabled(false);
     monaiStatus_->setStyleSheet("color:#fbbf24;");
     monaiStatus_->setText("● Checking MONAI service…");
@@ -1711,6 +2196,7 @@ void MainWindow::checkMonaiStatus() {
         if (revision != monaiCheckSerial_) return;
         const bool allowed = error.isEmpty() && value.value("backend").toObject().value("status").toString() == "ok";
         managementButton_->setEnabled(allowed);
+        managementButton_->setVisible(allowed);
         if (managementAction_) managementAction_->setEnabled(allowed);
         managementButton_->setToolTip(allowed ? "Open MONAI model management" :
             "Model management is unavailable or not enabled on this backend");
@@ -1730,13 +2216,15 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
         const auto mapping = editorMonaiLabels();
         const auto original = sourcePng(*doc_);
         QJsonArray femurBox, tibiaBox;
+        cv::Mat maskPrompt;
+        int promptLabel = 0;
         auto boxJson = [this](const std::optional<Box>& box) {
             if (!box) return QJsonArray{};
             const auto b = validatedBox(*box, doc_->mask().size());
             return QJsonArray{int(std::floor(b.x0)), int(std::floor(b.y0)),
                               int(std::ceil(b.x1)), int(std::ceil(b.y1))};
         };
-        if (prompted) {
+        if (prompted && doc_->aiFill().promptType == AIFillPromptType::BoundingBox) {
             femurBox = boxJson(doc_->aiFill().femurBox);
             tibiaBox = boxJson(doc_->aiFill().tibiaBox);
             const auto femurSecond = boxJson(doc_->aiFill().femurBox2);
@@ -1746,12 +2234,27 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
             if (femurBox.isEmpty() && tibiaBox.isEmpty())
                 throw std::runtime_error("Draw a Femur or Tibia box before running MONAI SAM2.");
         }
+        if (prompted && doc_->aiFill().promptType != AIFillPromptType::BoundingBox) {
+            if (activeLabel_ != Label::Femur && activeLabel_ != Label::Tibia)
+                throw std::runtime_error("Select Femur or Tibia for refinement.");
+            const auto binary = doc_->aiFill().promptMask;
+            if (binary.empty() || !cv::countNonZero(binary))
+                throw std::runtime_error("Paint or load a non-empty mask for the selected bone first.");
+            promptLabel = static_cast<int>(activeLabel_);
+            maskPrompt = cv::Mat::zeros(binary.size(), CV_8UC3);
+            cv::Mat channel(binary.size(), CV_8UC1, cv::Scalar(0));
+            channel.setTo(promptLabel, binary != 0);
+            cv::insertChannel(channel, maskPrompt, 3 - promptLabel);
+        }
         const auto caseId = monaiCaseId(original);
         const auto versionKey = monai_->baseUrl().toString().toUtf8() + ':' + caseId;
-        if (cv::countNonZero((doc_->mask() == mapping.femur) | (doc_->mask() == mapping.tibia)) &&
+        if (cv::countNonZero(doc_->labelMask(Label::Femur) | doc_->labelMask(Label::Tibia)) &&
             QMessageBox::question(this, "AI Segment", "AI Segment will replace the current Femur/Tibia segmentation.\nContinue?",
                                   QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
         const auto before = doc_->mask().clone();
+        const auto beforeChannels = doc_->maskChannels().clone();
+        const auto beforeFemur = doc_->labelMask(Label::Femur);
+        const auto beforeTibia = doc_->labelMask(Label::Tibia);
         const auto generation = imageGeneration_;
         monai_->setBaseUrl(QUrl(monaiUrl_->text().trimmed()));
         const auto urlRevision = monaiCheckSerial_;
@@ -1761,8 +2264,9 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
         aiRun_->setEnabled(false);
         aiStatus_->setText("Checking MONAI service…");
         statusBar()->showMessage("Checking MONAI service…");
-        monai_->health([this, original, before, generation, caseId, versionKey, mapping, urlRevision,
-                        prompted, nnunet, femurBox, tibiaBox](const QJsonObject& health, const QString& healthError) {
+        monai_->health([this, original, before, beforeChannels, beforeFemur, beforeTibia,
+                        generation, caseId, versionKey, mapping, urlRevision,
+                        prompted, nnunet, femurBox, tibiaBox, maskPrompt, promptLabel](const QJsonObject& health, const QString& healthError) {
             if (urlRevision != monaiCheckSerial_) {
                 monaiRequestPending_ = false;
                 monaiSegment_->setEnabled(true);
@@ -1791,8 +2295,9 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
             statusBar()->showMessage("MONAI AI Segment is running…");
             aiStatus_->setText("MONAI segmentation is running…");
             try {
-                auto done = [this, before, generation, caseId, versionKey, mapping, urlRevision,
-                             prompted, femurBox, tibiaBox](const cv::Mat& canonical, const QString& version, const QString& error) {
+                auto done = [this, before, beforeChannels, beforeFemur, beforeTibia,
+                             generation, caseId, versionKey, mapping, urlRevision,
+                             prompted, femurBox, tibiaBox, promptLabel](const cv::Mat& canonical, const QString& version, const QString& error) {
                 monaiRequestPending_ = false;
                 monaiSegment_->setEnabled(true);
                 monaiSegment_->setText("AI Segment");
@@ -1801,8 +2306,8 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
                 if (urlRevision != monaiCheckSerial_) { aiStatus_->setText("MONAI URL changed. Result discarded."); checkMonaiStatus(); return; }
                 if (!error.isEmpty()) { aiStatus_->setText("MONAI segmentation failed."); QMessageBox::warning(this, "AI Segment", error); return; }
                 // Editing remains responsive; never overwrite edits made during inference.
-                if (generation != imageGeneration_ || doc_->mask().size() != before.size() ||
-                    cv::norm(doc_->mask(), before, cv::NORM_INF) != 0 || aiController_->running() ||
+                if (generation != imageGeneration_ || doc_->maskChannels().size() != beforeChannels.size() ||
+                    cv::norm(doc_->maskChannels(), beforeChannels, cv::NORM_INF) != 0 || aiController_->running() ||
                     !doc_->aiFill().resultMask.empty() || (doc_->originalPng().empty() || monaiCaseId(sourcePng(*doc_)) != caseId)) {
                     QMessageBox::information(this, "AI Segment", "Result discarded because the image or annotation changed. Run AI Segment again when ready.");
                     aiStatus_->setText("MONAI result discarded after annotation changed.");
@@ -1810,17 +2315,26 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
                 }
                 try {
                     cv::Mat result = canonical.clone();
-                    if (prompted && femurBox.isEmpty()) {
-                        result.setTo(0, result == 1);
-                        result.setTo(1, before == mapping.femur);
-                    }
-                    if (prompted && tibiaBox.isEmpty()) {
-                        result.setTo(0, result == 2);
-                        result.setTo(2, before == mapping.tibia);
+                    if (prompted) {
+                        if (result.type() == CV_8UC1) {
+                            cv::Mat channels = cv::Mat::zeros(result.size(), CV_8UC3);
+                            cv::Mat femur = (result == 1) / 255;
+                            cv::Mat tibia = (result == 2) / 255 * 2;
+                            cv::insertChannel(femur, channels, 2);
+                            cv::insertChannel(tibia, channels, 1);
+                            result = channels;
+                        }
+                        if (promptLabel ? promptLabel != 1 : femurBox.isEmpty()) {
+                            cv::Mat femur = beforeFemur / 255;
+                            cv::insertChannel(femur, result, 2);
+                        }
+                        if (promptLabel ? promptLabel != 2 : tibiaBox.isEmpty()) {
+                            cv::Mat tibia = beforeTibia / 255 * 2;
+                            cv::insertChannel(tibia, result, 1);
+                        }
                     }
                     auto preview = fromMonaiLabels(result, mapping);
-                    if (preview.empty() || preview.size() != before.size() || preview.type() != CV_8UC1 ||
-                        cv::countNonZero(preview > 2))
+                    if (preview.empty() || preview.size() != before.size())
                         throw std::runtime_error("MONAI returned an invalid mask. Annotation is unchanged.");
                     doc_->aiFill().resultMask = std::move(preview);
                     doc_->aiFill().resultReplacesAnatomy = true;
@@ -1837,7 +2351,7 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
                     QMessageBox::warning(this, "AI Segment", QString::fromUtf8(e.what()));
                 }
                     };
-                if (prompted) monai_->segmentPrompted(original, {before.cols, before.rows}, femurBox, tibiaBox, done);
+                if (prompted) monai_->segmentPrompted(original, {before.cols, before.rows}, femurBox, tibiaBox, done, maskPrompt);
                 else if (nnunet) monai_->segmentNnUnet(original, {before.cols, before.rows}, done);
                 else monai_->segment(original, {before.cols, before.rows}, done);
             } catch (const std::exception& e) {
@@ -1861,6 +2375,15 @@ void MainWindow::startMonaiSegment(bool prompted, bool nnunet) {
     }
 }
 
+void MainWindow::recordAppliedMonaiResult() {
+    if (!doc_->aiFill().resultMask.empty()) return;
+    if (!pendingMonaiVersionKey_.isEmpty())
+        monaiVersions_[pendingMonaiVersionKey_] = pendingMonaiVersion_;
+    pendingMonaiVersionKey_.clear();
+    pendingMonaiVersion_.clear();
+    updateUndoState();
+}
+
 void MainWindow::offerMonaiTraining() {
     // Export has already succeeded; this optional operation never modifies it.
     if (doc_->originalPng().empty() || monai_->uploadRunning() || monaiRequestPending_ || monai_->segmentRunning()) return;
@@ -1869,8 +2392,8 @@ void MainWindow::offerMonaiTraining() {
         const auto original = sourcePng(*doc_);
         const auto caseId = monaiCaseId(original);
         const auto versionKey = monai_->baseUrl().toString().toUtf8() + ':' + caseId;
-        const auto canonical = toMonaiLabels(doc_->mask(), editorMonaiLabels());
-        if (!cv::countNonZero(canonical) && !monaiVersions_.contains(versionKey)) return;
+        const auto canonical = toMonaiLabels(doc_->monaiAnatomyMask(), editorMonaiLabels());
+        if (!cv::countNonZero(canonical.reshape(1)) && !monaiVersions_.contains(versionKey)) return;
         key = versionKey + ':' + monaiCaseId(encodeMonaiMask(canonical));
         if (monaiPrompted_.contains(key)) return;
         QMessageBox prompt(QMessageBox::Question, "Add to AI Training",
@@ -1884,7 +2407,7 @@ void MainWindow::offerMonaiTraining() {
         if (!monaiVersions_.contains(versionKey)) monaiVersions_.insert(versionKey, {});
         if (prompt.clickedButton() != add) return;
         // Read the current editable annotation, never a cached MONAI prediction.
-        const auto corrected = toMonaiLabels(doc_->mask(), editorMonaiLabels());
+        const auto corrected = toMonaiLabels(doc_->monaiAnatomyMask(), editorMonaiLabels());
         monai_->submitTrainingCase(original, corrected, QFileInfo(QString::fromStdString(doc_->sourcePath())).fileName(),
             monaiVersions_.value(versionKey), [this, key](const QJsonObject& response, const QString& error) {
                 if (!error.isEmpty()) {
@@ -1895,11 +2418,51 @@ void MainWindow::offerMonaiTraining() {
                 }
                 statusBar()->showMessage(QString("Corrected segmentation added to AI training data. New cases awaiting training: %1")
                     .arg(response.value("new_cases_since_last_training").toInt()), 12000);
+                offerFineTuningReminder();
             });
     } catch (const std::exception& e) {
         monaiPrompted_.remove(key);
         QMessageBox::warning(this, "AI Training", "Segmentation was saved successfully, but it could not be added to AI training.\n" + QString::fromUtf8(e.what()));
     }
+}
+
+void MainWindow::offerFineTuningReminder() {
+    if (fineTuningReminderPending_) return;
+    QSettings settings("OrthoSeg", "OrthoSeg");
+    const auto family = settings.value("training/reminderModel", "unet").toString();
+    const int threshold = settings.value("training/reminderCases/" + family, 0).toInt();
+    if (threshold <= 0 || (family != "unet" && family != "medsam2")) return;
+    const auto base = monai_->baseUrl();
+    fineTuningReminderPending_ = true;
+    monai_->managementStatus([this, family, threshold, base](const QJsonObject& state, const QString& error) {
+        fineTuningReminderPending_ = false;
+        if (!error.isEmpty() || monai_->baseUrl() != base || state["training_active"].toBool() ||
+            !state["can_start"].toBool()) return;
+        QSettings settings("OrthoSeg", "OrthoSeg");
+        if (settings.value("training/reminderModel", "unet").toString() != family ||
+            settings.value("training/reminderCases/" + family, 0).toInt() != threshold) return;
+        const auto dataset = state["dataset"].toObject();
+        const int count = dataset["new_cases_since_last_training"].toInt();
+        if (count < threshold) return;
+        const auto token = base.toString() + "|" + dataset["latest_candidate_version"].toString() +
+            "|" + QString::number(threshold) + "|" + QString::number(count / threshold);
+        const auto key = "training/reminderLast/" + family;
+        if (settings.value(key).toString() == token) return;
+        settings.setValue(key, token);
+        fineTuningReminderPending_ = true;
+        const auto answer = QMessageBox::question(this, "Fine-tuning Reminder",
+            QString("%1 new or revised cases are awaiting %2 fine-tuning. Your reminder threshold is %3.\n\nOpen Model Management to review the dataset and start fine-tuning?")
+                .arg(count).arg(family == "medsam2" ? "MedSAM2" : "UNet").arg(threshold),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        fineTuningReminderPending_ = false;
+        if (answer != QMessageBox::Yes || monai_->baseUrl() != base) return;
+        if (!modelManagement_) modelManagement_ = new ModelManagementDialog(this, base);
+        else modelManagement_->setBackendUrl(base);
+        modelManagement_->selectModel(family);
+        modelManagement_->show();
+        modelManagement_->raise();
+        modelManagement_->activateWindow();
+    }, family);
 }
 
 void MainWindow::onClear() {

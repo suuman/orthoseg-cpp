@@ -6,7 +6,9 @@
 #include <QSet>
 #include <QHash>
 #include <QMainWindow>
+#include <QString>
 #include <memory>
+#include <vector>
 
 class QPushButton;
 class QSlider;
@@ -37,7 +39,10 @@ public:
     QDialog* claheDialog() const { return claheDialog_; }
 
 private slots:
+    void offerFineTuningReminder();
     void onUpload();
+    void onBatchMode();
+    void onImportMask();
     void onMonaiSegment();
     void onExport();
     void onClear();
@@ -55,6 +60,12 @@ private slots:
     void selectTool(Tool t);
 
 private:
+    bool confirmOpenProcessed(const QString& path);
+    void markProcessed(const QString& maskPath);
+    QHash<QString, QString> processedFiles_;
+    struct ToolSettings { int size = 20; int edge = 30; bool constrained = false; };
+    std::array<ToolSettings, 7> toolSettings_;
+    void recordAppliedMonaiResult();
     void offerMonaiTraining();
     void startMonaiSegment(bool prompted, bool nnunet = false);
     void checkMonaiStatus();
@@ -66,6 +77,22 @@ private:
     void updateUndoState();
     void updateStatus();
     void updateAIPromptStatus();
+    void finishImageLoad();
+    bool loadBatchItem();
+    void endBatchMode();
+    void updateBatchUi();
+
+    struct BatchItem {
+        QString imagePath;
+        QString labelPath;
+        QString outputPath;
+    };
+    std::vector<BatchItem> batchItems_;
+    size_t batchIndex_ = 0;
+    bool batchActive_ = false;
+    QString batchImagesDir_;
+    QString batchLabelsDir_;
+    QString batchOutputDir_;
 
     ModelManagementDialog* modelManagement_ = nullptr;
     std::unique_ptr<Document> doc_;
@@ -91,6 +118,7 @@ private:
     unsigned monaiCheckSerial_ = 0;
     bool monaiRequestPending_ = false;
     bool monaiReady_ = false;
+    bool fineTuningReminderPending_ = false;
     QHash<QByteArray, QString> monaiVersions_;
     QByteArray pendingMonaiVersionKey_;
     QString pendingMonaiVersion_;
@@ -99,11 +127,13 @@ private:
 
     // Sidebar controls kept for state updates.
     QWidget* labelButtons_[4] = {nullptr, nullptr, nullptr, nullptr};
-    QWidget* toolButtons_[4]  = {nullptr, nullptr, nullptr, nullptr};
+    QWidget* toolButtons_[6]  = {};
     QWidget* aiPanel_ = nullptr;
     QComboBox* aiPromptCombo_ = nullptr;
     QLineEdit* aiModels_ = nullptr;
     QPushButton* modelDirBtn_ = nullptr;
+    QPushButton* batchModeBtn_ = nullptr;
+    QPushButton* exportMaskBtn_ = nullptr;
     QCheckBox* claheCheck_ = nullptr;
     QPushButton* claheSettingsBtn_ = nullptr;
     QDialog* claheDialog_ = nullptr;
@@ -131,9 +161,17 @@ private:
     std::unique_ptr<AIFillController> aiController_;
     unsigned long imageGeneration_ = 0;
     unsigned long submittedGeneration_ = 0;
+    std::vector<int> submittedLabels_;
     QWidget* brushPanel_ = nullptr;
     QWidget* fillPanel_  = nullptr;
+    QWidget* drawFillPanel_ = nullptr;
+    void setFillOutlineHighlight(bool highlighted);
+    QPushButton* fillOutlineButton_ = nullptr;
+    QPushButton* drawOutlineButton_ = nullptr;
+    QPushButton* fillClosedAreaButton_ = nullptr;
+    QLabel* lassoHint_ = nullptr;
     QWidget* intensityPanel_ = nullptr;
+    QCheckBox* constrainEdges_ = nullptr;
     QWidget* edgePanel_  = nullptr;
     QWidget* betaPanel_  = nullptr;   // scribble algos: edge sensitivity
     QWidget* seedPanel_  = nullptr;   // scribble algos: hint + Run/Clear Seeds
@@ -158,7 +196,7 @@ private:
     QLabel* zoomLabel_ = nullptr;
     QLabel* dimLabel_ = nullptr;
 
-    Tool  activeTool_ = Tool::Brush;
+    Tool  activeTool_ = Tool::None;
     Label activeLabel_ = Label::Femur;
 };
 
