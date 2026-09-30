@@ -1,5 +1,6 @@
 #pragma once
 #include "Labels.h"
+#include <functional>
 #include <opencv2/core.hpp>
 
 namespace orthoseg {
@@ -48,16 +49,18 @@ constexpr uchar kNoSeed = 255;
 // g = exp(-beta*(Ip-Iq)^2); p is converted if the attack exceeds its own
 // strength. Iterates to convergence. Writes a full labeling into `outMask`.
 void growCutFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
-                      cv::Mat& outMask, double beta, int maxIters = -1);
+                      cv::Mat& outMask, double beta, int maxIters = -1, const std::function<bool()>& cancelled = {});
 
 // E. Random walker — for each seeded label, solve the weighted Dirichlet
 // (harmonic) problem with that label's seeds held at 1 and all other seeds at
 // 0; edge weights w = exp(-beta*(Ip-Iq)^2). The value at a pixel is the
 // probability a random walker from it reaches a same-label seed first; each
-// pixel is assigned the argmax label. Solved by SOR relaxation. Full labeling.
+// pixel is assigned the argmax label. Solved by preconditioned conjugate gradients with checked residual.
+// Throws on non-convergence or cancellation; output is unchanged on failure.
 void randomWalkerFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
                            cv::Mat& outMask, double beta,
-                           int maxIters = 500, double tol = 1e-3);
+                           int maxIters = 4000, double tol = 1e-8,
+                           const std::function<bool()>& cancelled = {});
 
 // F. Graph cut — OpenCV grabCut (color GMMs + min-cut/max-flow). The active
 // `foreground` label's scribbles become hard foreground, every other scribble

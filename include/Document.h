@@ -27,6 +27,7 @@ public:
     int  width()  const { return sourceGray_.cols; }
     int  height() const { return sourceGray_.rows; }
 
+    const cv::Mat& sourceOriginal() const { return sourceOriginal_; }
     const cv::Mat& sourceGray() const { return sourceGray_; }
     const cv::Mat& sourceColor() const { return sourceColor_; }
     const cv::Mat& mask() const { return mask_; }
@@ -45,6 +46,7 @@ public:
     void paintLine(cv::Point a, cv::Point b, Label label, int brushSize, const cv::Mat& allowed = {});
     void eraseLabelLine(cv::Point a, cv::Point b, Label label, int brushSize, const cv::Mat& allowed = {});
     void fillPolygon(const std::vector<cv::Point>& points, Label label, bool recordHistory = true, const cv::Mat& allowed = {});
+    bool fillEnclosedHoles(Label label, int maxPixels = 0);
     bool fillEnclosedAt(cv::Point seed, Label label, const cv::Mat& allowed = {});
     // Binary connected region bounded by source-image edges; zero when seed lies on an edge.
     cv::Mat edgeRegion(cv::Point seed, int threshold) const;
@@ -70,7 +72,9 @@ public:
     // Creates its own undo snapshot on success. Failure leaves mask/history
     // unchanged (including when downscaling loses a seed label). GraphCut
     // requires a bone foreground label; all methods need two seed labels.
-    bool runSeedSegmentation(FillAlgorithm algo, Label foreground, double beta);
+    bool runSeedSegmentation(FillAlgorithm algo, Label foreground, double beta, const std::function<bool()>& cancelled = {}, bool restrictToSeeds = false);
+    Document segmentationCopy() const;
+    void applySegmentationChannels(const cv::Mat& channels);
 
     // Undo support: caller pushes a snapshot before a mutating gesture begins,
     // except runSeedSegmentation(), which records its own successful mutation.
@@ -89,6 +93,7 @@ private:
 
     std::vector<unsigned char> originalPng_;
     std::string sourcePath_;
+    cv::Mat sourceOriginal_; // Original precision, separate from normalized working image.
     cv::Mat sourceGray_;   // CV_8UC1
     cv::Mat sourceColor_;  // CV_8UC3 (BGR) for display
     cv::Mat channels_;     // CV_8UC3, BGR discrete labels; overlap is independent.

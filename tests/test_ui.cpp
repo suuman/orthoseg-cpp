@@ -3,6 +3,8 @@
 #include "FileBrowser.h"
 #include "ImageFilePreview.h"
 #include <QToolButton>
+#include <QDialogButtonBox>
+#include <QProgressDialog>
 #include <QElapsedTimer>
 #include <QThread>
 #include <QKeyEvent>
@@ -136,6 +138,12 @@ int main(int argc, char** argv) {
           window.findChild<QPushButton*>("fillClosedAreaButton")->isVisible() &&
           window.findChild<QPushButton*>("fillOutlineButton")->isVisible(),
           "Draw & Fill exposes outline and enclosed-hole controls");
+    window.document()->fillPolygon({{2, 2}, {8, 2}, {8, 8}, {2, 8}}, Label::Femur);
+    window.document()->fillPolygon({{3, 3}, {7, 3}, {7, 7}, {3, 7}}, Label::Background);
+    window.canvas()->setActiveLabel(Label::Femur);
+    window.findChild<QPushButton*>("fillClosedAreaButton")->click();
+    CHECK(window.document()->labelMask(Label::Femur).at<uchar>(5,5),
+          "Fill Closed Area button fills mask holes immediately without a canvas click");
     lassoTool->click();
     CHECK(window.findChild<QPushButton*>("fillOutlineButton")->isVisible(),
           "Lasso exposes a fill-outline action");
@@ -683,6 +691,45 @@ int main(int argc, char** argv) {
                   "tool gesture respects edge opt-in and freehand opt-out");
         }
     }
+    // Undo must clear both painted pixels and the transient trace, including mid-stroke.
+    canvas.setAutoFillOutline(false);canvas.setEdgeConstrained(false);
+    canvas.setActiveTool(Tool::DrawFill);canvas.setDrawFillHoles(false);doc.clearMask();doc.clearUndoHistory();
+    mouse(QEvent::MouseButtonPress, sourcePoint(6,7),Qt::LeftButton,Qt::LeftButton);
+    mouse(QEvent::MouseMove,sourcePoint(17,7),Qt::NoButton,Qt::LeftButton);
+    mouse(QEvent::MouseMove,sourcePoint(17,12),Qt::NoButton,Qt::LeftButton);
+    canvas.undoLastEdit();
+    mouse(QEvent::MouseButtonRelease,sourcePoint(6,12),Qt::LeftButton,Qt::NoButton);
+    canvas.fillCurrentOutline();
+    CHECK(cv::countNonZero(doc.mask())==0,"Undo removes draw stroke and its preview; late release cannot redraw it");
+    mouse(QEvent::MouseButtonPress,sourcePoint(6,7),Qt::LeftButton,Qt::LeftButton);
+    mouse(QEvent::MouseMove,sourcePoint(7,7),Qt::NoButton,Qt::LeftButton);
+    mouse(QEvent::MouseMove,sourcePoint(17,7),Qt::NoButton,Qt::NoButton);
+    mouse(QEvent::MouseButtonRelease,sourcePoint(17,7),Qt::LeftButton,Qt::NoButton);
+    CHECK(doc.mask().at<uchar>(7,15)==0,"lost mouse release does not draw a straight line on later hover");
+    canvas.undoLastEdit();
+    CHECK(cv::countNonZero(doc.mask())==0,"interrupted stroke remains undoable");
+    for(auto tool:{Tool::DrawFill,Tool::Lasso}) {
+        doc.clearMask();canvas.setActiveTool(tool);canvas.setEdgeConstrained(true);
+        mouse(QEvent::MouseButtonPress,sourcePoint(6,7),Qt::LeftButton,Qt::LeftButton);
+        mouse(QEvent::MouseMove,sourcePoint(17,7),Qt::NoButton,Qt::LeftButton);
+        mouse(QEvent::MouseMove,sourcePoint(17,12),Qt::NoButton,Qt::LeftButton);
+        mouse(QEvent::MouseMove,sourcePoint(6,12),Qt::NoButton,Qt::LeftButton);
+        mouse(QEvent::MouseButtonRelease,sourcePoint(6,7),Qt::LeftButton,Qt::NoButton);
+        canvas.fillCurrentOutline();
+        CHECK(doc.mask().at<uchar>(10,7)==1 && (doc.mask().at<uchar>(10,17)!=0)==(tool==Tool::DrawFill),
+              "Draw & Fill filling ignores image edges; Lasso honors its edge constraint");
+    }
+    doc.clearMask();doc.clearUndoHistory();canvas.setActiveTool(Tool::DrawFill);canvas.setEdgeConstrained(false);
+    doc.aiFill().resultMask=cv::Mat::zeros(doc.mask().size(),CV_8U);
+    doc.aiFill().resultMask.at<uchar>(2,2)=1;doc.aiFill().resultLabels={1};
+    mouse(QEvent::MouseButtonPress,sourcePoint(6,7),Qt::LeftButton,Qt::LeftButton);
+    mouse(QEvent::MouseMove,sourcePoint(17,7),Qt::NoButton,Qt::LeftButton);
+    mouse(QEvent::MouseButtonRelease,sourcePoint(17,7),Qt::LeftButton,Qt::NoButton);
+    CHECK(doc.aiFill().resultMask.empty() && doc.mask().at<uchar>(2,2)==1,"draw stroke auto-applies pending AI result");
+    canvas.undoLastEdit();
+    CHECK(doc.mask().at<uchar>(2,2)==1 && doc.mask().at<uchar>(7,10)==0,"first Undo removes manual stroke and retains applied AI mask");
+    canvas.undoLastEdit();CHECK(cv::countNonZero(doc.mask())==0,"second Undo removes the AI application");
+    canvas.setAutoFillOutline(true);
     canvas.setPanMode(true);
     const auto beforePan = canvas.imageRect();
     const auto beforeMask = doc.maskChannels().clone();
@@ -966,6 +1013,46 @@ int main(int argc, char** argv) {
     CHECK(saveBrowser.findChild<QToolButton*>("forwardButton")->isEnabled(), "save dialog child arrow remains enabled");
     saveBrowser.close();
 
+    // Run the real background workflow and reject/apply its proposed result.
+    freshSession.showFillAlgorithm(4);
+    freshSession.document()->clearSeeds();
+    freshSession.document()->paintSeedLine({1,1},{1,1},Label::Femur,1);
+    freshSession.document()->paintSeedLine({18,18},{18,18},Label::Background,1);
+    const auto beforeSeedRun=freshSession.document()->maskChannels().clone();
+    bool sawPreview=false, sawProgress=false, applySeed=false;
+    QTimer seedDialogs;
+    QObject::connect(&seedDialogs,&QTimer::timeout,&freshSession,[&]{
+        auto* dialog=qobject_cast<QDialog*>(QApplication::activeModalWidget());
+        if(!dialog)return;
+        if(dialog->objectName()=="seedSegmentationProgress")sawProgress=true;
+        if(dialog->objectName()=="seedSegmentationPreview"){
+            sawPreview=true;if(applySeed)dialog->accept();else dialog->reject();
+        }
+        if(auto* message=qobject_cast<QMessageBox*>(dialog)){CHECK(false,"background segmentation should succeed");message->accept();}
+    });seedDialogs.start(1);
+    QMetaObject::invokeMethod(&freshSession,"onRunSegmentation",Qt::DirectConnection);
+    CHECK(sawPreview && cv::norm(beforeSeedRun,freshSession.document()->maskChannels(),cv::NORM_INF)==0,
+          "discarding asynchronous segmentation preview preserves the mask");
+    applySeed=true;sawPreview=false;
+    QMetaObject::invokeMethod(&freshSession,"onRunSegmentation",Qt::DirectConnection);
+    CHECK(sawPreview && freshSession.document()->labelMask(Label::Femur).at<uchar>(1,1),"applying preview commits worker result");
+    freshSession.document()->undo();
+    CHECK(cv::norm(beforeSeedRun,freshSession.document()->maskChannels(),cv::NORM_INF)==0,"applied worker result is one undo step");
+    seedDialogs.stop();
+    QTimer::singleShot(0,&freshSession,[&]{
+        if(auto* progress=qobject_cast<QProgressDialog*>(QApplication::activeModalWidget()))progress->reject();
+    });
+    QMetaObject::invokeMethod(&freshSession,"onRunSegmentation",Qt::DirectConnection);
+    CHECK(cv::norm(beforeSeedRun,freshSession.document()->maskChannels(),cv::NORM_INF)==0,"cancelling worker leaves the mask unchanged");
+    freshSession.document()->clearMask();freshSession.document()->clearUndoHistory();
+    freshSession.document()->aiFill().resultMask=cv::Mat::zeros(freshSession.document()->mask().size(),CV_8U);
+    freshSession.document()->aiFill().resultMask.at<uchar>(4,4)=1;
+    freshSession.document()->aiFill().resultLabels={1};
+    QMetaObject::invokeMethod(&freshSession,"onClear",Qt::DirectConnection);
+    CHECK(freshSession.document()->aiFill().resultMask.empty() && cv::countNonZero(freshSession.document()->mask())==0,
+          "Clear applies pending AI result before clearing the mask");
+    QMetaObject::invokeMethod(&freshSession,"onUndo",Qt::DirectConnection);
+    CHECK(freshSession.document()->mask().at<uchar>(4,4)==1,"Undo Clear restores the applied AI segmentation");
     std::printf("\n%d UI test failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

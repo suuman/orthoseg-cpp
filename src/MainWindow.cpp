@@ -2,6 +2,13 @@
 #include "FileBrowser.h"
 #include "ImageFilePreview.h"
 #include <QSignalBlocker>
+#include <QShortcut>
+#include <QKeySequence>
+#include <QProgressDialog>
+#include <QSpinBox>
+#include <QDialogButtonBox>
+#include <QThread>
+#include <atomic>
 #include "ModelManagementDialog.h"
 #include <QMenuBar>
 #include <QApplication>
@@ -469,6 +476,10 @@ QWidget* MainWindow::buildSidebar() {
             "QPushButton:hover{ color:#e2e8f0; border:1px solid #475569; }");
         connect(clearSeedsBtn, &QPushButton::clicked, this, &MainWindow::onClearSeeds);
         spl->addWidget(clearSeedsBtn);
+        restrictSeedRegion_ = new QCheckBox("Limit to area around seeds");
+        restrictSeedRegion_->setObjectName("restrictSeedRegion");
+        restrictSeedRegion_->setToolTip("Keep edits inside the seed bounding rectangle plus a 32-pixel margin.");
+        spl->addWidget(restrictSeedRegion_);
         fl->addWidget(seedPanel_);
     }
     v->addWidget(fillPanel_);
@@ -485,6 +496,8 @@ QWidget* MainWindow::buildSidebar() {
         drawOutlineButton_->setChecked(true);
         fillClosedAreaButton_ = new QPushButton("Fill Closed Area");
         fillClosedAreaButton_->setObjectName("fillClosedAreaButton");
+        fillClosedAreaButton_->setToolTip("Fill every enclosed hole in the selected label’s mask. Open gaps and exterior background are left unchanged.");
+        connect(fillClosedAreaButton_, &QPushButton::clicked, canvas_, &CanvasWidget::fillClosedAreas);
         fillClosedAreaButton_->setCheckable(true);
         auto* modes = new QButtonGroup(drawFillPanel_);
         modes->addButton(drawOutlineButton_);
@@ -512,6 +525,11 @@ QWidget* MainWindow::buildSidebar() {
         connect(fillClosedAreaButton_, &QPushButton::clicked, this, [this] { setFillOutlineHighlight(false); });
         dl->addWidget(clearOutline);
         dl->addWidget(fillClosedAreaButton_);
+        auto* holeLimit=new QSpinBox;holeLimit->setObjectName("maxHolePixels");
+        holeLimit->setRange(0,25000000);holeLimit->setSpecialValueText("Hole size: unlimited");
+        holeLimit->setPrefix("Max hole pixels: ");
+        connect(holeLimit,&QSpinBox::valueChanged,canvas_,&CanvasWidget::setMaxHolePixels);
+        dl->addWidget(holeLimit);
     }
     v->addWidget(drawFillPanel_);
     aiPanel_ = buildAIPanel();
@@ -699,7 +717,9 @@ QWidget* MainWindow::buildTopBar() {
     connect(monaiSegment_, &QPushButton::clicked, this, &MainWindow::onMonaiSegment);
     h->addWidget(monaiSegment_);
 
-    undoBtn_ = makeIconBtn("↺", "Undo");
+    undoBtn_ = makeIconBtn("↺", "Undo (Ctrl+Z)");
+    auto* undoShortcut = new QShortcut(QKeySequence::Undo, this);
+    connect(undoShortcut, &QShortcut::activated, this, &MainWindow::onUndo);
     connect(undoBtn_, &QPushButton::clicked, this, &MainWindow::onUndo);
     h->addWidget(undoBtn_);
 
@@ -1692,6 +1712,7 @@ void MainWindow::updateSettingsVisibility() {
     drawOutlineButton_->setVisible(activeTool_ == Tool::DrawFill);
     fillClosedAreaButton_->setVisible(activeTool_ == Tool::DrawFill);
     lassoHint_->setVisible(activeTool_ == Tool::Lasso);
+    if(auto* limit=drawFillPanel_->findChild<QSpinBox*>("maxHolePixels"))limit->setVisible(activeTool_==Tool::DrawFill);
     updateAIPromptStatus();
     const bool manualEdit = activeTool_ == Tool::Brush || activeTool_ == Tool::Eraser ||
                             activeTool_ == Tool::DrawFill || activeTool_ == Tool::Lasso;
@@ -2008,12 +2029,16 @@ void MainWindow::onImportMask() {
     const QString path = browseFile(this, "Import Mask", QSettings("OrthoSeg", "OrthoSeg").value("folders/masks", QFileInfo(QString::fromStdString(doc_->sourcePath())).absolutePath()).toString(),
         "Lossless masks (*.png *.bmp *.tif *.tiff)");
     if (path.isEmpty()) return;
-    if (!doc_->importMask(path.toStdString())) {
+    auto imported = doc_->segmentationCopy();
+    if (!imported.importMask(path.toStdString())) {
         QMessageBox::warning(this, "Import Mask",
             "Mask must match the X-ray size and contain exact RGB channel labels "
             "(R=1 Femur, G=2 Tibia, B=3 Fibula), or grayscale labels 0–3.");
         return;
     }
+    if (!canvas_->applyPendingAIResult()) return;
+    doc_->applySegmentationChannels(imported.maskChannels());
+    canvas_->clearOutline();
     QSettings("OrthoSeg", "OrthoSeg").setValue("folders/masks", QFileInfo(path).absolutePath());
     ++imageGeneration_;
     doc_->aiFill().resultMask.release();
@@ -2466,7 +2491,8 @@ void MainWindow::offerFineTuningReminder() {
 }
 
 void MainWindow::onClear() {
-    if (!doc_->hasImage()) return;
+    if (!doc_->hasImage() || !canvas_->applyPendingAIResult()) return;
+    canvas_->clearOutline();
     doc_->pushHistory();
     doc_->clearMask();
     doc_->clearSeeds();
@@ -2539,17 +2565,57 @@ void MainWindow::onRunSegmentation() {
         return;
     }
 
-    bool ok = doc_->runSeedSegmentation(algo, activeLabel_, currentBeta());
-    if (!ok)
-        QMessageBox::warning(this, "OrthoSeg",
-            "Segmentation could not run. Try larger, separated seed strokes; "
-            "small strokes can overlap when the image is reduced for processing.");
+    if (aiController_->running() || monaiRequestPending_) {
+        QMessageBox::information(this, "Segmentation", "Wait for AI inference to finish first."); return;
+    }
+    if (!canvas_->applyPendingAIResult()) return;
+    auto work = std::make_shared<Document>(doc_->segmentationCopy());
+    auto cancelled = std::make_shared<std::atomic_bool>(false);
+    struct Result { bool ok=false; QString error; };
+    auto result=std::make_shared<Result>();
+    QProgressDialog progress("Computing segmentation…", "Cancel", 0, 0, this);
+    progress.setObjectName("seedSegmentationProgress");
+    progress.setWindowModality(Qt::ApplicationModal);progress.setMinimumDuration(0);
+    connect(&progress,&QProgressDialog::canceled,this,[cancelled]{cancelled->store(true);});
+    auto* worker=QThread::create([work,cancelled,result,algo,label=activeLabel_,beta=currentBeta(),limited=restrictSeedRegion_->isChecked()] {
+        try { result->ok=work->runSeedSegmentation(algo,label,beta,[cancelled]{return cancelled->load();},limited); }
+        catch(const std::exception& e){result->error=QString::fromUtf8(e.what());}
+    });
+    connect(worker,&QThread::finished,worker,&QObject::deleteLater);
+    connect(worker,&QThread::finished,&progress,&QDialog::accept);
+    connect(&progress,&QProgressDialog::canceled,&progress,&QDialog::reject);
+    worker->start();
+    if(progress.exec()!=QDialog::Accepted || cancelled->load()) {cancelled->store(true);return;}
+    if(!result->ok){QMessageBox::warning(this,"Segmentation",result->error.isEmpty()?
+        "Could not segment. Try larger, separated seed strokes.":result->error);return;}
+    QDialog preview(this);preview.setObjectName("seedSegmentationPreview");preview.setWindowTitle("Review segmentation");
+    auto* layout=new QVBoxLayout(&preview);
+    layout->addWidget(new QLabel(algo==FillAlgorithm::GraphCut ?
+        "Preview: the selected label will be replaced; other labels are preserved." :
+        "Preview: seeded labels compete within the processing region. Their overlaps become exclusive."));
+    auto* row=new QHBoxLayout;
+    auto addPreview=[&](const QString& title,const cv::Mat& channels){
+        cv::Mat color=doc_->sourceColor().clone();
+        for(int y=0;y<color.rows;++y)for(int x=0;x<color.cols;++x){auto p=channels.at<cv::Vec3b>(y,x);
+            if(p!=cv::Vec3b(0,0,0)){auto& c=color.at<cv::Vec3b>(y,x);for(int k=0;k<3;++k)c[k]=uchar(.5*c[k]+(p[k]?127:0));}}
+        cv::cvtColor(color,color,cv::COLOR_BGR2RGB);
+        auto* column=new QVBoxLayout;column->addWidget(new QLabel(title));
+        auto* image=new QLabel;image->setPixmap(QPixmap::fromImage(QImage(color.data,color.cols,color.rows,int(color.step),QImage::Format_RGB888).copy()).scaled(420,550,Qt::KeepAspectRatio,Qt::SmoothTransformation));
+        column->addWidget(image);row->addLayout(column);
+    };
+    addPreview("Current",doc_->maskChannels());addPreview("Proposed",work->maskChannels());layout->addLayout(row);
+    auto* buttons=new QDialogButtonBox(QDialogButtonBox::Apply|QDialogButtonBox::Cancel);
+    connect(buttons->button(QDialogButtonBox::Apply),&QPushButton::clicked,&preview,&QDialog::accept);
+    connect(buttons,&QDialogButtonBox::rejected,&preview,&QDialog::reject);layout->addWidget(buttons);
+    if(preview.exec()!=QDialog::Accepted)return;
+    doc_->applySegmentationChannels(work->maskChannels());
+
     canvas_->update();
     updateUndoState();
 }
 
 void MainWindow::onUndo() {
-    doc_->undo();
+    canvas_->undoLastEdit();
     canvas_->update();
     updateUndoState();
 }

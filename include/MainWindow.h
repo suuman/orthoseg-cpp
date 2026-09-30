@@ -174,6 +174,7 @@ private:
     QCheckBox* constrainEdges_ = nullptr;
     QWidget* edgePanel_  = nullptr;
     QWidget* betaPanel_  = nullptr;   // scribble algos: edge sensitivity
+    QCheckBox* restrictSeedRegion_ = nullptr;
     QWidget* seedPanel_  = nullptr;   // scribble algos: hint + Run/Clear Seeds
     QLabel*  graphCutNote_ = nullptr;
     QSlider* brushSlider_ = nullptr;

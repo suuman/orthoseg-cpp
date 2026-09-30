@@ -186,8 +186,8 @@ so zoom, fit, aspect ratio, pan, and HiDPI do not change source prompt coordinat
 Box endpoints follow `ocv`'s inclusive pixel convention (`0..width-1`, `0..height-1`).
 Painted and loaded masks remain binary `CV_8UC1` at original resolution.
 
-The original image loader is unchanged: it supplies the displayed 8-bit BGR pixels,
-including its existing grayscale/16-bit-to-8-bit conversion. AI Fill converts this
+The image loader retains original samples and supplies a separate 8-bit BGR working image;
+high-bit-depth inputs are normalized to their observed intensity range. AI Fill converts this
 in-memory source to RGB exactly once; it does not reload the file or normalize it
 again. `ocv` handles centered 1024-square padding, blob creation, mask logits, and
 restoration to source dimensions with its existing defaults.
@@ -266,7 +266,7 @@ must still be verified on a machine with an available NVIDIA driver/device.
 | Embedded Boundary | Single click | Applies the same intensity test and stops at pixels whose Sobel edge magnitude exceeds Edge Penalty. |
 | Split-and-Merge | Single click | Divides the image into 4 × 4 blocks, then joins adjacent blocks with similar mean intensity when both maximum edge magnitudes are within the cutoff. Fills the seed block's connected component. |
 | Grow from Seeds (GrowCut) | Labeled scribbles | Neighboring pixels compete for labels using strength weighted by `exp(−β × ΔI²)`. Updates synchronously until stable or the iteration limit is reached. |
-| Random Walker | Labeled scribbles | Solves one weighted harmonic probability field per seeded label using successive over-relaxation, then chooses the label with the highest value at each pixel. Uses the same intensity-based edge weights as GrowCut. |
+| Random Walker | Labeled scribbles | Solves one weighted harmonic probability field per seeded label using residual-checked preconditioned conjugate gradients, then chooses the label with the highest value at each pixel. Uses the same intensity-based edge weights as GrowCut. |
 | Graph Cut | Foreground and background scribbles | Uses OpenCV `grabCut` with color mixture models and a graph cut, running three iterations by default. Segments one active label per run. |
 
 Click fills run at full resolution. Scribble algorithms run with the longest
@@ -280,13 +280,13 @@ retry. Fine boundaries can still be affected by resizing; refine the result at
 full resolution with Brush or Eraser. Graph Cut merges its foreground selection
 into the original mask, preserving other labels at background pixels exactly.
 
-The Sobel edge map has a one-pixel zero border, matching the web reference.
-Embedded Boundary can therefore grow around a barrier along the image boundary
-when the intensity threshold permits it.
+Sobel edge strengths are retained at image borders so a boundary cannot be bypassed
+through an artificially cleared border row.
 
 ## Image and mask formats
 
-The native loader reads images as 8-bit BGR color and computes grayscale intensity
+The native loader retains original pixel precision and derives an 8-bit BGR working
+image (min/max normalization for high-bit-depth inputs), then computes grayscale intensity
 as the mean of the three channels. The editable mask stores **three independent
 channels**, so overlapping bones remain separate. The canvas renders each present
 channel at full red, green, or blue, producing yellow, cyan, magenta, or white
@@ -529,9 +529,7 @@ Brush, Eraser, Lasso, and Draw & Fill offer **Stop at image edges** (off by defa
 Enable it to limit a gesture to the source-image region connected to its starting
 point. Start inside the region, not on its boundary. **Edge Threshold** ranges
 from 0 to 255: lower values stop at weaker edges; 255 allows every edge. Detected
-boundaries must close off the region to prevent growth around gaps. For Draw & Fill, edge stopping applies only to drawing. Fill closed area fills
-inside the drawn mask boundary; Fill Outline and auto-fill fill the traced polygon
-without any source-image edge constraint. Brush size now starts at one
+boundaries must close off the region to prevent growth around gaps. For Draw & Fill, edge stopping applies only to drawing. Fill Closed Area fills all enclosed holes in the selected label’s mask; Fill Outline and auto-fill ignore X-ray edges in Draw & Fill; Lasso still honors its edge-stop setting. Brush size now starts at one
 image pixel.
 
 Use **Drag image** in the top toolbar to drag repeatedly with the left mouse button, or use right/middle drag or
@@ -586,3 +584,45 @@ all pages, with their labels, overlap counts, training status, model and case ID
 The **Upload X-ray** dialog previews the highlighted image before opening it,
 with its filename and pixel dimensions. Mouse and keyboard selection update the
 preview; folders or unreadable files clear it. Previewing does not alter the current image or mask.
+
+**Fill Closed Area** immediately fills all enclosed holes in the selected label’s
+mask, including imported masks. Exterior background and holes with straight or
+diagonal openings to the image border remain unchanged. Other labels are preserved;
+all holes filled by one action can be undone together. Image intensity and edge
+threshold do not affect this operation.
+
+## Fill reliability and review
+
+Scribble segmentation runs in a cancellable worker on an independent document copy.
+Review Current/Proposed masks and choose Apply or Cancel. Applying creates one undo
+step. Graph Cut cancellation discards the result immediately; its OpenCV computation
+may finish in the background. GrowCut and Random Walker check cancellation during
+iteration and reject unconverged output. Random Walker uses a residual-checked solver.
+
+Enable **Limit to area around seeds** to process the seed bounding rectangle plus a
+32-pixel margin, preserving all annotations outside it. GrowCut and Random Walker
+remain exclusive among competing seeded labels within the processing area. Full-size
+hard seeds are restored after resampling; fine boundary editing remains available.
+
+Split-and-Merge bounds block means to the seed intensity and checks connected pixels
+at full resolution; seed blocks crossing strong edges use pixel-level growth.
+Fill Closed Area optionally limits each hole by **Max hole pixels** (zero: unlimited).
+Lasso previews show the implicit closing segment. Draw Outline shows only the
+stroke drawn by the user, so open gaps remain visible for manual closure.
+
+Draw strokes are one Undo step each; **Ctrl+Z** and the Undo button also clear the
+transient outline and terminate the active gesture, so a late mouse release cannot
+repaint an undone stroke. Lost mouse releases stop drawing instead of connecting
+later hover positions with straight lines.
+
+Pending AI results are applied before manual mask edits, including Fill Outline,
+Fill Closed Area, mask import, Clear, and running scribble segmentation. The AI
+application is a separate Undo step: undoing the manual edit retains the AI mask.
+Prompt editing and panning do not apply an AI result.
+
+The edge checkbox constrains Brush/Eraser, Lasso polygon fills, and Draw & Fill
+strokes to the connected region from the gesture's starting point.
+Start inside the intended region, not on a strong boundary. Fill Closed Area remains
+a mask-topology operation and ignores X-ray edges. Standard Fill uses intensity;
+Edge-Embedded and Split-and-Merge also apply their edge threshold. Scribble solvers
+use their own edge sensitivity (or Graph Cut's image model).

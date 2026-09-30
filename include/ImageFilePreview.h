@@ -1,4 +1,5 @@
 #pragma once
+#include "XrayImage.h"
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -74,7 +75,7 @@ private:
         auto* thread = QThread::create([path, result] {
             try {
                 // Match the editor's decoder, including 16-bit TIFF display conversion.
-                const auto original = cv::imread(path.toStdString(), cv::IMREAD_COLOR);
+                const auto original = displayXray(cv::imread(path.toStdString(), cv::IMREAD_UNCHANGED));
                 if (original.empty()) return;
                 result->width = original.cols;
                 result->height = original.rows;

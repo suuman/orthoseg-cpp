@@ -73,8 +73,8 @@ int main() {
         cv::Mat mask = cv::Mat::zeros(img.size(), CV_8UC1);
         regionGrowEdgeEmbedded(img, mask, cv::Point(10, 10), Label::Tibia,
                                255, 60);
-        CHECK(mask.at<uchar>(0, 80) == static_cast<uchar>(Label::Tibia),
-              "edge map border is zero, matching the reference");
+        CHECK(mask.at<uchar>(0, 80) == 0,
+              "edge barrier remains intact at the image border");
     }
 
     // --- Split-and-merge groups the uniform half via union-find. ---
@@ -193,5 +193,26 @@ int main() {
 
     if (failures == 0) std::printf("\nALL TESTS PASSED\n");
     else std::printf("\n%d TEST(S) FAILED\n", failures);
+    {
+        cv::Mat image(1,512,CV_8U,cv::Scalar(80));
+        cv::Mat seeds(1,512,CV_8U,cv::Scalar(kNoSeed)), out;
+        seeds.at<uchar>(0,0)=0;seeds.at<uchar>(0,511)=1;
+        randomWalkerFromSeeds(image,seeds,out,.003);
+        CHECK(cv::countNonZero(out)==256,"Random Walker converges to symmetric partition on a uniform image");
+        cv::Mat unchanged(1,512,CV_8U,cv::Scalar(3));bool failed=false;
+        try{randomWalkerFromSeeds(image,seeds,unchanged,.003,1,1e-12);}catch(const std::exception&){failed=true;}
+        CHECK(failed && cv::countNonZero(unchanged!=3)==0,"Random Walker rejects nonconvergence without changing output");
+        failed=false;
+        try{randomWalkerFromSeeds(image,seeds,unchanged,.003,4000,1e-8,[]{return true;});}catch(const std::exception&){failed=true;}
+        CHECK(failed,"Random Walker supports cancellation");
+        cv::Mat ramp(4,256,CV_8U);for(int x=0;x<256;++x)ramp.col(x).setTo(x);
+        out=cv::Mat::zeros(ramp.size(),CV_8U);
+        regionGrowSplitMerge(ramp,out,{0,1},Label::Femur,5,255,4);
+        CHECK(out.at<uchar>(1,255)==0,"Split merge rejects transitive intensity drift");
+        cv::Mat edge(10,20,CV_8U,cv::Scalar(0));edge.colRange(10,20).setTo(255);
+        out=cv::Mat::zeros(edge.size(),CV_8U);
+        regionGrowSplitMerge(edge,out,{10,5},Label::Femur,0,0,4);
+        CHECK(cv::countNonZero(out)==0,"Split merge does not paint a blocked seed block");
+    }
     return failures == 0 ? 0 : 1;
 }

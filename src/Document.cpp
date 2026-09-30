@@ -1,4 +1,5 @@
 #include "Document.h"
+#include "XrayImage.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <algorithm>
@@ -11,7 +12,8 @@ namespace orthoseg {
 
 bool Document::loadImage(const std::string& path) {
     try {
-        cv::Mat color = cv::imread(path, cv::IMREAD_COLOR);
+        cv::Mat original = cv::imread(path, cv::IMREAD_UNCHANGED);
+        cv::Mat color = displayXray(original);
         if (color.empty()) return false;
 
         // Prepare all layers before replacing the current document, so a
@@ -25,16 +27,17 @@ bool Document::loadImage(const std::string& path) {
         cv::Mat seeds(gray.size(), CV_8UC1, cv::Scalar(kNoSeed));
 
         // Retain exact PNG bytes independently of the unchanged display path.
-        std::vector<unsigned char> original;
+        std::vector<unsigned char> originalBytes;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (file && file.tellg() > 0 && file.tellg() <= 32 * 1024 * 1024) {
             file.seekg(0);
-            original.assign(std::istreambuf_iterator<char>(file), {});
+            originalBytes.assign(std::istreambuf_iterator<char>(file), {});
             const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
-            if (original.size() < 8 || !std::equal(std::begin(signature), std::end(signature), original.begin()))
-                original.clear();
+            if (originalBytes.size() < 8 || !std::equal(std::begin(signature), std::end(signature), originalBytes.begin()))
+                originalBytes.clear();
         }
-        originalPng_ = std::move(original);
+        originalPng_ = std::move(originalBytes);
+        sourceOriginal_ = original;
         sourcePath_ = path;
         sourceColor_ = color;
         sourceGray_ = gray;
@@ -215,14 +218,6 @@ void Document::paintAIPrompt(cv::Point a, cv::Point b, bool erase, int brushSize
 cv::Mat Document::edgeRegion(cv::Point seed, int threshold) const {
     if (!hasImage()) return {};
     cv::Mat region = edgeMap_ <= threshold;
-    // The shared fill edge map has an artificial zero border. Extend the nearest
-    // interior barrier here so a stroke cannot bypass an edge around the frame.
-    if (region.rows > 2 && region.cols > 2) {
-        region.row(1).copyTo(region.row(0));
-        region.row(region.rows - 2).copyTo(region.row(region.rows - 1));
-        region.col(1).copyTo(region.col(0));
-        region.col(region.cols - 2).copyTo(region.col(region.cols - 1));
-    }
     if (seed.x < 0 || seed.y < 0 || seed.x >= width() || seed.y >= height() ||
         !region.at<uchar>(seed)) return cv::Mat::zeros(edgeMap_.size(), CV_8UC1);
     cv::floodFill(region, seed, cv::Scalar(128), nullptr, cv::Scalar(), cv::Scalar(), 4);
@@ -273,6 +268,26 @@ void Document::fillPolygon(const std::vector<cv::Point>& points, Label label, bo
     if (!allowed.empty()) cv::bitwise_and(region, allowed, region);
     if (recordHistory) pushHistory();
     applyRegion(region, label);
+}
+
+bool Document::fillEnclosedHoles(Label label, int maxPixels) {
+    if (channels_.empty() || label == Label::Background) return false;
+    const auto active = labelMask(label);
+    // Padding gives every image-border background region a common exterior seed.
+    cv::Mat background;
+    cv::copyMakeBorder(active == 0, background, 1, 1, 1, 1, cv::BORDER_CONSTANT, cv::Scalar(255));
+    // Diagonal connections to the exterior count as openings, not enclosed holes.
+    cv::floodFill(background, {0, 0}, cv::Scalar(128), nullptr, cv::Scalar(), cv::Scalar(), 8);
+    cv::Mat holes = background(cv::Rect(1, 1, width(), height())) == 255;
+    if(maxPixels>0) {
+        cv::Mat components,stats,centers;
+        int count=cv::connectedComponentsWithStats(holes,components,stats,centers,8);
+        for(int id=1;id<count;++id)if(stats.at<int>(id,cv::CC_STAT_AREA)>maxPixels)holes.setTo(0,components==id);
+    }
+    if (!cv::countNonZero(holes)) return false;
+    pushHistory();
+    applyRegion(holes, label);
+    return true;
 }
 
 bool Document::fillEnclosedAt(cv::Point seed, Label label, const cv::Mat& allowed) {
@@ -377,7 +392,7 @@ static cv::Mat downscaleSeeds(const cv::Mat& seeds, cv::Size dst) {
 }
 
 bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
-                                   double beta) {
+                                   double beta, const std::function<bool()>& cancelled, bool restrictToSeeds) {
     if (sourceGray_.empty() || seedLabelCount() < 2) return false;
     if (!isScribbleAlgorithm(algo)) return false;
     if (algo == FillAlgorithm::GraphCut &&
@@ -386,7 +401,13 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
 
     // Cap the working resolution so the iterative solvers stay interactive.
     constexpr int kMaxWorkDim = 512;
-    const int w = width(), h = height();
+    cv::Rect area(0,0,width(),height());
+    if(restrictToSeeds) {
+        const auto bounds=cv::boundingRect(seeds_ != kNoSeed);
+        area=cv::Rect(bounds.x-32,bounds.y-32,bounds.width+64,bounds.height+64)&area;
+    }
+    const auto localGray=sourceGray_(area), localColor=sourceColor_(area), localSeeds=seeds_(area);
+    const int w = area.width, h = area.height;
     const double scale = std::min(1.0, static_cast<double>(kMaxWorkDim) /
                                        std::max(w, h));
     const bool down = scale < 1.0;
@@ -395,9 +416,9 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
 
     cv::Mat wgray, wcolor, wseeds, wout;
     if (down) {
-        cv::resize(sourceGray_,  wgray,  ws, 0, 0, cv::INTER_AREA);
-        cv::resize(sourceColor_, wcolor, ws, 0, 0, cv::INTER_AREA);
-        wseeds = downscaleSeeds(seeds_, ws);
+        cv::resize(localGray,  wgray,  ws, 0, 0, cv::INTER_AREA);
+        cv::resize(localColor, wcolor, ws, 0, 0, cv::INTER_AREA);
+        wseeds = downscaleSeeds(localSeeds, ws);
         // Never silently run a different competition after an entire seed
         // class disappears into another label's working pixel.
         for (const auto& info : labels()) {
@@ -406,9 +427,9 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
                 return false;
         }
     } else {
-        wgray = sourceGray_;
-        wcolor = sourceColor_;
-        wseeds = seeds_;
+        wgray = localGray;
+        wcolor = localColor;
+        wseeds = localSeeds;
     }
     // Graph Cut produces a foreground selection here; merge it into the
     // original mask later so unrelated labels never take a resizing round trip.
@@ -417,10 +438,10 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
     bool ok = true;
     switch (algo) {
         case FillAlgorithm::GrowCut:
-            growCutFromSeeds(wgray, wseeds, wout, beta);
+            growCutFromSeeds(wgray, wseeds, wout, beta, -1, cancelled);
             break;
         case FillAlgorithm::RandomWalker:
-            randomWalkerFromSeeds(wgray, wseeds, wout, beta);
+            randomWalkerFromSeeds(wgray, wseeds, wout, beta, 4000, 1e-8, cancelled);
             break;
         case FillAlgorithm::GraphCut:
             ok = graphCutFromSeeds(wcolor, wseeds, wout, foreground);
@@ -428,24 +449,26 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
         default:
             return false;
     }
-    if (!ok) return false;
+    if (!ok || (cancelled && cancelled())) return false;
 
     cv::Mat result;
     if (down)
-        cv::resize(wout, result, sourceGray_.size(), 0, 0, cv::INTER_NEAREST);
+        cv::resize(wout, result, area.size(), 0, 0, cv::INTER_NEAREST);
     else
         result = wout;
 
+    cv::Mat fullResult=cv::Mat::zeros(sourceGray_.size(),CV_8U);
+    result.copyTo(fullResult(area));result=fullResult;
     if (algo == FillAlgorithm::GraphCut) {
         const uchar fg = static_cast<uchar>(foreground);
         cv::Mat selected = result == fg;
         selected.setTo(0, (seeds_ != kNoSeed) & (seeds_ != fg));
         selected.setTo(255, seeds_ == fg);
         pushHistory();
-        for (int y = 0; y < height(); ++y) {
+        for (int y = area.y; y < area.y+area.height; ++y) {
             const auto* s = selected.ptr<uchar>(y);
             auto* dst = channels_.ptr<cv::Vec3b>(y);
-            for (int x = 0; x < width(); ++x)
+            for (int x = area.x; x < area.x+area.width; ++x)
                 dst[x][3 - fg] = s[x] ? fg : 0;
         }
     } else {
@@ -455,10 +478,10 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
         const bool updateTibia = hasSeedForLabel(Label::Tibia);
         const bool updateFibula = hasSeedForLabel(Label::Fibula);
         pushHistory();
-        for (int y = 0; y < height(); ++y) {
+        for (int y = area.y; y < area.y+area.height; ++y) {
             const auto* src = result.ptr<uchar>(y);
             auto* dst = channels_.ptr<cv::Vec3b>(y);
-            for (int x = 0; x < width(); ++x) {
+            for (int x = area.x; x < area.x+area.width; ++x) {
                 if (updateFemur) dst[x][2] = src[x] == 1 ? 1 : 0;
                 if (updateTibia) dst[x][1] = src[x] == 2 ? 2 : 0;
                 if (updateFibula) dst[x][0] = src[x] == 3 ? 3 : 0;
@@ -467,6 +490,17 @@ bool Document::runSeedSegmentation(FillAlgorithm algo, Label foreground,
     }
     syncIndexed(cv::Rect(0, 0, width(), height()));
     return true;
+}
+
+Document Document::segmentationCopy() const {
+    Document copy = *this;
+    copy.channels_ = channels_.clone(); copy.mask_ = mask_.clone(); copy.seeds_ = seeds_.clone();
+    copy.history_.clear(); copy.aiFill_ = AIFillState{};
+    return copy;
+}
+void Document::applySegmentationChannels(const cv::Mat& channels) {
+    CV_Assert(channels.type()==CV_8UC3 && channels.size()==channels_.size());
+    pushHistory(); channels_=channels.clone();syncIndexed(cv::Rect(0,0,width(),height()));
 }
 
 void Document::pushHistory() {

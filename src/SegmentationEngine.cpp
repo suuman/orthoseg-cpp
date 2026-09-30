@@ -4,6 +4,8 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <array>
+#include <stdexcept>
 
 namespace orthoseg {
 
@@ -16,14 +18,6 @@ cv::Mat computeEdgeMap(const cv::Mat& graySource) {
     cv::magnitude(gx, gy, mag);          // sqrt(gx^2 + gy^2)
     cv::Mat edges;
     mag.convertTo(edges, CV_8U);         // saturating cast clamps to 255
-    // The reference leaves a 1-pixel zero border (its Sobel loop skips the
-    // image boundary), so border pixels never block region growth.
-    if (edges.rows > 1 && edges.cols > 1) {
-        edges.row(0).setTo(0);
-        edges.row(edges.rows - 1).setTo(0);
-        edges.col(0).setTo(0);
-        edges.col(edges.cols - 1).setTo(0);
-    }
     return edges;
 }
 
@@ -165,6 +159,15 @@ void regionGrowSplitMerge(const cv::Mat& graySource, cv::Mat& mask,
         }
     }
 
+    const int seedBlock = (seed.y / blockSize) * bw + seed.x / blockSize;
+    const int seedIntensity = graySource.at<uchar>(seed);
+    if (blockMaxEdge[seedBlock] > edgePenaltyThreshold) {
+        // A coarse boundary block needs pixel-level subdivision.
+        regionGrowEdgeEmbedded(graySource, mask, seed, label, intensityThreshold, edgePenaltyThreshold, edges);
+        return;
+    }
+    for (int i=0;i<numBlocks;++i)
+        if (std::abs(blockMean[i] - seedIntensity) > intensityThreshold) blockMaxEdge[i] = 256;
     // Merge adjacent blocks: both below the edge penalty and similar in mean.
     DisjointSet ds(numBlocks);
     for (int by = 0; by < bh; ++by) {
@@ -187,24 +190,21 @@ void regionGrowSplitMerge(const cv::Mat& graySource, cv::Mat& mask,
         }
     }
 
-    // Fill every block sharing the seed block's root.
-    int seedRoot = ds.find((seed.y / blockSize) * bw + (seed.x / blockSize));
-    const uchar labelId = static_cast<uchar>(label);
-    for (int by = 0; by < bh; ++by) {
-        for (int bx = 0; bx < bw; ++bx) {
-            if (ds.find(by * bw + bx) != seedRoot) continue;
-            int y0 = by * blockSize, y1 = std::min((by + 1) * blockSize, h);
-            int x0 = bx * blockSize, x1 = std::min((bx + 1) * blockSize, w);
-            for (int y = y0; y < y1; ++y) {
-                uchar* mrow = mask.ptr<uchar>(y);
-                for (int x = x0; x < x1; ++x) mrow[x] = labelId;
-            }
-        }
-    }
+    int seedRoot = ds.find(seedBlock);
+    cv::Mat eligible = cv::Mat::zeros(graySource.size(), CV_8U);
+    for(int y=0;y<h;++y) for(int x=0;x<w;++x)
+        if(ds.find((y/blockSize)*bw+x/blockSize)==seedRoot &&
+           edges.at<uchar>(y,x)<=edgePenaltyThreshold &&
+           std::abs(int(graySource.at<uchar>(y,x))-seedIntensity)<=intensityThreshold)
+            eligible.at<uchar>(y,x)=255;
+    if(!eligible.at<uchar>(seed))return;
+    cv::floodFill(eligible,seed,cv::Scalar(128),nullptr,cv::Scalar(),cv::Scalar(),4);
+    mask.setTo(static_cast<uchar>(label),eligible==128);
+
 }
 
 void growCutFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
-                      cv::Mat& outMask, double beta, int maxIters) {
+                      cv::Mat& outMask, double beta, int maxIters, const std::function<bool()>& cancelled) {
     CV_Assert(graySource.type() == CV_8UC1 && seeds.type() == CV_8UC1);
     CV_Assert(graySource.size() == seeds.size());
     const int w = graySource.cols, h = graySource.rows;
@@ -234,7 +234,9 @@ void growCutFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
     const int dx[4] = {-1, 1, 0, 0};
     const int dy[4] = {0, 0, -1, 1};
 
+    bool converged = false;
     for (int it = 0; it < maxIters; ++it) {
+        if (cancelled && cancelled()) throw std::runtime_error("Segmentation cancelled");
         // Synchronous update: every cell reads the previous state.
         nextLabel = label;
         nextStrength = strength;
@@ -261,9 +263,12 @@ void growCutFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
         }
         std::swap(label, nextLabel);
         std::swap(strength, nextStrength);
-        if (!changed) break;
+        if (!changed) { converged = true; break; }
     }
 
+    if (!converged) throw std::runtime_error("GrowCut did not converge. Add seeds or restrict the region.");
+    if (std::any_of(strength.begin(), strength.end(), [](float value){return value<=0;}))
+        throw std::runtime_error("GrowCut left unresolved pixels. Reduce edge sensitivity or add seeds.");
     outMask.create(h, w, CV_8UC1);
     for (int y = 0; y < h; ++y) {
         uchar* m = outMask.ptr<uchar>(y);
@@ -273,106 +278,58 @@ void growCutFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
 }
 
 void randomWalkerFromSeeds(const cv::Mat& graySource, const cv::Mat& seeds,
-                           cv::Mat& outMask, double beta,
-                           int maxIters, double tol) {
-    CV_Assert(graySource.type() == CV_8UC1 && seeds.type() == CV_8UC1);
-    CV_Assert(graySource.size() == seeds.size());
-    const int w = graySource.cols, h = graySource.rows;
-    const size_t N = static_cast<size_t>(w) * h;
-
-    // Which labels are present among the seeds?
-    int fieldOf[4] = {-1, -1, -1, -1};
-    std::vector<uchar> labelList;
-    for (int y = 0; y < h; ++y) {
-        const uchar* s = seeds.ptr<uchar>(y);
-        for (int x = 0; x < w; ++x) {
-            uchar v = s[x];
-            if (v != kNoSeed && v < 4 && fieldOf[v] < 0) {
-                fieldOf[v] = 1; // mark; index assigned below
+                           cv::Mat& outMask, double beta, int maxIters, double tol,
+                           const std::function<bool()>& cancelled) {
+    CV_Assert(graySource.type() == CV_8UC1 && seeds.type() == CV_8UC1 && graySource.size() == seeds.size());
+    const int w = graySource.cols, h = graySource.rows, n = w*h;
+    std::vector<int> classes;
+    for (int l=0;l<4;++l) if (cv::countNonZero(seeds == l)) classes.push_back(l);
+    if (classes.size()<2) { outMask = cv::Mat(h,w,CV_8U,cv::Scalar(classes.empty()?0:classes[0])); return; }
+    std::vector<int> freeIndex(n,-1), pixels;
+    for(int i=0;i<n;++i) if(seeds.at<uchar>(i/w,i%w)==kNoSeed) {freeIndex[i]=pixels.size();pixels.push_back(i);}
+    const int m=pixels.size();
+    std::vector<std::array<int,4>> neighbors(m);
+    std::vector<std::array<double,4>> weights(m);
+    std::vector<double> diagonal(m,0), best(m,-1);
+    cv::Mat result=seeds.clone();
+    for(int j=0;j<m;++j) {
+        int p=pixels[j],x=p%w,y=p/w;
+        neighbors[j]={x>0?p-1:-1,x+1<w?p+1:-1,y>0?p-w:-1,y+1<h?p+w:-1};
+        for(int k=0;k<4;++k) {
+            int q=neighbors[j][k];if(q<0){weights[j][k]=0;continue;}
+            double d=double(graySource.at<uchar>(y,x))-graySource.at<uchar>(q/w,q%w);
+            weights[j][k]=std::max(1e-12,std::exp(-beta*d*d));diagonal[j]+=weights[j][k];
+        }
+    }
+    auto multiply=[&](const std::vector<double>& x,std::vector<double>& y){
+        for(int j=0;j<m;++j){y[j]=diagonal[j]*x[j];for(int k=0;k<4;++k){int q=neighbors[j][k];
+            if(q>=0 && freeIndex[q]>=0)y[j]-=weights[j][k]*x[freeIndex[q]];}}
+    };
+    auto dot=[](const auto& a,const auto& b){double sum=0;for(size_t i=0;i<a.size();++i)sum+=a[i]*b[i];return sum;};
+    for(int label:classes) {
+        std::vector<double> b(m,0),x(m,0),r(m),z(m),p(m),ap(m);
+        for(int j=0;j<m;++j) for(int k=0;k<4;++k){int q=neighbors[j][k];
+            if(q>=0 && seeds.at<uchar>(q/w,q%w)==label)b[j]+=weights[j][k];}
+        r=b;for(int j=0;j<m;++j)z[j]=r[j]/diagonal[j];p=z;
+        double rz=dot(r,z),target=std::max(1e-24,dot(b,b)*tol*tol);
+        bool converged=dot(r,r)<=target;
+        for(int it=0;it<maxIters && !converged;++it){
+            if(cancelled && cancelled()) throw std::runtime_error("Segmentation cancelled");
+            multiply(p,ap);double denom=dot(p,ap);if(denom<=0 || !std::isfinite(denom))break;
+            double alpha=rz/denom;
+            for(int j=0;j<m;++j){x[j]+=alpha*p[j];r[j]-=alpha*ap[j];}
+            if(dot(r,r)<=target){
+                multiply(x,ap);for(int j=0;j<m;++j)r[j]=b[j]-ap[j];
+                converged=dot(r,r)<=target;if(converged)break;
             }
+            for(int j=0;j<m;++j)z[j]=r[j]/diagonal[j];
+            double next=dot(r,z);if(!std::isfinite(next))break;
+            for(int j=0;j<m;++j)p[j]=z[j]+(next/rz)*p[j];rz=next;
         }
+        if(!converged)throw std::runtime_error("Random Walker did not converge. Use a smaller region or add seeds.");
+        for(int j=0;j<m;++j)if(x[j]>best[j]){best[j]=x[j];int p=pixels[j];result.at<uchar>(p/w,p%w)=label;}
     }
-    for (int l = 0; l < 4; ++l)
-        if (fieldOf[l] >= 0) { fieldOf[l] = static_cast<int>(labelList.size());
-                               labelList.push_back(static_cast<uchar>(l)); }
-    const int K = static_cast<int>(labelList.size());
-
-    outMask.create(h, w, CV_8UC1);
-    if (K == 0) { outMask.setTo(0); return; }
-    if (K == 1) { outMask.setTo(labelList[0]); return; }
-
-    // Per-pixel: seed field index, or -1 if free.
-    std::vector<int>   seedField(N, -1);
-    std::vector<float> I(N);
-    for (int y = 0; y < h; ++y) {
-        const uchar* g = graySource.ptr<uchar>(y);
-        const uchar* s = seeds.ptr<uchar>(y);
-        for (int x = 0; x < w; ++x) {
-            size_t i = static_cast<size_t>(y) * w + x;
-            I[i] = g[x];
-            if (s[x] != kNoSeed && s[x] < 4) seedField[i] = fieldOf[s[x]];
-        }
-    }
-
-    // Edge weights to the right/down neighbour: w = exp(-beta*(dI)^2).
-    std::vector<double> wR(N, 0.0), wD(N, 0.0);
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            size_t i = static_cast<size_t>(y) * w + x;
-            if (x < w - 1) { double d = I[i] - I[i + 1];     wR[i] = std::exp(-beta * d * d); }
-            if (y < h - 1) { double d = I[i] - I[i + w];     wD[i] = std::exp(-beta * d * d); }
-        }
-    }
-
-    // Potentials U[i*K + k]: seeds pinned, free pixels start uniform.
-    std::vector<double> U(N * K, 0.0);
-    for (size_t i = 0; i < N; ++i) {
-        if (seedField[i] >= 0) U[i * K + seedField[i]] = 1.0;
-        else for (int k = 0; k < K; ++k) U[i * K + k] = 1.0 / K;
-    }
-
-    // SOR (Gauss-Seidel with over-relaxation) on the harmonic system.
-    const double omega = 1.8;
-    for (int it = 0; it < maxIters; ++it) {
-        double maxDelta = 0.0;
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                size_t i = static_cast<size_t>(y) * w + x;
-                if (seedField[i] >= 0) continue;
-                double wl = (x > 0)     ? wR[i - 1] : 0.0;
-                double wr = (x < w - 1) ? wR[i]     : 0.0;
-                double wu = (y > 0)     ? wD[i - w] : 0.0;
-                double wd = (y < h - 1) ? wD[i]     : 0.0;
-                double wsum = wl + wr + wu + wd;
-                if (wsum <= 0.0) continue;
-                for (int k = 0; k < K; ++k) {
-                    double num = 0.0;
-                    if (wl) num += wl * U[(i - 1) * K + k];
-                    if (wr) num += wr * U[(i + 1) * K + k];
-                    if (wu) num += wu * U[(i - w) * K + k];
-                    if (wd) num += wd * U[(i + w) * K + k];
-                    double newv = num / wsum;
-                    double old = U[i * K + k];
-                    double upd = old + omega * (newv - old);
-                    U[i * K + k] = upd;
-                    double delta = std::abs(upd - old);
-                    if (delta > maxDelta) maxDelta = delta;
-                }
-            }
-        }
-        if (maxDelta < tol) break;
-    }
-
-    for (int y = 0; y < h; ++y) {
-        uchar* m = outMask.ptr<uchar>(y);
-        for (int x = 0; x < w; ++x) {
-            size_t i = static_cast<size_t>(y) * w + x;
-            int bestK = 0; double bestV = U[i * K];
-            for (int k = 1; k < K; ++k)
-                if (U[i * K + k] > bestV) { bestV = U[i * K + k]; bestK = k; }
-            m[x] = labelList[bestK];
-        }
-    }
+    outMask=result;
 }
 
 bool graphCutFromSeeds(const cv::Mat& colorSource, const cv::Mat& seeds,

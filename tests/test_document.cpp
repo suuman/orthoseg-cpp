@@ -272,6 +272,30 @@ int main() {
     }
 
     {
+        Document holes;
+        CHECK(holes.loadImage(input), "load hole-filling test source");
+        auto ring = [&](int x) {
+            holes.fillPolygon({{x, 10}, {x+20, 10}, {x+20, 30}, {x, 30}}, Label::Femur);
+            holes.fillPolygon({{x+1, 11}, {x+19, 11}, {x+19, 29}, {x+1, 29}}, Label::Background);
+        };
+        ring(10); ring(50); ring(90); ring(130);
+        holes.eraseLabelLine({100, 10}, {100, 10}, Label::Femur, 1); // straight opening
+        holes.eraseLabelLine({130, 10}, {130, 10}, Label::Femur, 1); // diagonal opening
+        holes.paintLine({20, 20}, {20, 20}, Label::Tibia, 1);
+        const auto before = holes.maskChannels().clone();
+        CHECK(!holes.fillEnclosedHoles(Label::Femur,100), "hole size limit preserves larger enclosed spaces");
+        CHECK(holes.fillEnclosedHoles(Label::Femur), "fill all enclosed holes in one operation");
+        CHECK(holes.labelMask(Label::Femur).at<uchar>(20,20) && holes.labelMask(Label::Femur).at<uchar>(20,60),
+              "both disjoint enclosed holes are filled");
+        CHECK(!holes.labelMask(Label::Femur).at<uchar>(20,100) && !holes.labelMask(Label::Femur).at<uchar>(20,140) &&
+              !holes.labelMask(Label::Femur).at<uchar>(0,0), "open and diagonal gaps and exterior remain unfilled");
+        CHECK(holes.maskChannels().at<cv::Vec3b>(20,20) == cv::Vec3b(0,2,1), "hole fill preserves overlapping labels");
+        CHECK(!holes.fillEnclosedHoles(Label::Femur) && !holes.fillEnclosedHoles(Label::Background), "no-op and background fill do not edit mask");
+        holes.undo();
+        CHECK(same(before, holes.maskChannels()), "one undo restores every filled hole; no-op adds no history");
+    }
+
+    {
         Document refined;
         CHECK(refined.loadImage(input), "load local refinement regression source");
         refined.paintLine({10, 10}, {12, 10}, Label::Femur, 1);
@@ -296,5 +320,25 @@ int main() {
     }
 
     std::printf("\n%d document test failure(s)\n", failures);
+    {
+        cv::Mat raw(16,16,CV_16U);for(int y=0;y<16;++y)for(int x=0;x<16;++x)raw.at<ushort>(y,x)=1000+y;
+        const auto path=(tmp.path/"precision.tiff").string();cv::imwrite(path,raw);
+        Document high;
+        CHECK(high.loadImage(path),"load high precision TIFF");
+        CHECK(high.sourceOriginal().depth()==CV_16U && cv::norm(raw,high.sourceOriginal(),cv::NORM_INF)==0,"retain original 16-bit samples");
+        double low,max;cv::minMaxLoc(high.sourceGray(),&low,&max);
+        CHECK(low==0 && max==255,"working image normalizes narrow high-bit-depth intensity range");
+        high.paintSeedLine({1,1},{1,1},Label::Femur,1);high.paintSeedLine({14,14},{14,14},Label::Background,1);
+        auto copy=high.segmentationCopy();copy.clearMask();copy.clearSeeds();
+        CHECK(high.hasSeeds(),"worker document owns independent mutable seed data");
+    }
+    {
+        Document limited;CHECK(limited.loadImage(input),"load scoped segmentation image");
+        limited.paintLine({900,30},{900,30},Label::Femur,1);
+        limited.paintSeedLine({2,2},{2,2},Label::Femur,1);
+        limited.paintSeedLine({20,20},{20,20},Label::Background,1);
+        CHECK(limited.runSeedSegmentation(FillAlgorithm::RandomWalker,Label::Femur,.003,{},true),"seed-region segmentation succeeds");
+        CHECK(limited.labelMask(Label::Femur).at<uchar>(30,900),"seed-region segmentation preserves distant same-label annotations");
+    }
     return failures == 0 ? 0 : 1;
 }

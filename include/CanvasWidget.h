@@ -22,6 +22,10 @@ public:
     void setDrawFillHoles(bool enabled) { drawFillHoles_ = enabled; outline_.clear(); update(); }
     void setAutoFillOutline(bool enabled) { autoFillOutline_ = enabled; }
     void fillCurrentOutline();
+    bool applyPendingAIResult();
+    void undoLastEdit();
+    void fillClosedAreas();
+    void setMaxHolePixels(int value) { maxHolePixels_=value; }
     void clearOutline() { outline_.clear(); update(); }
     void setBrushSize(int s)            { brushSize_ = s; }
     void setAIPromptEditing(bool enabled) { aiPromptEditing_ = enabled; drawing_ = false; }
@@ -61,6 +65,7 @@ signals:
     void zoomChanged(float z);
 
 protected:
+    bool event(QEvent*) override;
     void paintEvent(QPaintEvent*) override;
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
@@ -96,6 +101,7 @@ private:
     bool aiPromptErase_ = false;
     bool aiPromptEditing_ = true;
     bool isolatedView_ = false;
+    int maxHolePixels_ = 0;
     bool drawFillHoles_ = false;
     bool autoFillOutline_ = false;
     std::vector<cv::Point> outline_;

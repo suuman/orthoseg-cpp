@@ -251,14 +251,53 @@ void CanvasWidget::paintEvent(QPaintEvent*) {
         path.moveTo(dst.left() + outline_[0].x * sx, dst.top() + outline_[0].y * sy);
         for (size_t i = 1; i < outline_.size(); ++i)
             path.lineTo(dst.left() + outline_[i].x * sx, dst.top() + outline_[i].y * sy);
+        if (tool_ == Tool::Lasso && outline_.size() >= 3) path.closeSubpath();
         p.setPen(QPen(QColor(56, 189, 248), 2, Qt::DashLine));
         p.setBrush(Qt::NoBrush);
         p.drawPath(path);
     }
 }
 
+bool CanvasWidget::applyPendingAIResult() {
+    if (doc_->aiFill().resultMask.empty()) return true;
+    doc_->applyAIResult();
+    if (!doc_->aiFill().resultMask.empty()) return false;
+    emit aiResultApplied();
+    emit maskChanged();
+    update();
+    return true;
+}
+
+void CanvasWidget::undoLastEdit() {
+    const bool pendingLasso = tool_ == Tool::Lasso && !outline_.empty();
+    drawing_ = false;
+    panning_ = false;
+    outline_.clear();
+    gestureRegion_.release();
+    if (!pendingLasso) doc_->undo();
+    emit maskChanged();
+    update();
+}
+
+bool CanvasWidget::event(QEvent* event) {
+    if (event->type() == QEvent::WindowDeactivate || event->type() == QEvent::UngrabMouse) {
+        if (drawing_) { drawing_ = false; emit maskChanged(); }
+        panning_ = false;
+    }
+    return QWidget::event(event);
+}
+
+void CanvasWidget::fillClosedAreas() {
+    if (!doc_->hasImage() || label_ == Label::Background) return;
+    if (!applyPendingAIResult()) return;
+    outline_.clear();
+    if (doc_->fillEnclosedHoles(label_, maxHolePixels_)) emit maskChanged();
+    update();
+}
+
 void CanvasWidget::fillCurrentOutline() {
     if (outline_.size() < 3 || !doc_->hasImage()) return;
+    if (!applyPendingAIResult()) return;
     doc_->fillPolygon(outline_, label_, true,
         edgeConstrained_ && tool_ == Tool::Lasso ? doc_->edgeRegion(outline_.front(), edgePenalty_) : cv::Mat());
     outline_.clear();
@@ -324,24 +363,14 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
         return;
     }
 
-    // If an AI result mask exists and user begins editing with Brush, Eraser, or Fill,
-    // automatically apply AI result into doc_->mask() so user edits the actual AI mask!
-    if ((tool_ == Tool::Brush || tool_ == Tool::Eraser || tool_ == Tool::Fill ||
-         tool_ == Tool::DrawFill || tool_ == Tool::Lasso) &&
-        !doc_->aiFill().resultMask.empty()) {
-        doc_->applyAIResult();
-        if (doc_->aiFill().resultMask.empty()) emit aiResultApplied();
-    }
+    if (!applyPendingAIResult()) return;
 
     gestureRegion_ = edgeConstrained_ && tool_ != Tool::Fill
         ? doc_->edgeRegion({ip.x(), ip.y()}, edgePenalty_) : cv::Mat();
 
     if (tool_ == Tool::DrawFill || tool_ == Tool::Lasso) {
         if (tool_ == Tool::DrawFill && drawFillHoles_) {
-            if (doc_->fillEnclosedAt(cv::Point(ip.x(), ip.y()), label_)) {
-                emit maskChanged();
-                update();
-            }
+            fillClosedAreas();
             return;
         }
         drawing_ = true;
@@ -351,6 +380,7 @@ void CanvasWidget::mousePressEvent(QMouseEvent* e) {
         if (tool_ == Tool::DrawFill) {
             doc_->pushHistory();
             doc_->paintLine(cv::Point(ip.x(), ip.y()), cv::Point(ip.x(), ip.y()), label_, brushSize_, gestureRegion_);
+            emit maskChanged();
         }
         update();
         return;
@@ -395,6 +425,13 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* e) {
         return;
     }
     if (!drawing_) return;
+    if (e->type() == QEvent::MouseMove && !(e->buttons() & Qt::LeftButton)) {
+        // A lost release must not connect a later hover to the last drawn point.
+        drawing_ = false;
+        emit maskChanged();
+        update();
+        return;
+    }
     QPoint ip = widgetToImage(e->position());
     if (tool_ == Tool::DrawFill || tool_ == Tool::Lasso) {
         ip.setX(std::clamp(ip.x(), 0, doc_->width() - 1));
