@@ -2,6 +2,9 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/imgproc.hpp>
+#if CV_VERSION_MAJOR >= 5
+#include <opencv2/geometry/2d.hpp>
+#endif
 #include <opencv2/imgcodecs.hpp>
 
 #include <string>
