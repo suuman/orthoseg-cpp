@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
     CHECK(failed && uiThread && !controller.running(), "worker errors return safely to UI thread");
     CHECK(heartbeat, "UI event loop remains responsive");
 
+#if CV_VERSION_MAJOR < 5
     // Exercise the real CUDA preflight when the checkout's models are available.
     if (cv::cuda::getCudaEnabledDeviceCount() <= 0 &&
         std::filesystem::is_regular_file(std::filesystem::path(ORTHOSEG_MODEL_DIR) /
@@ -141,6 +142,21 @@ int main(int argc, char** argv) {
         }
         CHECK(cudaError, "real models with no CUDA produce an explicit error, not CPU fallback");
     }
+#else
+    const auto modelDir = std::filesystem::path(ORTHOSEG_MODEL_DIR);
+    if (std::filesystem::is_regular_file(modelDir / "medsam2_image_encoder.onnx") &&
+        std::filesystem::is_regular_file(modelDir / "medsam2_mask_decoder.onnx")) {
+        AIFillRequest cpuRequest;
+        cpuRequest.imageBGR = cv::Mat(size, CV_8UC3, cv::Scalar(100, 100, 100));
+        cpuRequest.box = Box{10, 20, 80, 150};
+        cpuRequest.modelDirectory = modelDir.string();
+        MedSAM2Inference inference;
+        const auto output = inference.run(cpuRequest);
+        CHECK(output.size() == size && output.type() == CV_8UC1 &&
+              cv::countNonZero(output > 1) == 0,
+              "OpenCV 5 AI Fill completes real inference without requiring CUDA");
+    }
+#endif
     std::printf("%d AI test failure(s)\n", failures);
     return failures ? 1 : 0;
 }

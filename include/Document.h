@@ -9,6 +9,8 @@
 
 namespace orthoseg {
 
+enum class MaskExportFormat { Both, Labels2D, Channels3D };
+
 // Holds the source X-ray, independent bone channels, an indexed compatibility
 // view for exclusive-label algorithms, and a capped undo history.
 // Knows nothing about Qt so it stays unit-testable.
@@ -18,7 +20,7 @@ public:
 
     bool loadImage(const std::string& path);
     bool importMask(const std::string& path); // Exact 8-bit RGB label channels or grayscale 0..3.
-    bool exportMask(const std::string& path) const;
+    bool exportMask(const std::string& path, MaskExportFormat format = MaskExportFormat::Both) const;
     const std::vector<unsigned char>& originalPng() const { return originalPng_; }
     const std::string& sourcePath() const { return sourcePath_; }
     bool replaceAnatomyMask(const cv::Mat& mapped); // One undo step; preserve unrelated labels.

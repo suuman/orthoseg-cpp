@@ -204,6 +204,21 @@ int main() {
         const auto output = (tmp.path / "overlap.png").string();
         CHECK(doc.exportMask(output), "overlapping channel mask exports as PNG");
         const auto saved = cv::imread(output, cv::IMREAD_UNCHANGED);
+        const auto savedLabels = cv::imread((tmp.path / "binoverlap.png").string(), cv::IMREAD_UNCHANGED);
+        CHECK(savedLabels.type() == CV_8UC1 && same(savedLabels, doc.mask()) &&
+              savedLabels.at<uchar>(all) == 3 && savedLabels.at<uchar>(femTib) == 2 &&
+              savedLabels.at<uchar>(fem) == 1 && savedLabels.at<uchar>(0, 0) == 0,
+              "export also saves source-sized 2D labels with overlap priority Fibula then Tibia then Femur");
+        const auto only2d = (tmp.path / "only2d.png").string();
+        CHECK(doc.exportMask(only2d, MaskExportFormat::Labels2D) &&
+              !std::filesystem::exists(only2d) &&
+              same(cv::imread((tmp.path / "binonly2d.png").string(), cv::IMREAD_UNCHANGED), doc.mask()),
+              "2D-only export writes only the bin-prefixed indexed mask");
+        const auto only3d = (tmp.path / "only3d.png").string();
+        CHECK(doc.exportMask(only3d, MaskExportFormat::Channels3D) &&
+              !std::filesystem::exists(tmp.path / "binonly3d.png") &&
+              same(cv::imread(only3d, cv::IMREAD_UNCHANGED), doc.maskChannels()),
+              "three-channel-only export writes only the RGB mask");
         CHECK(saved.type() == CV_8UC3 && saved.at<cv::Vec3b>(all) == cv::Vec3b(3, 2, 1) &&
               saved.at<cv::Vec3b>(fem) == cv::Vec3b(0, 0, 1) &&
               saved.at<cv::Vec3b>(tib) == cv::Vec3b(0, 2, 0) &&

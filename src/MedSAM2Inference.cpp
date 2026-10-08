@@ -129,11 +129,13 @@ cv::Mat MedSAM2Inference::run(const AIFillRequest& r) {
         const auto decoder = dir / "medsam2_mask_decoder.onnx";
         if (!std::filesystem::is_regular_file(encoder) || !std::filesystem::is_regular_file(decoder))
             throw std::runtime_error("Model directory must contain medsam2_image_encoder.onnx and medsam2_mask_decoder.onnx.");
+#if CV_VERSION_MAJOR < 5
         const auto targets = cv::dnn::getAvailableTargets(cv::dnn::DNN_BACKEND_CUDA);
         if (cv::cuda::getCudaEnabledDeviceCount() <= 0 ||
             std::find(targets.begin(), targets.end(), cv::dnn::DNN_TARGET_CUDA) == targets.end())
             throw std::runtime_error("CUDA is unavailable. AI Fill requires an NVIDIA driver/device and OpenCV DNN built with CUDA and cuDNN.");
         cv::cuda::setDevice(0);
+#endif
         // Release the previous models before changing directories to bound GPU use.
         engine_.reset();
         engine_ = std::make_unique<MedSAM2Engine>(encoder.string(), decoder.string(), "cuda");

@@ -53,7 +53,7 @@ bool Document::loadImage(const std::string& path) {
     }
 }
 
-bool Document::exportMask(const std::string& path) const {
+bool Document::exportMask(const std::string& path, MaskExportFormat format) const {
     if (channels_.empty()) return false;
     // PNG stores RGB channel values exactly: R=1, G=2, B=3. Lossy formats
     // would corrupt these discrete IDs, so never silently write one.
@@ -63,7 +63,11 @@ bool Document::exportMask(const std::string& path) const {
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
     if (ext != ".png") return false;
     try {
-        return cv::imwrite(path, channels_);
+        const auto separator = path.find_last_of("/\\");
+        const size_t nameStart = separator == std::string::npos ? 0 : separator + 1;
+        const std::string labelPath = path.substr(0, nameStart) + "bin" + path.substr(nameStart);
+        if (format != MaskExportFormat::Channels3D && !cv::imwrite(labelPath, mask_)) return false;
+        return format == MaskExportFormat::Labels2D || cv::imwrite(path, channels_);
     } catch (const cv::Exception&) {
         // Missing/unsupported extensions and encoder failures can throw rather
         // than return false. Let the UI show its export error in either case.

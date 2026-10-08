@@ -52,7 +52,7 @@ include_directories(include)
 # ---------------------------------------------------------------------------
 
 # MedSAM2 OpenCV DNN implementation
-add_library(medsam2_ocv STATIC src/medsam2_ocv.cpp)
+add_library(medsam2_ocv STATIC src/medsam2_ocv.cpp src/medsam2_onnx.cpp)
 target_include_directories(medsam2_ocv PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(medsam2_ocv PUBLIC ${OpenCV_LIBS})
 
@@ -155,6 +155,17 @@ endif()
 # ---------------------------------------------------------------------------
 if(BUILD_TESTS)
     enable_testing()
+
+    if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
+        add_executable(test_medsam2 tests/test_medsam2.cpp)
+        target_link_libraries(test_medsam2 PRIVATE medsam2_ocv)
+        add_test(NAME medsam2 COMMAND test_medsam2 "${CMAKE_CURRENT_SOURCE_DIR}/models")
+        set_tests_properties(medsam2 PROPERTIES TIMEOUT 60)
+        if(ALL_RPATHS)
+            set_target_properties(test_medsam2 PROPERTIES INSTALL_RPATH "${ALL_RPATHS}" BUILD_WITH_INSTALL_RPATH TRUE)
+            target_link_options(test_medsam2 PRIVATE "-Wl,--disable-new-dtags")
+        endif()
+    endif()
 
     if(ENABLE_NATIVE_NNUNET AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/models/nnunet2/model.onnx")
         add_executable(test_native_nnunet tests/test_native_nnunet.cpp)

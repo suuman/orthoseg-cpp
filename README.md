@@ -6,7 +6,8 @@ Widgets**, and **OpenCV**, with manual painting and six interactive segmentation
 algorithms, plus **AI Fill** with native MedSAM2 and nnUNet v2 options.
 Processing runs locally without API keys. Native nnUNet v2 runs through OpenCV 5
 DNN with no Python, PyTorch, or MONAI server. Native MedSAM2 requires two ONNX
-models and CUDA-enabled OpenCV DNN; MONAI SAM2 uses the separate local backend.
+models; OpenCV 5 uses its CPU graph engine for the exported SAM2 models, while
+CUDA is used for compatible models loaded by the classic DNN engine; MONAI SAM2 uses the separate local backend.
 
 The original React/TypeScript implementation is included in [`example/`](example/).
 The instructions below describe the native application; see
@@ -31,8 +32,8 @@ The instructions below describe the native application; see
 - CMake 3.16 or newer.
 - Qt 6 development files for the `Widgets` component.
 - OpenCV development files for `core`, `imgproc`, `imgcodecs`, and `dnn` (OpenCV 4+).
-- For AI Fill: an NVIDIA GPU/driver and OpenCV DNN built with CUDA and cuDNN.
-  Distribution OpenCV packages can build the application but may lack CUDA support.
+- MedSAM2 on OpenCV 5 can run on CPU. CUDA inference with the classic DNN engine
+  requires an NVIDIA GPU/driver and OpenCV DNN built with CUDA and cuDNN.
 
 On Debian/Ubuntu, install the build dependencies:
 
@@ -89,8 +90,11 @@ segmentation engine checks, use `./build/test_seg` from the repository root.
    removes only the selected bone; painting with **Background** clears all channels.
 4. Use **Mask Opacity** to adjust the overlay. The mouse wheel and toolbar
    **+**/**−** buttons change zoom; **Reset Zoom** returns to the fitted view.
-5. Click **Export Mask** to save the result. The default filename is
-   `bone_segmentation_mask.png`.
+5. Click **Export Mask** to save the result. The default filename follows the
+   source image name, removing a trailing channel suffix such as `_0000`.
+   Choose **Save format** in the save dialog: **2D labels only**, **3D / three-channel
+   mask only**, or **Both** (default). For a filename of `case.png`, the 2D output
+   is `bincase.png` and the three-channel output is `case.png`, in the same folder.
 
 Use **Show only selected label** to hide the other bone overlays while editing.
 **Draw & Fill** traces a brush outline; **Fill Outline** closes and fills it.
@@ -107,14 +111,16 @@ closing the application.
 
 Click **Batch Mode** in the top bar and choose the X-ray images folder, input
 label-mask folder, and destination folder. A label such as `abc.png` pairs with
-`abc_0000.png` in the images folder. **Start / Resume** loads the first pair
-whose destination `abc.png` does not already exist. Missing image pairs are
+`abc_0000.png` in the images folder. Choose **Save format** for the batch.
+**Start / Resume** loads the first pair whose destination `binabc.png` (2D only)
+or `abc.png` (three-channel or Both) does not already exist. Missing image pairs are
 skipped. Input labels use the same exact RGB channel or grayscale 0–3 format as
 **Import Mask** and must match their X-ray dimensions.
 
 While a batch is active, **Export Mask** becomes **Save Mask & Next**. It saves
-the current mask as `abc.png` in the destination and loads the next unsaved
-pair. The save is atomic; a failed save keeps the current case open. Apply or
+the selected format in the destination and loads the next unsaved pair. Each
+file is saved atomically; when saving Both, `binabc.png` is committed before
+`abc.png`. A failed save keeps the current case open. Apply or
 clear an AI preview before saving. The last save ends batch mode. **Upload X-ray**
 also ends batch mode after a successful manual image load. Click **Batch Mode**
 again with the same folders to resume; masks already present in the destination
@@ -301,8 +307,14 @@ Fibula, then Tibia, then Femur in that view.
 | Tibia | 2 | `(0, 2, 0)` |
 | Fibula | 3 | `(0, 0, 3)` |
 
-**Export Mask** writes an exact 8-bit RGB PNG. Overlaps add channel values, for
+The **3D / three-channel** save option writes an exact 8-bit RGB PNG (a 2D image
+with three channels, not a volume). Overlaps add channel values, for
 example Tibia + Fibula is `(0, 2, 3)` and all three is `(1, 2, 3)`.
+The **2D labels** option writes `bin<filename>` in the same folder, a single-channel 8-bit PNG with the original
+image dimensions and IDs 0=Background, 1=Femur, 2=Tibia, 3=Fibula. At overlapping
+pixels, this 2D label mask chooses Fibula, then Tibia, then Femur. The RGB file
+preserves all overlapping labels. The companion is a multiclass label mask,
+not a binary foreground/background mask. Choose **Both** to save both formats.
 **Import Mask** accepts those exact channel values and combinations, or an 8-bit
 grayscale mask with IDs 0–3 (including RGB files where all three values are
 equal). The imported mask must match the open X-ray's dimensions. Invalid
@@ -626,3 +638,16 @@ Start inside the intended region, not on a strong boundary. Fill Closed Area rem
 a mask-topology operation and ignores X-ray edges. Standard Fill uses intensity;
 Edge-Embedded and Split-and-Merge also apply their edge threshold. Scribble solvers
 use their own edge sensitivity (or Graph Cut's image model).
+
+### MedSAM2 with OpenCV 5
+
+The MedSAM2 loader repairs missing branch-output shape metadata in memory so
+OpenCV 5 can use its new ONNX importer. Cubic Resize remains cubic; the model
+files and weights are unchanged. An OpenCV DNN layer adapter handles integer
+`Abs` operations used by the exported model's shape calculations. No Python,
+ONNX Runtime, or additional libraries are required at runtime.
+
+This OpenCV 5 graph engine runs these models on CPU and does not support CUDA
+targets yet. AI Fill accepts CPU execution on OpenCV 5 and the engine logs the
+actual device. The `medsam2` test checks cubic interpolation, integer `Abs`,
+invalid input handling, and box/mask inference when the model files are present.

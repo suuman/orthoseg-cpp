@@ -1,4 +1,5 @@
 #include "medsam2_ocv.h"
+#include "medsam2_onnx.h"
 
 #include <iostream>
 #include <chrono>
@@ -11,34 +12,43 @@ MedSAM2Engine::MedSAM2Engine(
     backend_id_(cv::dnn::DNN_BACKEND_OPENCV),
     target_id_(cv::dnn::DNN_TARGET_CPU) {
 
-    if (device_str == "cuda" && cv::cuda::getCudaEnabledDeviceCount() > 0) {
-        backend_id_ = cv::dnn::DNN_BACKEND_CUDA;
-        target_id_ = cv::dnn::DNN_TARGET_CUDA;
-        device_str_ = "cuda";
-        std::cout << "[MedSAM2 OpenCV5 C++] Using device: CUDA (Device count: "
-                  << cv::cuda::getCudaEnabledDeviceCount() << ")" << std::endl;
-    } else {
-        backend_id_ = cv::dnn::DNN_BACKEND_OPENCV;
-        target_id_ = cv::dnn::DNN_TARGET_CPU;
-        device_str_ = "cpu";
-        std::cout << "[MedSAM2 OpenCV5 C++] Using device: CPU" << std::endl;
-    }
-
     std::cout << "[MedSAM2 OpenCV5 C++] Loading Image Encoder: " << encoder_path << std::endl;
-    encoder_ = cv::dnn::readNetFromONNX(encoder_path);
+    encoder_ = readMedSAM2ONNX(encoder_path);
     if (encoder_.empty()) {
         std::cerr << "Error: Failed to load Image Encoder ONNX model: " << encoder_path << std::endl;
     }
-    encoder_.setPreferableBackend(backend_id_);
-    encoder_.setPreferableTarget(target_id_);
 
     std::cout << "[MedSAM2 OpenCV5 C++] Loading Mask Decoder: " << decoder_path << std::endl;
-    decoder_ = cv::dnn::readNetFromONNX(decoder_path);
+    decoder_ = readMedSAM2ONNX(decoder_path);
     if (decoder_.empty()) {
         std::cerr << "Error: Failed to load Mask Decoder ONNX model: " << decoder_path << std::endl;
     }
-    decoder_.setPreferableBackend(backend_id_);
-    decoder_.setPreferableTarget(target_id_);
+    bool graphEngine = false;
+#if CV_VERSION_MAJOR >= 5
+    graphEngine = !encoder_.getMainGraph().empty() || !decoder_.getMainGraph().empty();
+#endif
+    device_str_ = "cpu";
+    if (!graphEngine && device_str == "cuda" && cv::cuda::getCudaEnabledDeviceCount() > 0) {
+        const auto targets = cv::dnn::getAvailableTargets(cv::dnn::DNN_BACKEND_CUDA);
+        if (std::find(targets.begin(), targets.end(), cv::dnn::DNN_TARGET_CUDA) != targets.end()) {
+            backend_id_ = cv::dnn::DNN_BACKEND_CUDA;
+            target_id_ = cv::dnn::DNN_TARGET_CUDA;
+            device_str_ = "cuda";
+            cv::cuda::setDevice(0);
+        }
+    }
+    auto configure = [&](cv::dnn::Net& net) {
+#if CV_VERSION_MAJOR >= 5
+        // This OpenCV graph engine executes on CPU and ignores CUDA targets.
+        if (!net.getMainGraph().empty()) return;
+#endif
+        net.setPreferableBackend(backend_id_);
+        net.setPreferableTarget(target_id_);
+    };
+    configure(encoder_);
+    configure(decoder_);
+    std::cout << "[MedSAM2 OpenCV5 C++] Using device: " << device_str_
+              << (graphEngine ? " (OpenCV 5 graph engine)" : "") << std::endl;
 }
 
 SegmentationResult MedSAM2Engine::segment(

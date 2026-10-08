@@ -90,11 +90,16 @@ int main(int argc, char** argv) {
     if (!tmp.isValid()) return 1;
     const QString input = tmp.filePath("source.png");
     cv::imwrite(input.toStdString(), cv::Mat(20, 20, CV_8UC3, cv::Scalar(80, 80, 80)));
-    auto chooseFile = [&window](const QString& path) {
-        QTimer::singleShot(0, &window, [path] {
+    auto chooseFile = [&window](const QString& path, int formatIndex = -1) {
+        QTimer::singleShot(0, &window, [path, formatIndex] {
             auto* dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
             CHECK(dialog != nullptr, "file dialog opens");
             if (dialog) {
+                if (formatIndex >= 0) {
+                    auto* format = dialog->findChild<QComboBox*>("maskExportFormat");
+                    CHECK(format != nullptr, "export dialog offers save format choices");
+                    if (format) format->setCurrentIndex(formatIndex);
+                }
                 dialog->selectFile(path);
                 QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection);
             } else if (auto* modal = QApplication::activeModalWidget()) {
@@ -110,6 +115,21 @@ int main(int argc, char** argv) {
           "export slot is invoked");
     CHECK(QFileInfo::exists(tmp.filePath("annotation.png")),
           "export adds the PNG suffix when the user omits an extension");
+    const auto exportedLabels = cv::imread(tmp.filePath("binannotation.png").toStdString(), cv::IMREAD_UNCHANGED);
+    CHECK(exportedLabels.type() == CV_8UC1 && exportedLabels.size() == window.document()->mask().size(),
+          "manual export also writes a source-sized 2D label PNG");
+    chooseFile(tmp.filePath("only2d.png"), 1);
+    QMetaObject::invokeMethod(&window, "onExport", Qt::DirectConnection);
+    CHECK(QFileInfo::exists(tmp.filePath("binonly2d.png")) && !QFileInfo::exists(tmp.filePath("only2d.png")),
+          "2D-only choice saves only the bin-prefixed file");
+    chooseFile(tmp.filePath("only3d.png"), 2);
+    QMetaObject::invokeMethod(&window, "onExport", Qt::DirectConnection);
+    CHECK(QFileInfo::exists(tmp.filePath("only3d.png")) && !QFileInfo::exists(tmp.filePath("binonly3d.png")),
+          "three-channel-only choice saves only the RGB file");
+    chooseFile(tmp.filePath("both.png"), 0);
+    QMetaObject::invokeMethod(&window, "onExport", Qt::DirectConnection);
+    CHECK(QFileInfo::exists(tmp.filePath("both.png")) && QFileInfo::exists(tmp.filePath("binboth.png")),
+          "Both choice saves both files");
     auto* isolated = window.findChild<QCheckBox*>("isolatedLabelView");
     auto* drawFillTool = window.findChild<QPushButton*>("drawFillToolBtn");
     auto* lassoTool = window.findChild<QPushButton*>("lassoToolBtn");
@@ -594,7 +614,7 @@ int main(int argc, char** argv) {
     QApplication::processEvents();
     auto* batchButton = batchWindow.findChild<QPushButton*>("batchModeButton");
     CHECK(batchButton && batchButton->isVisible(), "Batch Mode button is visible in the top bar");
-    auto startBatch = [&] {
+    auto startBatch = [&](int formatIndex = 0) {
         bool configured = false;
         QTimer::singleShot(0, &batchWindow, [&] {
             auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
@@ -602,11 +622,13 @@ int main(int argc, char** argv) {
             auto* labels = dlg ? dlg->findChild<QLineEdit*>("batchLabelsDir") : nullptr;
             auto* saved = dlg ? dlg->findChild<QLineEdit*>("batchOutputDir") : nullptr;
             auto* start = dlg ? dlg->findChild<QPushButton*>("batchStartButton") : nullptr;
-            configured = images && labels && saved && start;
+            auto* format = dlg ? dlg->findChild<QComboBox*>("maskExportFormat") : nullptr;
+            configured = images && labels && saved && start && format;
             if (!configured) { if (dlg) dlg->reject(); return; }
             images->setText(imageDir);
             labels->setText(labelDir);
             saved->setText(savedDir);
+            format->setCurrentIndex(formatIndex);
             start->click();
         });
         batchButton->click();
@@ -632,6 +654,10 @@ int main(int argc, char** argv) {
     batchWindow.document()->paintLine({4, 4}, {4, 4}, Label::Fibula, 1);
     QMetaObject::invokeMethod(&batchWindow, "onExport", Qt::DirectConnection);
     const auto savedBMask = cv::imread(savedB.toStdString(), cv::IMREAD_UNCHANGED);
+    const auto savedBLabels = cv::imread(QDir(savedDir).filePath("bincase_b.png").toStdString(), cv::IMREAD_UNCHANGED);
+    CHECK(savedBLabels.type() == CV_8UC1 && savedBLabels.size() == cv::Size(16, 16) &&
+          savedBLabels.at<uchar>(4, 4) == 3 && savedBLabels.at<uchar>(0, 0) == 0,
+          "batch export also writes 2D labels with the expected overlap priority");
     CHECK(savedBMask.type() == CV_8UC3 && savedBMask.at<cv::Vec3b>(4, 4) == cv::Vec3b(3, 2, 1) &&
           batchButton->text() == "Batch 2/2" &&
           QString::fromStdString(batchWindow.document()->sourcePath()).endsWith("case_c_0000.png"),
@@ -659,6 +685,15 @@ int main(int argc, char** argv) {
           batchButton->text() == "Batch Mode" &&
           cv::norm(savedABefore, cv::imread(savedA.toStdString(), cv::IMREAD_UNCHANGED), cv::NORM_INF) == 0,
           "last save completes the batch and leaves previously saved masks untouched");
+    startBatch(1);
+    CHECK(batchButton->text() == "Batch 1/1" &&
+          QString::fromStdString(batchWindow.document()->sourcePath()).endsWith("case_a_0000.png"),
+          "2D batch resume skips existing bin files and opens the case with only an RGB output");
+    QMetaObject::invokeMethod(&batchWindow, "onExport", Qt::DirectConnection);
+    const auto savedALabels = cv::imread(QDir(savedDir).filePath("bincase_a.png").toStdString(), cv::IMREAD_UNCHANGED);
+    CHECK(savedALabels.type() == CV_8UC1 && batchButton->text() == "Batch Mode" &&
+          cv::norm(savedABefore, cv::imread(savedA.toStdString(), cv::IMREAD_UNCHANGED), cv::NORM_INF) == 0,
+          "2D-only batch saves the bin file and leaves the existing RGB output untouched");
 
     // Real mouse gestures exercise all four edge-aware tool paths.
     const QString edgeInput = tmp.filePath("edge-tools.png");

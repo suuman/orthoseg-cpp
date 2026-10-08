@@ -93,6 +93,8 @@ private:
     QString batchImagesDir_;
     QString batchLabelsDir_;
     QString batchOutputDir_;
+    MaskExportFormat exportFormat_ = MaskExportFormat::Both;
+    MaskExportFormat batchFormat_ = MaskExportFormat::Both;
 
     ModelManagementDialog* modelManagement_ = nullptr;
     std::unique_ptr<Document> doc_;

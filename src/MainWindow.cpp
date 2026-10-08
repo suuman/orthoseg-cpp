@@ -46,6 +46,26 @@
 
 namespace orthoseg {
 
+static QString labelExportPath(const QString& path) {
+    const QFileInfo info(path);
+    return info.dir().filePath("bin" + info.fileName());
+}
+
+static QString exportCompletionPath(const QString& path, MaskExportFormat format) {
+    return format == MaskExportFormat::Labels2D ? labelExportPath(path) : path;
+}
+
+static QComboBox* exportFormatCombo(QWidget* parent, MaskExportFormat format) {
+    auto* combo = new QComboBox(parent);
+    combo->setObjectName("maskExportFormat");
+    combo->addItem("Both: 2D labels + 3D / three-channel mask");
+    combo->addItem("2D labels only (0–3, bin prefix)");
+    combo->addItem("3D / three-channel mask only (RGB)");
+    combo->setCurrentIndex(static_cast<int>(format));
+    combo->setToolTip("2D overlap priority: Fibula, then Tibia, then Femur. Three channels preserve overlaps.");
+    return combo;
+}
+
 static cv::Mat selectedBonePrompt(const cv::Mat& mask, Label label) {
     if (mask.empty()) return {};
     if (label != Label::Femur && label != Label::Tibia)
@@ -1099,7 +1119,7 @@ QWidget* MainWindow::buildAIPanel() {
         else onRunAIFill();
     });
     layout->addWidget(aiRun_);
-    aiStatus_ = new QLabel("Ready. CUDA required.");
+    aiStatus_ = new QLabel("Ready.");
     aiStatus_->setObjectName("aiStatus");
     aiStatus_->setWordWrap(true);
     aiStatus_->setMinimumHeight(42);
@@ -1343,16 +1363,20 @@ void MainWindow::onOpenModelDirDialog() {
         const auto dec = dir / "medsam2_mask_decoder.onnx";
         bool encOk = std::filesystem::is_regular_file(enc);
         bool decOk = std::filesystem::is_regular_file(dec);
-        bool cudaOk = cv::cuda::getCudaEnabledDeviceCount() > 0;
+#if CV_VERSION_MAJOR >= 5
+        const QString execution = "CPU supported (OpenCV 5 graph engine)";
+#else
+        const bool cudaOk = cv::cuda::getCudaEnabledDeviceCount() > 0;
+        const QString execution = cudaOk ? "CUDA GPU Available" : "CUDA Unavailable (CUDA required)";
+#endif
 
         QString msg;
         if (encOk && decOk) {
             msg = QString("<span style='color:#22c55e; font-weight:bold;'>✓ Valid MedSAM2 Models Found</span><br>"
                           "• medsam2_image_encoder.onnx: <span style='color:#22c55e;'>Present</span><br>"
                           "• medsam2_mask_decoder.onnx: <span style='color:#22c55e;'>Present</span><br>"
-                          "• Hardware Acceleration: %1")
-                  .arg(cudaOk ? "<span style='color:#22c55e;'>CUDA GPU Available</span>"
-                              : "<span style='color:#f87171;'>CUDA Unavailable (CUDA required for AI Fill)</span>");
+                          "• Execution: %1")
+                  .arg(execution);
         } else {
             msg = QString("<span style='color:#f87171; font-weight:bold;'>✗ Incomplete Model Directory</span><br>"
                           "• medsam2_image_encoder.onnx: %1<br>"
@@ -1866,9 +1890,9 @@ void MainWindow::updateBatchUi() {
         const QString stem = QFileInfo(item.labelPath).completeBaseName();
         batchModeBtn_->setText(QString("Batch %1/%2").arg(batchIndex_ + 1).arg(batchItems_.size()));
         batchModeBtn_->setToolTip(QString("Current case: %1\nSaving to: %2\nClick to configure a new batch")
-            .arg(stem, item.outputPath));
+            .arg(stem, exportCompletionPath(item.outputPath, batchFormat_)));
         exportMaskBtn_->setText("Save Mask & Next");
-        exportMaskBtn_->setToolTip(QString("Save %1 and load the next unsaved pair").arg(item.outputPath));
+        exportMaskBtn_->setToolTip(QString("Save %1 and load the next unsaved pair").arg(exportCompletionPath(item.outputPath, batchFormat_)));
         setWindowTitle(QString("OrthoSeg — Batch %1/%2 — %3")
             .arg(batchIndex_ + 1).arg(batchItems_.size()).arg(stem));
     } else {
@@ -1926,8 +1950,8 @@ void MainWindow::onBatchMode() {
     layout->setContentsMargins(20, 20, 20, 20);
     layout->setSpacing(12);
     auto* description = new QLabel(
-        "Label abc.png pairs with X-ray abc_0000.png. Edited masks are saved as abc.png "
-        "in the destination folder. Pairs with an existing destination mask are skipped.", &dlg);
+        "Label abc.png pairs with X-ray abc_0000.png. Save three-channel masks as abc.png, "
+        "2D labels as binabc.png, or both. Pairs already saved in the chosen format are skipped.", &dlg);
     description->setWordWrap(true);
     layout->addWidget(description);
 
@@ -1951,6 +1975,9 @@ void MainWindow::onBatchMode() {
     auto* imagesEdit = addFolder("X-ray images folder", "batchImagesDir", batchImagesDir_);
     auto* labelsEdit = addFolder("Input label masks folder", "batchLabelsDir", batchLabelsDir_);
     auto* outputEdit = addFolder("Saved masks destination", "batchOutputDir", batchOutputDir_);
+    layout->addWidget(new QLabel("Save format:", &dlg));
+    auto* formatCombo = exportFormatCombo(&dlg, exportFormat_);
+    layout->addWidget(formatCombo);
     auto* feedback = new QLabel(&dlg);
     feedback->setObjectName("batchSetupFeedback");
     feedback->setWordWrap(true);
@@ -1996,7 +2023,8 @@ void MainWindow::onBatchMode() {
             const QString xray = imageDir.filePath(stem + "_0000.png");
             const QString saved = outputDir.filePath(stem + ".png");
             if (!QFileInfo(xray).isFile()) { ++missingImages; continue; }
-            if (QFileInfo::exists(saved)) { ++alreadySaved; continue; }
+            const auto format = static_cast<MaskExportFormat>(formatCombo->currentIndex());
+            if (QFileInfo::exists(exportCompletionPath(saved, format))) { ++alreadySaved; continue; }
             pending.push_back({xray, label.absoluteFilePath(), saved});
         }
         if (pending.empty()) {
@@ -2015,6 +2043,7 @@ void MainWindow::onBatchMode() {
     batchImagesDir_ = selectedImages;
     batchLabelsDir_ = selectedLabels;
     batchOutputDir_ = selectedOutput;
+    batchFormat_ = exportFormat_ = static_cast<MaskExportFormat>(formatCombo->currentIndex());
     batchItems_ = std::move(selected);
     batchIndex_ = 0;
     batchActive_ = true;
@@ -2064,35 +2093,49 @@ void MainWindow::onExport() {
     if (batchActive_) {
         if (batchIndex_ >= batchItems_.size()) { endBatchMode(); return; }
         const QString savedPath = batchItems_[batchIndex_].outputPath;
-        if (QFileInfo::exists(savedPath)) {
+        if (QFileInfo::exists(exportCompletionPath(savedPath, batchFormat_))) {
             endBatchMode();
             QMessageBox::warning(this, "Batch Mode",
                 "A saved mask appeared for the current case, so batch mode stopped without overwriting it. Select Batch Mode to resume.");
             return;
         }
-        std::vector<uchar> encoded;
+        const QString labelPath = labelExportPath(savedPath);
+        const bool saveLabels = batchFormat_ != MaskExportFormat::Channels3D;
+        const bool saveChannels = batchFormat_ != MaskExportFormat::Labels2D;
+        std::vector<uchar> encoded, encodedLabels;
         bool encodedOkay = false;
-        try { encodedOkay = cv::imencode(".png", doc_->maskChannels(), encoded); }
+        try {
+            encodedOkay = (!saveChannels || cv::imencode(".png", doc_->maskChannels(), encoded)) &&
+                          (!saveLabels || cv::imencode(".png", doc_->mask(), encodedLabels));
+        }
         catch (const cv::Exception&) {
             QMessageBox::warning(this, "Batch Mode", "Could not encode the current mask as PNG.");
             return;
         }
-        if (!encodedOkay || encoded.empty()) {
+        if (!encodedOkay || (saveChannels && encoded.empty()) || (saveLabels && encodedLabels.empty())) {
             QMessageBox::warning(this, "Batch Mode", "Could not encode the current mask as PNG.");
             return;
         }
+        // Commit the companion first; the RGB file remains the batch completion marker.
+        QSaveFile labelsFile(labelPath);
+        if (saveLabels && (!labelsFile.open(QIODevice::WriteOnly) ||
+            labelsFile.write(reinterpret_cast<const char*>(encodedLabels.data()), qint64(encodedLabels.size())) != qint64(encodedLabels.size()) ||
+            !labelsFile.commit())) {
+            QMessageBox::warning(this, "Batch Mode", "Could not save the 2D label mask to:\n" + labelPath);
+            return;
+        }
         QSaveFile file(savedPath);
-        if (!file.open(QIODevice::WriteOnly) ||
+        if (saveChannels && (!file.open(QIODevice::WriteOnly) ||
             file.write(reinterpret_cast<const char*>(encoded.data()), qint64(encoded.size())) != qint64(encoded.size()) ||
-            !file.commit()) {
+            !file.commit())) {
             QMessageBox::warning(this, "Batch Mode", "Could not save the mask to:\n" + savedPath);
             return;
         }
-        markProcessed(savedPath);
+        markProcessed(exportCompletionPath(savedPath, batchFormat_));
         offerMonaiTraining();
         ++batchIndex_;
         while (batchIndex_ < batchItems_.size() &&
-               QFileInfo::exists(batchItems_[batchIndex_].outputPath)) ++batchIndex_;
+               QFileInfo::exists(exportCompletionPath(batchItems_[batchIndex_].outputPath, batchFormat_))) ++batchIndex_;
         if (batchIndex_ >= batchItems_.size()) {
             const auto count = batchItems_.size();
             endBatchMode();
@@ -2119,10 +2162,13 @@ void MainWindow::onExport() {
     destination->setObjectName("exportDestinationFolder");
     destination->setToolTip("Type or paste an existing destination folder. You can also enter a full path in File name.");
     auto* grid = qobject_cast<QGridLayout*>(dialog.layout());
+    auto* formatCombo = exportFormatCombo(&dialog, exportFormat_);
     if (grid) {
         const int row = grid->rowCount();
         grid->addWidget(new QLabel("Destination folder:", &dialog), row, 0);
         grid->addWidget(destination, row, 1, 1, grid->columnCount() - 1);
+        grid->addWidget(new QLabel("Save format:", &dialog), row + 1, 0);
+        grid->addWidget(formatCombo, row + 1, 1, 1, grid->columnCount() - 1);
     }
     connect(destination, &QLineEdit::textChanged, &dialog, [&dialog](const QString& text) {
         const QString folder = text.trimmed();
@@ -2138,19 +2184,23 @@ void MainWindow::onExport() {
     });
     if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) return;
     const QString path = dialog.selectedFiles().first();
+    const auto format = static_cast<MaskExportFormat>(formatCombo->currentIndex());
     if (!QDir(destination->text().trimmed()).exists()) {
         QMessageBox::warning(this, "Export Mask", "The destination folder does not exist. Choose or create a folder before saving.");
         return;
     }
-    if (QFileInfo(path).canonicalFilePath() == source.canonicalFilePath() && source.exists()) {
+    const QString labelPath = labelExportPath(path);
+    if (source.exists() && ((format != MaskExportFormat::Labels2D && QFileInfo(path).canonicalFilePath() == source.canonicalFilePath()) ||
+                            (format != MaskExportFormat::Channels3D && QFileInfo(labelPath).canonicalFilePath() == source.canonicalFilePath()))) {
         QMessageBox::warning(this, "Export Mask", "Choose a different folder or filename so the mask does not overwrite the source X-ray.");
         return;
     }
-    if (!doc_->exportMask(path.toStdString())) {
+    if (!doc_->exportMask(path.toStdString(), format)) {
         QMessageBox::warning(this, "OrthoSeg", "Failed to export mask.");
         return;
     }
-    markProcessed(path);
+    exportFormat_ = format;
+    markProcessed(exportCompletionPath(path, format));
     offerMonaiTraining();
 }
 
