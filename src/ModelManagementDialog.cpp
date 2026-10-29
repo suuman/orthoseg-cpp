@@ -264,7 +264,7 @@ void ModelManagementDialog::exportCases() {
     }
     exportCases_->setText("Exporting…");
     exportCasesPage(dialog.selectedFiles().value(0), model, revision, 0, -1,
-        "Filename,Labels,Overlap pixels,Training status,Model,Case ID\r\n");
+        "File path,Labels,Overlap pixels,Training status,Model,Case ID\r\n");
 }
 void ModelManagementDialog::exportCasesPage(const QString& path, const QString& model,
         unsigned revision, int offset, int total, QByteArray csv) {
@@ -294,7 +294,8 @@ void ModelManagementDialog::exportCasesPage(const QString& path, const QString& 
             const auto item = entry.toObject();
             QStringList labels;
             for (const auto& label : item["labels"].toArray()) labels << label.toString();
-            QStringList fields{item["filename"].toString(), labels.join(", "),
+            const QString sourcePath = item["original_path"].toString();
+            QStringList fields{sourcePath.isEmpty() ? item["filename"].toString() : sourcePath, labels.join(", "),
                 QString::number(item["overlap_pixels"].toInt()),
                 item["status"] == "incorporated" ? "Incorporated" : "Pending", model, item["case_id"].toString()};
             for (auto& field : fields) field = quote(field);

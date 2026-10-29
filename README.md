@@ -626,3 +626,18 @@ Start inside the intended region, not on a strong boundary. Fill Closed Area rem
 a mask-topology operation and ignores X-ray edges. Standard Fill uses intensity;
 Edge-Embedded and Split-and-Merge also apply their edge threshold. Scribble solvers
 use their own edge sensitivity (or Graph Cut's image model).
+
+
+### Region nnUNet model (OpenCV 5)
+
+AI Fill offers **nnunetv2_region (opencv5)** alongside the existing native nnUNet.
+Its two independent heads represent femur `[1,3]` and tibia `[2,3]`; both positive
+heads become overlapping femur/tibia mask channels. Label 3 is not Fibula.
+Preview, Apply, automatic application before edits, Undo, and RGB mask export retain overlap.
+The new option uses only local OpenCV 5 DNN, with no MONAI request or Python runtime.
+
+The default model is `models/nnunetv2_region/model.onnx`. Configure it separately
+in Local Models or set `ORTHOSEG_NNUNET_REGION_MODEL`. The existing native model
+path is unchanged. Both use the existing acceleration selector and 2048-high input.
+Export the region model with MONAI's `scripts/export_nnunet_region.py`; deploy the
+ONNX and accompanying manifest separately because ONNX files are ignored by Git.

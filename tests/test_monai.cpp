@@ -236,9 +236,10 @@ int main(int argc, char** argv) {
           "nnUNet endpoint called with source-sized mask");
     canonical.at<uchar>(0,0)=2;
     done=false;
-    client.submitTrainingCase(original,canonical,"original.png","test_v1",[&](auto,auto err){error=err;done=true;});
+    client.submitTrainingCase(original,canonical,"/data/X-rays/original.png","test_v1",[&](auto,auto err){error=err;done=true;});
     CHECK(waitFor([&]{return done;}) && error.isEmpty(), "training upload accepted");
     CHECK(server.field("image")==original && same(decodeMonaiMask(server.field("mask"),source.size()),canonical), "training uploads current corrected mask with original bytes");
+    CHECK(server.field("original_filename")=="original.png" && server.field("original_path")=="/data/X-rays/original.png", "training retains full source path and basename");
     CHECK(server.field("model_version")=="test_v1", "training includes model traceability");
     server.status=503;server.response="{\"detail\":\"No production model\"}";
     done=false;client.segment(original,source.size(),[&](auto,auto,auto err){error=err;done=true;});

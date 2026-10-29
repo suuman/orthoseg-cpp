@@ -10,6 +10,7 @@ struct NativeNnUnetRequest {
     cv::Mat imageBGR;
     std::string modelPath;
     std::string device = "auto";
+    bool regions = false;
 };
 #endif
 

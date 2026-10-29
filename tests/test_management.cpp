@@ -66,6 +66,7 @@ struct Backend : QTcpServer {
                         for (int i=0; i<(second ? 1 : 50); ++i)
                             items.append(QJsonObject{{"case_id", QString("case%1").arg(i)},
                                 {"filename", second ? "last.png" : "knee.png"},
+                                {"original_path", second ? "" : "/data/X-rays/knee.png"},
                                 {"labels", QJsonArray{"Femur", "Tibia"}}, {"overlap_pixels", 12},
                                 {"status", path.contains("model=medsam2") ? "pending" : "incorporated"}});
                         result = {{"items",items},{"total",51},{"offset",second ? 50 : 0},{"limit",50}};
@@ -238,6 +239,7 @@ int main(int argc,char** argv){
     const auto contents = csv.readAll();
     CHECK(contents.count('\n') == 52 && contents.contains("last.png") && contents.contains("knee.png"),
           "export from last table page includes all 51 files plus header");
+    CHECK(contents.contains("\"/data/X-rays/knee.png\"") && contents.contains("\"last.png\""), "CSV exports full paths with legacy filename fallback");
     CHECK(contents.contains("\"Femur, Tibia\"") && contents.contains("\"Incorporated\",\"unet\""),
           "CSV quotes multi-label cells and includes selected model training status");
     model->setCurrentIndex(1);

@@ -109,6 +109,7 @@ private:
 #ifdef ORTHOSEG_NATIVE_NNUNET
     QWidget* nativeNnUnetControls_ = nullptr;
     QString nativeNnUnetModelPath_;
+    QString nativeNnUnetRegionModelPath_;
     QString nativeNnUnetDeviceKey_ = "auto";
     cv::Mat nativeNnUnetBefore_;
     unsigned long nativeNnUnetGeneration_ = 0;

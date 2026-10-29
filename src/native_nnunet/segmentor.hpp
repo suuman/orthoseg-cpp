@@ -21,7 +21,7 @@ constexpr int TILE_WIDTH = 768;
  * @brief Structure holding inference outputs and original image data.
  */
 struct InferenceResult {
-    cv::Mat label_mask;        // (orig_H, orig_W) CV_8UC1 with discrete values {0, 1, 2}
+    cv::Mat label_mask;        // (orig_H, orig_W) CV_8UC1 with discrete values {0, 1, 2}; region mode also uses 3 for overlap
     cv::Mat overlay_bgr;       // (orig_H, orig_W) CV_8UC3 alpha-blended overlay on original image
     cv::Mat color_mask_bgr;    // (orig_H, orig_W) CV_8UC3 colored visual mask (Femur: Green, Tibia: Red)
     cv::Mat original_bgr;      // (orig_H, orig_W) CV_8UC3 original image in BGR
@@ -67,7 +67,8 @@ public:
     explicit XRaySegmentor(const std::string& onnx_model_path,
                            AccelerationMode mode = AccelerationMode::CUDA_FP16,
                            float alpha = 0.4f,
-                           bool draw_contours = true);
+                           bool draw_contours = true,
+                           bool regions = false);
 
     /**
      * @brief Factory constructor using string identifier ("auto", "cuda", "cuda_fp16", "cpu")
@@ -75,7 +76,8 @@ public:
     static std::unique_ptr<XRaySegmentor> create(const std::string& onnx_model_path,
                                                   const std::string& device_str = "auto",
                                                   float alpha = 0.4f,
-                                                  bool draw_contours = true);
+                                                  bool draw_contours = true,
+                           bool regions = false);
 
     /**
      * @brief Run inference on an image from disk.
@@ -108,6 +110,9 @@ private:
     AccelerationMode mode_;
     float alpha_;
     bool draw_contours_;
+    bool regions_;
+    int regionTileWidth_ = TILE_WIDTH;
+    cv::Mat run_region_window(const cv::Mat& image);
 
     void preprocess(const cv::Mat& orig_gray,
                     cv::Mat& img_infer,

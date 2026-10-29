@@ -1,5 +1,6 @@
 #include "MonaiClient.h"
 #include <QCryptographicHash>
+#include <QFileInfo>
 #include <QHttpMultiPart>
 #include <QJsonDocument>
 #include <QNetworkProxy>
@@ -134,7 +135,8 @@ void MonaiClient::request(const QString& path, const QByteArray& original, const
         if (!tibiaBox.isEmpty()) part("tibia_box", tibiaBox, false);
         if (!mask.isEmpty()) {
             part("mask", mask, true);
-            part("original_filename", filename.toUtf8(), false);
+            part("original_filename", QFileInfo(filename).fileName().toUtf8(), false);
+            if (QFileInfo(filename).isAbsolute()) part("original_path", filename.toUtf8(), false);
             if (!version.isEmpty()) part("model_version", version.toUtf8(), false);
         }
         reply = network_.post(req, multipart);

@@ -12,7 +12,7 @@ namespace xray_ocv {
 std::unique_ptr<XRaySegmentor> XRaySegmentor::create(const std::string& onnx_model_path,
                                                       const std::string& device_str,
                                                       float alpha,
-                                                      bool draw_contours) {
+                                                      bool draw_contours, bool regions) {
     AccelerationMode mode = AccelerationMode::CUDA_FP16; // default for RTX 4050
 
     if (device_str == "cpu") {
@@ -28,16 +28,16 @@ std::unique_ptr<XRaySegmentor> XRaySegmentor::create(const std::string& onnx_mod
         }
     }
 
-    return std::make_unique<XRaySegmentor>(onnx_model_path, mode, alpha, draw_contours);
+    return std::make_unique<XRaySegmentor>(onnx_model_path, mode, alpha, draw_contours, regions);
 }
 
 XRaySegmentor::XRaySegmentor(const std::string& onnx_model_path,
                              AccelerationMode mode,
                              float alpha,
-                             bool draw_contours)
+                             bool draw_contours, bool regions)
     : mode_(mode),
       alpha_(alpha),
-      draw_contours_(draw_contours) {
+      draw_contours_(draw_contours), regions_(regions) {
 
     if (!fs::exists(onnx_model_path)) {
         throw std::runtime_error("ONNX model file not found: " + onnx_model_path);
@@ -49,6 +49,18 @@ XRaySegmentor::XRaySegmentor(const std::string& onnx_model_path,
         throw std::runtime_error("Failed to load model from: " + onnx_model_path);
     }
 
+    if (regions_) {
+        const auto manifest = fs::path(onnx_model_path).parent_path() / "manifest.json";
+        if (fs::exists(manifest)) {
+            cv::FileStorage metadata(manifest.string(), cv::FileStorage::READ | cv::FileStorage::FORMAT_JSON);
+            std::vector<int> shape;
+            metadata["input_shape"] >> shape;
+            if (shape.size()!=4 || shape[0]!=1 || shape[1]!=1 || shape[2]!=TARGET_HEIGHT ||
+                (shape[3]!=256 && shape[3]!=768))
+                throw std::runtime_error("Unsupported region model input_shape in manifest.json");
+            regionTileWidth_ = shape[3];
+        }
+    }
     // Configure hardware acceleration
     if (mode_ == AccelerationMode::CUDA_FP16 || mode_ == AccelerationMode::CUDA_FP32) {
         int cuda_count = cv::cuda::getCudaEnabledDeviceCount();
@@ -108,6 +120,7 @@ void XRaySegmentor::preprocess(const cv::Mat& orig_gray,
 }
 
 cv::Mat XRaySegmentor::run_sliding_window(const cv::Mat& img_infer, int infer_w, int infer_h) {
+    if (regions_) return run_region_window(img_infer);
     // 1. Intensity Normalization: Z-Score (x - mean) / std matching nnUNet
     cv::Mat img_f;
     img_infer.convertTo(img_f, CV_32FC1);
@@ -134,6 +147,9 @@ cv::Mat XRaySegmentor::run_sliding_window(const cv::Mat& img_infer, int infer_w,
 
         // Crop center padding and compute argmax across classes (0, 1, 2)
         cv::Mat pred(infer_h, infer_w, CV_8UC1);
+        if (out.dims != 4 || out.type() != CV_32F || out.size[0] != 1 ||
+            out.size[1] != 3 || out.size[2] != infer_h || out.size[3] != TILE_WIDTH)
+            throw std::runtime_error("Expected three-class nnUNet logits; select the region option for a two-head model.");
         const float* p0 = out.ptr<float>(0, 0);
         const float* p1 = out.ptr<float>(0, 1);
         const float* p2 = out.ptr<float>(0, 2);
@@ -196,6 +212,9 @@ cv::Mat XRaySegmentor::run_sliding_window(const cv::Mat& img_infer, int infer_w,
         net_.setInput(blob);
         cv::Mat out = net_.forward();
 
+        if (out.dims != 4 || out.type() != CV_32F || out.size[0] != 1 ||
+            out.size[1] != 3 || out.size[2] != infer_h || out.size[3] != TILE_WIDTH)
+            throw std::runtime_error("Expected three-class nnUNet logits; select the region option for a two-head model.");
         const float* p0 = out.ptr<float>(0, 0);
         const float* p1 = out.ptr<float>(0, 1);
         const float* p2 = out.ptr<float>(0, 2);
@@ -243,6 +262,54 @@ cv::Mat XRaySegmentor::run_sliding_window(const cv::Mat& img_infer, int infer_w,
     return pred;
 }
 
+
+// Region heads are independent logits: sigmoid(logit) > 0.5 iff logit > 0.
+// Blend logits before thresholding; never take argmax between bones.
+cv::Mat XRaySegmentor::run_region_window(const cv::Mat& image) {
+    cv::Mat normalized;
+    image.convertTo(normalized, CV_32F);
+    cv::Scalar mean, deviation;
+    cv::meanStdDev(normalized, mean, deviation);
+    normalized = (normalized - mean[0]) / std::max(deviation[0], 1e-8);
+    const int width = std::max(image.cols, regionTileWidth_);
+    const int left = (width - image.cols) / 2;
+    cv::Mat padded;
+    cv::copyMakeBorder(normalized, padded, 0, 0, left, width-image.cols-left,
+                       cv::BORDER_CONSTANT, 0);
+    const int count = int(std::ceil(double(width-regionTileWidth_) / (regionTileWidth_*0.5))) + 1;
+    cv::Mat femur = cv::Mat::zeros(image.rows, width, CV_32F);
+    cv::Mat tibia = cv::Mat::zeros(image.rows, width, CV_32F);
+    std::vector<float> weights(regionTileWidth_);
+    for (int x=0; x<regionTileWidth_; ++x) {
+        const double d = (x - regionTileWidth_/2) / (regionTileWidth_/8.0);
+        weights[x] = float(std::max(std::exp(-0.5*d*d), 1e-7));
+    }
+    for (int step=0; step<count; ++step) {
+        const int start = count==1 ? 0 : int(std::nearbyint(double(width-regionTileWidth_)*step/(count-1)));
+        net_.setInput(cv::dnn::blobFromImage(padded(cv::Rect(start,0,regionTileWidth_,image.rows))));
+        cv::Mat output = net_.forward();
+        if (output.dims!=4 || output.type()!=CV_32F || output.size[0]!=1 ||
+            output.size[1]!=2 || output.size[2]!=image.rows || output.size[3]!=regionTileWidth_ ||
+            !cv::checkRange(output))
+            throw std::runtime_error("Expected two finite region logit maps (femur, tibia).");
+        for (int y=0; y<image.rows; ++y) {
+            const float* f=output.ptr<float>(0,0)+y*regionTileWidth_;
+            const float* t=output.ptr<float>(0,1)+y*regionTileWidth_;
+            for (int x=0; x<regionTileWidth_; ++x) {
+                femur.at<float>(y,start+x) += f[x]*weights[x];
+                tibia.at<float>(y,start+x) += t[x]*weights[x];
+            }
+        }
+    }
+    // Weight sums are positive, so normalization cannot change the sign.
+    cv::Mat mask(image.size(),CV_8U);
+    for (int y=0; y<image.rows; ++y)
+        for (int x=0; x<image.cols; ++x)
+            mask.at<uchar>(y,x) = (femur.at<float>(y,x+left)>0 ? 1 : 0) |
+                                 (tibia.at<float>(y,x+left)>0 ? 2 : 0);
+    return mask;
+}
+
 void XRaySegmentor::create_visualization(const cv::Mat& orig_bgr,
                                          const cv::Mat& label_mask,
                                          cv::Mat& overlay_bgr,
@@ -260,7 +327,9 @@ void XRaySegmentor::create_visualization(const cv::Mat& orig_bgr,
         const uint8_t* p_lbl = label_mask.ptr<uint8_t>(r);
         cv::Vec3b* p_col = color_mask_bgr.ptr<cv::Vec3b>(r);
         for (int c = 0; c < w; ++c) {
-            if (p_lbl[c] == LABEL_FEMUR) {
+            if (p_lbl[c] == 3) {
+                p_col[c] = cv::Vec3b(0, 255, 255);
+            } else if (p_lbl[c] == LABEL_FEMUR) {
                 p_col[c] = cv::Vec3b(0, 255, 0); // Green
             } else if (p_lbl[c] == LABEL_TIBIA) {
                 p_col[c] = cv::Vec3b(0, 0, 255); // Red in BGR
@@ -289,8 +358,8 @@ void XRaySegmentor::create_visualization(const cv::Mat& orig_bgr,
 
     // Draw boundary contours
     if (draw_contours_) {
-        cv::Mat mask_femur = (label_mask == LABEL_FEMUR);
-        cv::Mat mask_tibia = (label_mask == LABEL_TIBIA);
+        cv::Mat mask_femur = ((label_mask == LABEL_FEMUR) | (label_mask == 3));
+        cv::Mat mask_tibia = ((label_mask == LABEL_TIBIA) | (label_mask == 3));
 
         std::vector<std::vector<cv::Point>> contours_f, contours_t;
         cv::findContours(mask_femur, contours_f, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -442,8 +511,8 @@ void InferenceResult::save(const std::string& output_dir,
         fs::path stacked_dir = fs::path(output_dir) / (stem + "_channels");
         fs::create_directories(stacked_dir);
 
-        cv::Mat femur_mask = (label_mask == LABEL_FEMUR);
-        cv::Mat tibia_mask = (label_mask == LABEL_TIBIA);
+        cv::Mat femur_mask = ((label_mask == LABEL_FEMUR) | (label_mask == 3));
+        cv::Mat tibia_mask = ((label_mask == LABEL_TIBIA) | (label_mask == 3));
 
         cv::imwrite((stacked_dir / "ch1_femur.png").string(), femur_mask);
         cv::imwrite((stacked_dir / "ch2_tibia.png").string(), tibia_mask);

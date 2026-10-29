@@ -17,14 +17,15 @@ using namespace orthoseg;
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
+    const bool regions = argc == 3;
     QTemporaryDir temp;
     if (!temp.isValid()) return 2;
     const auto sourcePath = temp.filePath("native-xray.png");
     cv::Mat source(512, 128, CV_8UC3, cv::Scalar(0, 0, 0));
     source(cv::Rect(20, 50, 85, 410)).setTo(cv::Scalar(120, 120, 120));
     if (!cv::imwrite(sourcePath.toStdString(), source)) return 2;
-    qputenv("ORTHOSEG_NNUNET_MODEL", argv[1]);
+    qputenv(regions ? "ORTHOSEG_NNUNET_REGION_MODEL" : "ORTHOSEG_NNUNET_MODEL", argv[1]);
     MainWindow window;
     window.show();
     if (!window.document()->loadImage(sourcePath.toStdString())) return 2;
@@ -37,14 +38,14 @@ int main(int argc, char** argv) {
     auto* clear = window.findChild<QPushButton*>("clearAIResult");
     if (!aiTool || !selector || !run || !modelsButton || !apply || !clear) return 2;
     aiTool->click();
-    selector->setCurrentIndex(4);
+    selector->setCurrentIndex(regions ? 5 : 4);
     if (!QFileInfo(QString::fromLocal8Bit(argv[1])).isFile() || !modelsButton->text().contains("Local Models") ||
         !apply->isVisible() || !clear->isVisible()) return 2;
     bool localDialogValid = false;
     QTimer::singleShot(0, [&] {
         auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
         if (!dialog) return;
-        auto* model = dialog->findChild<QLineEdit*>("nativeNnUnetModel");
+        auto* model = dialog->findChild<QLineEdit*>(regions ? "nativeNnUnetRegionModel" : "nativeNnUnetModel");
         auto* device = dialog->findChild<QComboBox*>("nativeNnUnetDevice");
         localDialogValid = model && device && QFileInfo(model->text()).isFile() &&
                            device->currentData().toString() == "auto";
@@ -71,13 +72,21 @@ int main(int argc, char** argv) {
     QApplication::processEvents();
     const auto& preview = window.document()->aiFill().resultMask;
     if (!run->isEnabled() || errors || preview.size() != source.size() ||
-        preview.type() != CV_8UC1 || cv::countNonZero(preview > 2) ||
-        cv::countNonZero(preview) == 0 || !window.document()->aiFill().resultReplacesAnatomy ||
+        preview.type() != (regions ? CV_8UC3 : CV_8UC1) || cv::countNonZero(preview.reshape(1) > 2) ||
+        cv::countNonZero(preview.reshape(1)) == 0 || !window.document()->aiFill().resultReplacesAnatomy ||
         cv::countNonZero(window.document()->mask()) != 0) {
         std::fprintf(stderr, "Native AI Fill did not produce a valid preview (errors=%d)\n", errors);
         return 1;
     }
+    if (regions) {
+        for (int y=0; y<preview.rows; ++y)
+            for (int x=0; x<preview.cols; ++x)
+                if (preview.at<cv::Vec3b>(y,x) != cv::Vec3b(0,2,1)) return 1;
+    }
     apply->click();
+    if (regions && (cv::countNonZero(window.document()->labelMask(Label::Femur)) != source.total() ||
+                    cv::countNonZero(window.document()->labelMask(Label::Tibia)) != source.total() ||
+                    cv::countNonZero(window.document()->labelMask(Label::Fibula)) != 0)) return 1;
     const auto& mask = window.document()->mask();
     if (!run->isEnabled() || errors || mask.size() != source.size() ||
         mask.type() != CV_8UC1 || cv::countNonZero(mask > 2) ||

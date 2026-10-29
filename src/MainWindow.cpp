@@ -189,7 +189,15 @@ MainWindow::MainWindow() : doc_(std::make_unique<Document>()) {
             return;
         }
         nativeNnUnetBefore_.release();
-        if (result.type() != CV_8UC1 || cv::countNonZero(result > 2)) {
+        bool valid = result.type() == CV_8UC1 && !cv::countNonZero(result > 2);
+        if (result.type() == CV_8UC3) {
+            std::vector<cv::Mat> channels;
+            cv::split(result, channels);
+            valid = !cv::countNonZero(channels[0]) &&
+                !cv::countNonZero((channels[1] != 0) & (channels[1] != 2)) &&
+                !cv::countNonZero(channels[2] > 1);
+        }
+        if (!valid) {
             aiStatus_->setText("Native nnUNet returned an invalid mask. Annotation unchanged.");
             QMessageBox::warning(this, "Native nnUNet", aiStatus_->text());
             return;
@@ -755,16 +763,17 @@ QWidget* MainWindow::buildAIPanel() {
     aiModelSelector_->addItems({"MedSAM2", "MONAI production (UNet)", "MONAI MedSAM2 (boxes / masks)", "MONAI nnUNet v2"});
 #ifdef ORTHOSEG_NATIVE_NNUNET
     aiModelSelector_->addItem("Native nnUNet v2 (OpenCV 5)");
+    aiModelSelector_->addItem("nnunetv2_region (opencv5)");
 #endif
     connect(aiModelSelector_, &QComboBox::currentIndexChanged, this, [this] {
         if (medSamControls_) medSamControls_->setVisible(aiModelSelector_->currentIndex() == 0 || aiModelSelector_->currentIndex() == 2);
         if (monaiControls_) monaiControls_->setVisible(aiModelSelector_->currentIndex() != 0
 #ifdef ORTHOSEG_NATIVE_NNUNET
-                                                       && aiModelSelector_->currentIndex() != 4
+                                                       && aiModelSelector_->currentIndex() < 4
 #endif
                                                        );
 #ifdef ORTHOSEG_NATIVE_NNUNET
-        if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(aiModelSelector_->currentIndex() == 4);
+        if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(aiModelSelector_->currentIndex() >= 4);
 #endif
         if (aiRun_) aiRun_->setText(aiModelSelector_->currentIndex() == 0 ? "▶ Run AI Fill" :
                                    aiModelSelector_->currentIndex() == 1 ? "▶ Run MONAI Segment" :
@@ -785,8 +794,8 @@ QWidget* MainWindow::buildAIPanel() {
         }
         updateSettingsVisibility();
 #ifdef ORTHOSEG_NATIVE_NNUNET
-        if (aiModelSelector_->currentIndex() == 4) {
-            aiStatus_->setText(QFileInfo(nativeNnUnetModelPath_).isFile() ?
+        if (aiModelSelector_->currentIndex() >= 4) {
+            aiStatus_->setText(QFileInfo(aiModelSelector_->currentIndex() == 5 ? nativeNnUnetRegionModelPath_ : nativeNnUnetModelPath_).isFile() ?
                 "Native nnUNet ready. No MONAI server needed." : "Native nnUNet ONNX model not found.");
         } else
 #endif
@@ -844,6 +853,7 @@ QWidget* MainWindow::buildAIPanel() {
     nativeLayout->setContentsMargins(0, 0, 0, 0);
     nativeLayout->addWidget(sectionLabel("Native nnUNet v2 · OpenCV 5"));
     nativeNnUnetModelPath_ = qEnvironmentVariable("ORTHOSEG_NNUNET_MODEL", ORTHOSEG_NNUNET_MODEL);
+    nativeNnUnetRegionModelPath_ = qEnvironmentVariable("ORTHOSEG_NNUNET_REGION_MODEL", ORTHOSEG_NNUNET_REGION_MODEL);
     auto* nativeNote = new QLabel("Runs locally without MONAI. Input height: 2048 px. Configure model and device in Local Models above.");
     nativeNote->setWordWrap(true);
     nativeLayout->addWidget(nativeNote);
@@ -1094,7 +1104,7 @@ QWidget* MainWindow::buildAIPanel() {
         else if (aiModelSelector_->currentIndex() == 2) startMonaiSegment(true);
         else if (aiModelSelector_->currentIndex() == 3) startMonaiSegment(false, true);
 #ifdef ORTHOSEG_NATIVE_NNUNET
-        else if (aiModelSelector_->currentIndex() == 4) onRunNativeNnUnet();
+        else if (aiModelSelector_->currentIndex() >= 4) onRunNativeNnUnet();
 #endif
         else onRunAIFill();
     });
@@ -1238,7 +1248,8 @@ void MainWindow::onRunNativeNnUnet() {
         if (!doc_->hasImage()) throw std::runtime_error("Load an X-ray image first.");
         if (!doc_->aiFill().resultMask.empty())
             throw std::runtime_error("Apply or clear the current AI Fill preview first.");
-        const auto path = nativeNnUnetModelPath_.trimmed();
+        const bool regions = aiModelSelector_->currentIndex() == 5;
+        const auto path = (regions ? nativeNnUnetRegionModelPath_ : nativeNnUnetModelPath_).trimmed();
         if (!QFileInfo(path).isFile()) throw std::runtime_error("Native nnUNet ONNX model not found.");
         const auto source = doc_->sourceColor();
         if (source.empty() || source.type() != CV_8UC3)
@@ -1254,6 +1265,7 @@ void MainWindow::onRunNativeNnUnet() {
         request.imageBGR = source;
         request.modelPath = path.toStdString();
         request.device = nativeNnUnetDeviceKey_.toStdString();
+        request.regions = regions;
         nativeNnUnetBefore_ = doc_->maskChannels().clone();
         nativeNnUnetGeneration_ = imageGeneration_;
         if (!aiController_->runNative(std::move(request))) return;
@@ -1404,6 +1416,19 @@ void MainWindow::onOpenModelDirDialog() {
     };
     checkNative();
     connect(nativeModelEdit, &QLineEdit::textChanged, &dlg, checkNative);
+    l->addWidget(new QLabel("nnunetv2_region (opencv5) · independent femur/tibia regions", &dlg));
+    auto* regionRow = new QHBoxLayout;
+    auto* regionModelEdit = new QLineEdit(nativeNnUnetRegionModelPath_, &dlg);
+    regionModelEdit->setObjectName("nativeNnUnetRegionModel");
+    regionRow->addWidget(regionModelEdit, 1);
+    auto* regionBrowse = new QPushButton("Browse…", &dlg);
+    regionRow->addWidget(regionBrowse);
+    l->addLayout(regionRow);
+    connect(regionBrowse, &QPushButton::clicked, &dlg, [regionModelEdit, &dlg] {
+        const auto path = browseFile(&dlg, "Select region nnUNet ONNX Model",
+            QFileInfo(regionModelEdit->text()).absolutePath(), "ONNX models (*.onnx)");
+        if (!path.isEmpty()) regionModelEdit->setText(path);
+    });
     auto* nativeDevice = new QComboBox(&dlg);
     nativeDevice->setObjectName("nativeNnUnetDevice");
     nativeDevice->addItem("Auto (CUDA FP16, or CPU)", "auto");
@@ -1429,9 +1454,10 @@ void MainWindow::onOpenModelDirDialog() {
         aiModels_->setText(pathEdit->text());
 #ifdef ORTHOSEG_NATIVE_NNUNET
         nativeNnUnetModelPath_ = nativeModelEdit->text().trimmed();
+        nativeNnUnetRegionModelPath_ = regionModelEdit->text().trimmed();
         nativeNnUnetDeviceKey_ = nativeDevice->currentData().toString();
-        if (aiModelSelector_ && aiModelSelector_->currentIndex() == 4)
-            aiStatus_->setText(QFileInfo(nativeNnUnetModelPath_).isFile() ?
+        if (aiModelSelector_ && aiModelSelector_->currentIndex() >= 4)
+            aiStatus_->setText(QFileInfo(aiModelSelector_->currentIndex() == 5 ? nativeNnUnetRegionModelPath_ : nativeNnUnetModelPath_).isFile() ?
                 "Native nnUNet ready. No MONAI server needed." : "Native nnUNet ONNX model not found.");
 #endif
     }
@@ -1682,11 +1708,11 @@ void MainWindow::updateSettingsVisibility() {
     if (medSamControls_) medSamControls_->setVisible(isAI && medSam);
     if (monaiControls_) monaiControls_->setVisible(isAI && aiModelSelector_->currentIndex() != 0
 #ifdef ORTHOSEG_NATIVE_NNUNET
-                                                  && aiModelSelector_->currentIndex() != 4
+                                                  && aiModelSelector_->currentIndex() < 4
 #endif
                                                   );
 #ifdef ORTHOSEG_NATIVE_NNUNET
-    if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(isAI && aiModelSelector_->currentIndex() == 4);
+    if (nativeNnUnetControls_) nativeNnUnetControls_->setVisible(isAI && aiModelSelector_->currentIndex() >= 4);
 #endif
     if (aiResultControls_) aiResultControls_->setVisible(isAI);
     bool isBox = isAI && medSam && doc_->aiFill().promptType == AIFillPromptType::BoundingBox;
@@ -2186,7 +2212,7 @@ void MainWindow::openModelManagement() {
 
 void MainWindow::checkMonaiStatus() {
 #ifdef ORTHOSEG_NATIVE_NNUNET
-    if (aiModelSelector_ && aiModelSelector_->currentIndex() == 4) return;
+    if (aiModelSelector_ && aiModelSelector_->currentIndex() >= 4) return;
 #endif
     if (!monai_ || !monaiUrl_ || monaiRequestPending_) return;
     const auto revision = ++monaiCheckSerial_;
@@ -2433,7 +2459,7 @@ void MainWindow::offerMonaiTraining() {
         if (prompt.clickedButton() != add) return;
         // Read the current editable annotation, never a cached MONAI prediction.
         const auto corrected = toMonaiLabels(doc_->monaiAnatomyMask(), editorMonaiLabels());
-        monai_->submitTrainingCase(original, corrected, QFileInfo(QString::fromStdString(doc_->sourcePath())).fileName(),
+        monai_->submitTrainingCase(original, corrected, QFileInfo(QString::fromStdString(doc_->sourcePath())).absoluteFilePath(),
             monaiVersions_.value(versionKey), [this, key](const QJsonObject& response, const QString& error) {
                 if (!error.isEmpty()) {
                     monaiPrompted_.remove(key); // Next export can retry this revision.

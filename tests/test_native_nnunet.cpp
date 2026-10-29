@@ -3,15 +3,16 @@
 #include <cstdio>
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
+    const bool regions = argc == 3;
     cv::Mat image(512, 128, CV_8UC3, cv::Scalar(0, 0, 0));
     image(cv::Rect(20, 50, 85, 410)).setTo(cv::Scalar(120, 120, 120));
     try {
-        auto segmentor = xray_ocv::XRaySegmentor::create(argv[1], "cpu", 0.4f, false);
+        auto segmentor = xray_ocv::XRaySegmentor::create(argv[1], "cpu", 0.4f, false, regions);
         const auto result = segmentor->predict(image);
         if (result.infer_height != 2048 || result.infer_width != 512 ||
             result.label_mask.size() != image.size() || result.label_mask.type() != CV_8UC1 ||
-            cv::countNonZero(result.label_mask > 2)) {
+            cv::countNonZero(result.label_mask > (regions ? 3 : 2))) {
             std::fprintf(stderr, "Native nnUNet returned invalid geometry or class IDs\n");
             return 1;
         }

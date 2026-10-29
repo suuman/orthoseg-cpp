@@ -12,6 +12,7 @@ struct InferenceWorker : QObject {
     std::unique_ptr<xray_ocv::XRaySegmentor> native;
     std::string nativePath;
     std::string nativeDevice;
+    bool nativeRegions = false;
 #endif
 };
 }
@@ -62,13 +63,23 @@ bool AIFillController::runNative(NativeNnUnetRequest request) {
         try {
             auto* worker = static_cast<InferenceWorker*>(worker_);
             if (!worker->native || worker->nativePath != request.modelPath ||
-                worker->nativeDevice != request.device) {
+                worker->nativeDevice != request.device || worker->nativeRegions != request.regions) {
                 worker->native = xray_ocv::XRaySegmentor::create(request.modelPath, request.device,
-                                                                  0.4f, false);
+                                                                  0.4f, false, request.regions);
                 worker->nativePath = request.modelPath;
                 worker->nativeDevice = request.device;
+                worker->nativeRegions = request.regions;
             }
             result = worker->native->predict(request.imageBGR).label_mask;
+            if (request.regions) {
+                cv::Mat channels = cv::Mat::zeros(result.size(), CV_8UC3);
+                for (int y=0; y<result.rows; ++y)
+                    for (int x=0; x<result.cols; ++x) {
+                        const uchar label = result.at<uchar>(y,x);
+                        channels.at<cv::Vec3b>(y,x) = cv::Vec3b(0, (label & 2) ? 2 : 0, (label & 1) ? 1 : 0);
+                    }
+                result = channels;
+            }
         } catch (const std::exception& e) {
             error = QString::fromUtf8(e.what());
         } catch (...) {

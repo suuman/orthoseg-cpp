@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+export LD_LIBRARY_PATH=/home/suman/soft/opencv/install_new/lib:$LD_LIBRARY_PATH
 ORTHOSEG_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 MONAI_REPO="${MONAI_REPO:-/run/media/suman/Data/monai}"
 MONAI_CONFIG="${MONAI_CONFIG:-$MONAI_REPO/configs/management.yaml}"
