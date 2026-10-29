@@ -61,6 +61,10 @@ def create_app(config=None, predictor=None):
             app.state.nnunet.load()
         except Exception:
             logging.getLogger(__name__).exception("nnUNet v2 model failed to load; nnUNet inference unavailable")
+        try:
+            app.state.nnunet_region.load()
+        except Exception:
+            logging.getLogger(__name__).exception("nnUNet region model failed to load")
         yield
     app = FastAPI(title="Offline Femur/Tibia Segmentation", lifespan=lifespan,
                   docs_url=None, redoc_url=None)
@@ -68,6 +72,7 @@ def create_app(config=None, predictor=None):
     app.state.predictor = predictor or Predictor(config)
     app.state.sam2 = Sam2Predictor(config)
     app.state.nnunet = NnUnetPredictor(config)
+    app.state.nnunet_region = NnUnetPredictor(config, regions=True)
     app.state.store = CaseStore(config)
     # Keep UNet serving independent of the CLI-selected training family.
     import copy

@@ -62,3 +62,32 @@ def test_nnunet_missing_model(config):
     with TestClient(app) as client:
         image = png(np.ones((24, 37), np.uint8))
         assert client.post('/segment/nnunet', files={'image': ('x.png', image)}).status_code == 503
+
+
+def test_region_probabilities_preserve_overlap():
+    import pytest
+    from app.ml.nnunet_region import region_probabilities_to_rgb
+    probabilities = np.array([[[0.1, 0.9, 0.1, 0.9]], [[0.1, 0.1, 0.9, 0.9]]])
+    mask = region_probabilities_to_rgb(probabilities)
+    assert mask.tolist() == [[[0, 0, 0], [1, 0, 0], [0, 2, 0], [1, 2, 0]]]
+    with pytest.raises(ValueError):
+        region_probabilities_to_rgb(np.zeros((3, 4, 5)))
+
+
+def test_region_route_and_health(config):
+    app = create_app(config)
+    app.state.nnunet_region.load = lambda: None
+    app.state.nnunet_region.info = lambda: {"model_loaded": True, "model_version": "region_test"}
+    def predict(arr):
+        mask = np.zeros((*arr.shape, 3), np.uint8)
+        mask[2:8, 3:9] = (1, 2, 0)
+        return mask, "region_test", 1.0
+    app.state.nnunet_region.predict = predict
+    with TestClient(app) as client:
+        assert client.get('/health').json()['nnunet_region_model_loaded']
+        response = client.post('/segment/nnunet_region', files={'image': ('x.png', png(np.ones((24, 37), np.uint8)))})
+        assert response.status_code == 200
+        mask = np.asarray(Image.open(io.BytesIO(response.content)))
+        assert mask.shape == (24, 37, 3)
+        assert mask[4, 5].tolist() == [1, 2, 0]
+        assert response.headers['x-model-version'] == 'region_test'

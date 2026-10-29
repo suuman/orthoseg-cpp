@@ -271,3 +271,62 @@ Model Management also provides `GET /management/cases?model=unet&offset=0&limit=
 The paginated response contains filenames, actual labels, overlap pixels, and
 pending/incorporated status for each active corrected-case revision. Maximum
 page size is 100. OrthoSeg displays these cases in its model-management dialog.
+
+### Training integrity and prompt robustness
+
+Training-case identity and train/validation leakage checks use decoded pixel hashes,
+independent of PNG compression or metadata. Byte hashes remain for file integrity.
+Legacy duplicate cases already in the pool are rejected at training preflight and
+must be consolidated. This does not replace patient-level splitting: patient IDs
+are not currently part of the submitted case schema.
+
+Each candidate freezes validation image/label files under its `validation/` directory.
+UNet affine augmentation transforms a valid-pixel mask alongside labels; its Dice
+and cross-entropy losses exclude preprocessing, augmentation and batch padding.
+
+MedSAM2 training perturbs boxes and mask prompts deterministically by run seed and
+epoch. Validation retains reference-box metrics for comparison and records separate
+`perturbed_box_metrics` and `perturbed_mask_metrics`, including full-image negative
+prompts for absent anatomy. These are synthetic robustness checks, not a substitute
+for evaluation with actual user prompts. Candidate selection still uses the reference
+foreground Dice, so existing and new primary scores use the same protocol.
+
+### Overlapping nnUNet v2 region model
+
+The independent Dataset105 model lives in `models/pretrained/nnunetv2_region/`,
+with `plans.json`, `dataset.json`, and `fold_0/checkpoint_best.pth`. It uses two
+region heads: femur `[1,3]` and tibia `[2,3]`. `/segment/nnunet_region` returns
+canonical discrete RGB masks (R=1 femur, G=2 tibia, overlap `(1,2,0)`), retaining
+both probabilities instead of nnUNet's indexed region conversion. The existing
+`/segment/nnunet` model remains separate. Health and model-info include the region model.
+
+Export the trusted checkpoint for OrthoSeg's local OpenCV 5 inference:
+
+```bash
+XRAY_PYTHON=/home/suman/deepnet/bin/python
+"$XRAY_PYTHON" scripts/export_nnunet_region.py \
+  --model-dir /path/to/nnUNetTrainer_100epochs_LR1e3__nnUNetPlans_transfer__2d \
+  --output models/pretrained/nnunetv2_region/model.onnx
+```
+
+Copy the ONNX and generated manifest into OrthoSeg's `models/nnunetv2_region/`.
+Select **nnunetv2_region (opencv5)** in AI Fill. This UI option runs entirely in
+OpenCV 5 and does not call MONAI or require Python at inference time. Both native
+models retain the existing 2048-high image preparation; region logits use independent
+zero thresholds, and label 3 denotes overlap only within the region decoder.
+The editable/exported mask uses independent anatomy channels, not label 3 as Fibula.
+Weights and ONNX artifacts are ignored by Git and must be deployed separately.
+
+The currently deployed region model is `fold_0/checkpoint_best.pth` from
+`/run/media/suman/Data/trained_model_xray/Dataset105_PNG2D/nnUNetTrainer_250epochs__nnUNetPlans__2d`.
+Use `--fold 0` with the exporter. Its input tiles are 2048 × 256; OpenCV reads
+`input_shape` from the adjacent `manifest.json`. Deploy this manifest with the ONNX.
+Older 2048 × 768 region models remain supported. The manifest records source and hashes.
+The UI choice remains **nnunetv2_region (opencv5)**.
+
+If a shell loads COLMAP's incompatible ONNX Runtime first, launch OrthoSeg with:
+
+```bash
+LD_LIBRARY_PATH=/home/suman/soft/opencv/install_new/lib:$LD_LIBRARY_PATH \
+  /home/suman/agentic_coding/orthoseg/build/orthoseg
+```

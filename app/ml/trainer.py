@@ -12,7 +12,7 @@ import monai
 import numpy as np
 import torch
 import yaml
-from monai.losses import DiceCELoss
+import torch.nn.functional as F
 from monai.utils import set_determinism
 from torch.utils.data import DataLoader
 
@@ -33,6 +33,32 @@ def environment():
     return {"python": platform.python_version(), "pytorch": str(torch.__version__),
             "monai": str(monai.__version__), "cuda_runtime": torch.version.cuda,
             "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None}
+
+
+def masked_segmentation_loss(logits, target, valid, include_background=False):
+    weights = valid[:, 0].to(logits.dtype)
+    ce = (F.cross_entropy(logits, target[:, 0], reduction='none') * weights).sum() / weights.sum().clamp_min(1)
+    probability = logits.softmax(1) * valid
+    truth = F.one_hot(target[:, 0], logits.shape[1]).movedim(-1, 1).to(logits.dtype) * valid
+    start = 0 if include_background else 1
+    intersection = (probability * truth).sum((-2, -1))[:, start:]
+    denominator = (probability + truth).sum((-2, -1))[:, start:]
+    dice = 1 - ((2 * intersection + 1e-5) / (denominator + 1e-5)).mean()
+    return ce + dice
+
+
+def freeze_validation(pairs, destination, config):
+    """Validate and freeze bytes used for every epoch and recorded in metadata."""
+    frozen = []
+    for image, label in pairs:
+        x, y = image.read_bytes(), label.read_bytes()
+        a, b = destination / 'images' / image.name, destination / 'labels' / label.name
+        atomic_write(a, x)
+        atomic_write(b, y)
+        from app.ml.dataset import validate_pair
+        validate_pair(a, b, config)
+        frozen.append((a, b))
+    return frozen
 
 
 def evaluate(model, pairs, config, device):
@@ -114,12 +140,17 @@ def _train(config, store, source, checkpoint, dry_run, progress):
             raise ValueError("Checkpoint lacks optimizer/scheduler state")
         optimizer.load_state_dict(payload["optimizer"])
         scheduler.load_state_dict(payload["scheduler"])
-    loss_fn = DiceCELoss(include_background=t["include_background"], to_onehot_y=True, softmax=True)
     amp = device.type == "cuda" and t["mixed_precision"]
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     version = ("medsam2_" if sam2 else "femur_tibia_2d_") + uuid.uuid4().hex
     candidate = model_root(config) / "candidates" / version
     candidate.mkdir(parents=True, exist_ok=False)
+    validation = freeze_validation(validation, candidate / "validation", config)
+    # Recheck frozen images against the immutable training revisions.
+    from app.ml.preprocessing import pixel_digest
+    training_pixels = {pixel_digest(decode_png(x.read_bytes(), config["limits"])) for x, _ in training}
+    if any(pixel_digest(decode_png(x.read_bytes(), config["limits"])) in training_pixels for x, _ in validation):
+        raise ValueError("Validation image also exists in training pool")
     progress(candidate_version=version, parent_model_version=parent["version"] if parent else None)
     atomic_write(candidate / "training_config.yaml", yaml.safe_dump(config).encode())
     write_json(candidate / "dataset_snapshot.json", {"training": records,
@@ -134,7 +165,8 @@ def _train(config, store, source, checkpoint, dry_run, progress):
         for batch in loader or []:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp):
-                loss = loss_fn(model(batch["image"].to(device)), batch["label"].to(device))
+                loss = masked_segmentation_loss(model(batch["image"].to(device)), batch["label"].to(device),
+                                                batch["valid"].to(device), t["include_background"])
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite training loss")
             scaler.scale(loss).backward()

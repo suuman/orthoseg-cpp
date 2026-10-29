@@ -131,3 +131,81 @@ def test_completion_marker_is_validated(config, pair):
     with pytest.raises(ValueError, match='completion marker'):
         promote(config, version)
     assert not production_path(config).exists()
+
+
+def test_decoded_duplicate_guard(config, pair):
+    import io
+    from PIL import Image
+    store, root = populate(config, pair)
+    buffer = io.BytesIO()
+    Image.open(io.BytesIO(pair[0])).save(buffer, format='PNG', compress_level=0)
+    reencoded = buffer.getvalue()
+    assert reencoded != pair[0]
+    store.submit(reencoded, pair[1], case_id='alias')
+    assert len(store.records()) == 1
+    (root / 'images/v.png').write_bytes(reencoded)
+    with pytest.raises(ValueError, match='also exists'):
+        snapshot(store, config)
+
+
+def test_padding_has_no_loss_or_gradient():
+    import torch
+    from app.ml.trainer import masked_segmentation_loss
+    logits = torch.randn(1, 3, 4, 4, requires_grad=True)
+    target = torch.ones(1, 1, 4, 4, dtype=torch.long)
+    valid = torch.ones(1, 1, 4, 4)
+    baseline = masked_segmentation_loss(logits, target, valid)
+    padded = torch.nn.functional.pad(logits.detach(), (0, 5, 0, 3), value=10).requires_grad_()
+    padded_target = torch.nn.functional.pad(target, (0, 5, 0, 3))
+    padded_valid = torch.nn.functional.pad(valid, (0, 5, 0, 3))
+    loss = masked_segmentation_loss(padded, padded_target, padded_valid)
+    assert torch.allclose(loss, baseline)
+    loss.backward()
+    assert torch.count_nonzero(padded.grad[:, :, 4:, :]) == 0
+    assert torch.count_nonzero(padded.grad[:, :, :, 4:]) == 0
+
+
+def test_frozen_validation(config, pair, tmp_path):
+    from app.ml.trainer import freeze_validation
+    store, root = populate(config, pair)
+    _, _, pairs = snapshot(store, config)
+    frozen = freeze_validation(pairs, tmp_path / 'frozen', config)
+    before = frozen[0][0].read_bytes()
+    pairs[0][0].write_bytes(pair[0])
+    assert frozen[0][0].read_bytes() == before
+
+
+def test_prompt_perturbations():
+    from app.ml.sam2_training import perturb_box, perturb_mask
+    binary = np.zeros((32, 32), bool)
+    binary[8:24, 8:24] = True
+    result = perturb_mask(binary, np.random.default_rng(5))
+    assert result.shape == binary.shape and not np.array_equal(result, binary)
+    box = perturb_box([0, 0, 31, 31], binary.shape, np.random.default_rng(5))
+    assert 0 <= box[0] < box[2] <= 31 and 0 <= box[1] < box[3] <= 31
+
+
+def test_sam2_robustness_reports_separate_protocols(config, pair, tmp_path, monkeypatch):
+    import types
+    import app.ml.sam2_training as module
+    calls = []
+    class Engine:
+        def __init__(self, config): pass
+        def predict(self, raw, boxes, prompt=None):
+            calls.append((boxes, prompt))
+            for box in boxes.values():
+                assert 0 <= box[0] < box[2] < raw.shape[1]
+                assert 0 <= box[1] < box[3] < raw.shape[0]
+            return np.zeros((*raw.shape, 3), np.uint8), 'test', 0
+    monkeypatch.setattr(module, 'Sam2Predictor', Engine)
+    image, mask = tmp_path/'image.png', tmp_path/'mask.png'
+    image.write_bytes(pair[0]); mask.write_bytes(pair[1])
+    adapter = module.Sam2TrainingAdapter.__new__(module.Sam2TrainingAdapter)
+    adapter.model = types.SimpleNamespace(eval=lambda: None)
+    adapter.config, adapter.predictor = config, object()
+    metrics = adapter.evaluate([(image, mask)])
+    assert len(calls) == 3 and calls[2][1] is not None
+    assert 'perturbed_box_metrics' in metrics and 'perturbed_mask_metrics' in metrics
+    calls.clear(); mask.write_bytes(png(np.zeros((24, 37), np.uint8)))
+    adapter.evaluate([(image, mask)])
+    assert len(calls) == 2 and set(calls[0][0]) == {1, 2}

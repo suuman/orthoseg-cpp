@@ -33,9 +33,10 @@ def prepare_nnunet_image(arr, max_pixels):
 
 
 class NnUnetPredictor:
-    def __init__(self, config):
+    def __init__(self, config, regions=False):
         self.config = config
-        self.root = Path(config["paths"]["models"]) / "pretrained" / "nnunet2"
+        self.regions = regions
+        self.root = Path(config["paths"]["models"]) / "pretrained" / ("nnunetv2_region" if regions else "nnunet2")
         self.device = get_device(config)
         self._lock = threading.RLock()
         self._info_lock = threading.Lock()
@@ -48,7 +49,8 @@ class NnUnetPredictor:
         if not all(path.is_file() for path in (checkpoint, plans, dataset)):
             return
         labels = json.loads(dataset.read_text())["labels"]
-        if labels != {"background": 0, "femur": 1, "tibia": 2}:
+        from app.ml.nnunet_region import REGION_LABELS
+        if labels != (REGION_LABELS if self.regions else {"background": 0, "femur": 1, "tibia": 2}):
             raise ValueError("nnUNet labels do not match canonical background/femur/tibia IDs")
         plan = json.loads(plans.read_text())
         architecture = plan["configurations"]["2d"]["architecture"]["network_class_name"]
@@ -63,8 +65,14 @@ class NnUnetPredictor:
                                     perform_everything_on_device=self.device.type == "cuda",
                                     device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
-        predictor.initialize_from_trained_model_folder(
-            str(self.root), use_folds=(0,), checkpoint_name="checkpoint_best.pth")
+        if self.regions:
+            from app.ml.nnunet_region import load_region_network
+            network, plans_manager, configuration, dataset_json = load_region_network(self.root)
+            predictor.manual_initialization(network, plans_manager, configuration, [network.state_dict()],
+                                            dataset_json, "nnUNetTrainer", None)
+        else:
+            predictor.initialize_from_trained_model_folder(
+                str(self.root), use_folds=(0,), checkpoint_name="checkpoint_best.pth")
         digest = hashlib.sha256()
         with checkpoint.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -72,14 +80,16 @@ class NnUnetPredictor:
         with self._lock:
             with self._info_lock:
                 self._predictor = predictor
-                self._version = "nnunet2_xray_best_" + digest.hexdigest()[:12]
+                self._version = ("nnunetv2_region_best_" if self.regions else "nnunet2_xray_best_") + digest.hexdigest()[:12]
 
     def info(self):
         with self._info_lock:
             return {"model_loaded": self._predictor is not None,
                     "model_version": self._version,
                     "architecture": "nnUNet v2 PlainConvUNet 2D",
-                    "input_height": 2048, "labels": {"background": 0, "femur": 1, "tibia": 2},
+                    "input_height": 2048, "labels": ({"background": 0, "femur": [1, 3], "tibia": [2, 3]}
+                                                       if self.regions else {"background": 0, "femur": 1, "tibia": 2}),
+                    "mask_encoding": "rgb_discrete" if self.regions else "class_index",
                     "cuda_active": self.device.type == "cuda"}
 
     def predict(self, arr):
@@ -92,7 +102,18 @@ class NnUnetPredictor:
                 raise ModelUnavailable("nnUNet v2 model unavailable; install its dependencies and restart backend")
             with torch.inference_mode():
                 prediction = self._predictor.predict_single_npy_array(
-                    data, props, None, None, save_or_return_probabilities=False)
+                    data, props, None, None, save_or_return_probabilities=self.regions)
+            if self.regions:
+                from app.ml.nnunet_region import region_probabilities_to_rgb
+                # nnUNet's indexed region conversion overwrites overlap; retain probabilities instead.
+                mask = region_probabilities_to_rgb(prediction[1])
+                if mask.shape[:2] != data.shape[-2:]:
+                    raise RuntimeError("Region prediction dimensions do not match inference image")
+                mask = (cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                        if cv2 is not None else np.asarray(Image.fromarray(mask).resize(
+                            (width, height), Image.Resampling.NEAREST)))
+                validate_mask(mask)
+                return mask, self._version, (time.perf_counter() - start) * 1000
             mask = np.asarray(prediction)
             if mask.ndim == 3 and mask.shape[0] == 1:
                 mask = mask[0]

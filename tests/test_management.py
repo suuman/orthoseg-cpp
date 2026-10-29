@@ -190,7 +190,8 @@ def test_management_case_list_labels_pagination_and_family_state(config, pair):
     store = CaseStore(config)
     mask = np.zeros((24, 37, 3), dtype=np.uint8)
     mask[2:10, 3:12] = (1, 2, 0)
-    store.submit(pair[0], png(mask), case_id='a', original_filename='knee.png')
+    store.submit(pair[0], png(mask), case_id='a', original_filename='knee.png',
+                 original_path='/home/user/X-rays/knee.png')
     record = store.records()[0]
     write_json(store.state_path, {'revisions': {'a': record['revision']},
         'last_training_time': None, 'latest_candidate_version': 'unet_done'})
@@ -204,11 +205,13 @@ def test_management_case_list_labels_pagination_and_family_state(config, pair):
         assert result['total'] == 2 and len(result['items']) == 1
         item = result['items'][0]
         assert item['filename'] == 'knee.png' and item['labels'] == ['Femur', 'Tibia']
+        assert item['original_path'] == '/home/user/X-rays/knee.png'
         assert item['overlap_pixels'] == 72 and item['status'] == 'incorporated'
         assert 'image' not in item and 'mask' not in item
         assert api.get('/management/cases?model=medsam2&limit=1').json()['items'][0]['status'] == 'pending'
         page2 = api.get('/management/cases?offset=1&limit=1').json()['items'][0]
         assert page2['filename'] == 'empty.png' and page2['labels'] == ['Background only']
+        assert page2['original_path'] == ''
         assert api.get('/management/cases?offset=99').json()['items'] == []
         for query in ('offset=-1', 'limit=0', 'limit=101', 'model=unknown'):
             assert api.get('/management/cases?' + query).status_code == 422

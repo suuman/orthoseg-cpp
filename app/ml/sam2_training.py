@@ -1,11 +1,40 @@
 """MedSAM2 adapter for the existing trainer, job runner and candidate lifecycle."""
 import numpy as np
+from PIL import Image, ImageFilter
 import torch
 import torch.nn.functional as F
 
 from app.ml.metrics import segmentation_metrics
 from app.ml.preprocessing import class_mask, decode_png
 from app.ml.sam2_predictor import Sam2Predictor, square_input, prompt_canvas, mask_box, mask_logits
+
+
+def perturb_box(box, shape, rng):
+    box = np.asarray(box, dtype=np.float32).copy()
+    h, w = shape[:2]
+    margin = np.maximum(2, 0.1 * np.array([box[2]-box[0]+1, box[3]-box[1]+1]))
+    box += rng.uniform(-1, 1, 4) * np.tile(margin, 2)
+    box[[0, 2]] = np.clip(np.sort(box[[0, 2]]), 0, w-1)
+    box[[1, 3]] = np.clip(np.sort(box[[1, 3]]), 0, h-1)
+    box = np.rint(box)
+    if box[2] <= box[0]: box[0], box[2] = max(0, box[0]-1), min(w-1, box[2]+1)
+    if box[3] <= box[1]: box[1], box[3] = max(0, box[1]-1), min(h-1, box[3]+1)
+    return box
+
+
+def perturb_mask(binary, rng):
+    image = Image.fromarray(binary.astype(np.uint8) * 255)
+    size = int(rng.choice([3, 5, 7]))
+    filtered = image.filter(ImageFilter.MinFilter(size) if rng.random() < .5 else ImageFilter.MaxFilter(size))
+    result = np.asarray(filtered) > 0
+    # Translation uses zero padding, never wraps foreground across image borders.
+    dx, dy = rng.integers(-3, 4, 2)
+    shifted = np.zeros_like(result)
+    h, w = result.shape
+    x0, x1 = max(0, dx), min(w, w+dx)
+    y0, y1 = max(0, dy), min(h, h+dy)
+    shifted[y0:y1, x0:x1] = result[y0-dy:y1-dy, x0-dx:x1-dx]
+    return shifted
 
 
 class Sam2TrainingAdapter:
@@ -23,7 +52,8 @@ class Sam2TrainingAdapter:
         self.model.sam_prompt_encoder.train()
         self.model.sam_mask_decoder.train()
         losses = []
-        order = np.random.default_rng(self.config['training']['seed'] + epoch).permutation(len(pairs))
+        rng = np.random.default_rng(self.config['training']['seed'] + epoch)
+        order = rng.permutation(len(pairs))
         batch_size = self.config['training']['batch_size']
         optimizer.zero_grad(set_to_none=True)
         for n, index in enumerate(order):
@@ -40,13 +70,14 @@ class Sam2TrainingAdapter:
                     # Include negative examples rather than silently ignoring empty structures.
                     if box is None:
                         box = np.array([0, 0, rgb.shape[1]-1, rgb.shape[0]-1], np.float32)
+                    box = perturb_box(box, binary.shape, rng)
                     coords = torch.as_tensor(box, device=self.device)[None]
                     coords = self.predictor._transforms.transform_boxes(coords, True, rgb.shape[:2]).reshape(1, 2, 2)
                     points = (coords, torch.tensor([[2, 3]], dtype=torch.int, device=self.device))
                     mask_input = None
                     # Alternate coarse-mask and box prompts; both keep the other bone independent.
                     if (epoch + n + label) % 2 == 0:
-                        mask_input = torch.from_numpy(mask_logits(binary)[None]).to(self.device)
+                        mask_input = torch.from_numpy(mask_logits(perturb_mask(binary, rng))[None]).to(self.device)
                     sparse, dense = self.model.sam_prompt_encoder(points=points, boxes=None, masks=mask_input)
                     low, quality, _, _ = self.model.sam_mask_decoder(
                         image_embeddings=self.predictor._features['image_embed'],
@@ -79,13 +110,21 @@ class Sam2TrainingAdapter:
         self.model.eval()
         engine = Sam2Predictor(self.config)
         engine._predictor, engine._version = self.predictor, 'validation'
-        def predictions():
+        def predictions(robust=False, mask_prompt=False):
+            rng = np.random.default_rng(self.config["training"]["seed"])
             for image, label in pairs:
                 raw = decode_png(image.read_bytes(), self.config['limits'])
                 truth = decode_png(label.read_bytes(), self.config['limits'], mask=True)
                 boxes = {}
+                prompt = np.zeros((*raw.shape, 3), np.uint8) if mask_prompt else None
                 for bone in (1, 2):
-                    box = mask_box(class_mask(truth, bone))
+                    binary = class_mask(truth, bone)
+                    box = mask_box(binary)
+                    if mask_prompt:
+                        noisy = perturb_mask(binary, rng)
+                        prompt[..., bone-1] = noisy.astype(np.uint8) * bone
+                        if noisy.any():
+                            continue
                     if box is not None:
                         box = box.astype(int)
                         # The endpoint uses positive-area inclusive boxes.
@@ -93,7 +132,12 @@ class Sam2TrainingAdapter:
                             box[0], box[2] = max(0, box[0]-1), min(raw.shape[1]-1, box[2]+1)
                         if box[1] == box[3]:
                             box[1], box[3] = max(0, box[1]-1), min(raw.shape[0]-1, box[3]+1)
-                        boxes[bone] = box.tolist()
-                pred = engine.predict(raw, boxes)[0] if boxes else np.zeros((*raw.shape, 3), np.uint8)
+                        boxes[bone] = (perturb_box(box, raw.shape, rng).astype(int) if robust else box).tolist()
+                    elif robust and min(raw.shape) > 1:
+                        boxes[bone] = [0, 0, raw.shape[1]-1, raw.shape[0]-1]
+                pred = (engine.predict(raw, boxes, prompt)[0] if mask_prompt else engine.predict(raw, boxes)[0]) if boxes or (prompt is not None and prompt.any()) else np.zeros((*raw.shape, 3), np.uint8)
                 yield pred, truth
-        return segmentation_metrics(predictions())
+        metrics = segmentation_metrics(predictions())
+        metrics["perturbed_box_metrics"] = segmentation_metrics(predictions(robust=True))
+        metrics["perturbed_mask_metrics"] = segmentation_metrics(predictions(robust=True, mask_prompt=True))
+        return metrics

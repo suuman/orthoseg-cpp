@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.paths import atomic_write, file_lock, write_json
-from app.ml.preprocessing import InvalidImage, decode_png, mask_statistics
+from app.ml.preprocessing import InvalidImage, decode_png, mask_statistics, pixel_digest
 
 
 def now():
@@ -60,6 +60,7 @@ class CaseStore:
                           if stats.get(key, 0) > 0]
                 items.append({"case_id": record["case_id"],
                     "filename": record.get("original_filename") or record["case_id"],
+                    "original_path": record.get("original_path") or "",
                     "labels": labels or ["Background only"],
                     "overlap_pixels": stats.get("overlap_pixels", 0),
                     "status": "incorporated" if state["revisions"].get(record["case_id"]) == record["revision"] else "pending"})
@@ -71,17 +72,21 @@ class CaseStore:
         if x.shape != y.shape[:2]:
             raise InvalidImage(f"Image dimensions {x.shape} do not match mask {y.shape}")
         digest = hashlib.sha256(image).hexdigest()
+        pixels = pixel_digest(x)
         requested = safe_id(case_id) if case_id else digest
         with file_lock(self.root / ".store.lock"):
             records = self.records()
             by_id = next((r for r in records if r["case_id"] == requested), None)
-            if by_id and by_id["image_sha256"] != digest:
+            def identity(record):
+                return record.get("image_pixel_sha256") or pixel_digest(decode_png(
+                    (self.root / record["image"]).read_bytes(), self.config["limits"]))
+            if by_id and identity(by_id) != pixels:
                 raise InvalidImage("case_id already belongs to a different original image")
-            previous = by_id or next((r for r in records if r["image_sha256"] == digest), None)
+            previous = by_id or next((r for r in records if identity(r) == pixels), None)
             identifier = previous["case_id"] if previous else requested
             revision = uuid.uuid4().hex
             base = Path("revisions") / identifier / revision
-            record = {"case_id": identifier, "revision": revision, "image_sha256": digest,
+            record = {"case_id": identifier, "revision": revision, "image_sha256": digest, "image_pixel_sha256": pixels,
                       "mask_sha256": hashlib.sha256(mask).hexdigest(), "updated_at": now(),
                       "image": str(base / "image.png"), "mask": str(base / "mask.png"),
                       "previous_revision": previous["revision"] if previous else None, **fields,

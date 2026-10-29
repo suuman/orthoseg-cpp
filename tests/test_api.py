@@ -49,10 +49,14 @@ def test_errors(config, pair, client):
 
 def test_submit_revision(client, pair):
     files = {'image': ('x.png', pair[0]), 'mask': ('y.png', pair[1])}
-    first = client.post('/training/cases', files=files, data={'case_id': 'case1'})
+    source_path = '/data/' + 'long-folder/' * 30 + 'knee.png'
+    first = client.post('/training/cases', files=files, data={
+        'case_id': 'case1', 'original_filename': 'knee.png', 'original_path': source_path})
     assert first.status_code == 200
     store = client.app.state.store
     original = store.records()[0]
+    assert original['original_path'] == source_path
+    assert store.case_page()['items'][0]['original_path'] == source_path
     for identifier in ('case1', 'another_alias'):
         result = client.post('/training/cases', files=files, data={'case_id': identifier}).json()
         assert result['training_case_count'] == 1 and result['case_id'] == 'case1'

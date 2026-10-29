@@ -25,6 +25,7 @@ def health(request: Request):
     info = predictor.info()
     sam2 = request.app.state.sam2.info()
     nnunet = request.app.state.nnunet.info()
+    region = request.app.state.nnunet_region.info()
     import torch
     return {"status": "ok", "device": predictor.device.type,
             "gpu": torch.cuda.get_device_name() if predictor.device.type == "cuda" else None,
@@ -32,13 +33,16 @@ def health(request: Request):
             "sam2_model_loaded": sam2["model_loaded"],
             "sam2_model_version": sam2["model_version"],
             "nnunet_model_loaded": nnunet["model_loaded"],
-            "nnunet_model_version": nnunet["model_version"]}
+            "nnunet_model_version": nnunet["model_version"],
+            "nnunet_region_model_loaded": region["model_loaded"],
+            "nnunet_region_model_version": region["model_version"]}
 
 
 @router.get("/model/info")
 def model_info(request: Request):
     return {**request.app.state.predictor.info(), "prompted_model": request.app.state.sam2.info(),
-            "nnunet_model": request.app.state.nnunet.info()}
+            "nnunet_model": request.app.state.nnunet.info(),
+            "nnunet_region_model": request.app.state.nnunet_region.info()}
 
 
 @router.post("/segment")
@@ -84,6 +88,35 @@ async def segment_nnunet(request: Request, image: UploadFile = File(...),
             encoded = encode_mask(mask)
         except InvalidImage as exc:
             raise RuntimeError("nnUNet produced an invalid class-index mask") from exc
+        return Response(encoded, media_type="image/png", headers={
+            "X-Model-Version": version, "X-Image-Width": str(arr.shape[1]),
+            "X-Image-Height": str(arr.shape[0]), "X-Inference-Time-Ms": f"{elapsed:.3f}"})
+    try:
+        return await run_in_threadpool(run)
+    except ImageTooLarge as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except InvalidImage as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ModelUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        log.exception("nnUNet v2 inference failed")
+        raise HTTPException(500, "nnUNet v2 inference failed; see local server logs") from exc
+
+
+@router.post("/segment/nnunet_region")
+async def segment_nnunet_region(request: Request, image: UploadFile = File(...),
+                         case_id: str | None = Form(None, max_length=128)):
+    data = await read_file(image, request.app.state.config)
+    def run():
+        arr = decode_png(data, request.app.state.config["limits"])
+        mask, version, elapsed = request.app.state.nnunet_region.predict(arr)
+        if mask.shape != (*arr.shape, 3):
+            raise RuntimeError("nnUNet prediction dimensions do not match original image")
+        try:
+            encoded = encode_mask(mask)
+        except InvalidImage as exc:
+            raise RuntimeError("nnUNet produced an invalid region mask") from exc
         return Response(encoded, media_type="image/png", headers={
             "X-Model-Version": version, "X-Image-Width": str(arr.shape[1]),
             "X-Image-Height": str(arr.shape[0]), "X-Inference-Time-Ms": f"{elapsed:.3f}"})
@@ -146,6 +179,7 @@ async def segment_prompted(request: Request, image: UploadFile = File(...),
 async def submit(request: Request, image: UploadFile = File(...), mask: UploadFile = File(...),
                  case_id: str | None = Form(None, max_length=128),
                  original_filename: str | None = Form(None, max_length=255),
+                 original_path: str | None = Form(None, max_length=32768),
                  model_version: str | None = Form(None, max_length=128),
                  annotator: str | None = Form(None, max_length=256),
                  notes: str | None = Form(None, max_length=8192)):
@@ -153,7 +187,7 @@ async def submit(request: Request, image: UploadFile = File(...), mask: UploadFi
     image_data, mask_data = await read_file(image, config), await read_file(mask, config)
     try:
         return await run_in_threadpool(request.app.state.store.submit, image_data, mask_data,
-            case_id=case_id, original_filename=original_filename, model_version=model_version,
+            case_id=case_id, original_filename=original_filename, original_path=original_path, model_version=model_version,
             annotator=annotator, notes=notes)
     except ImageTooLarge as exc:
         raise HTTPException(413, str(exc)) from exc

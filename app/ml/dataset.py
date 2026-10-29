@@ -6,7 +6,7 @@ import torch
 from monai.transforms import Compose, RandAffined, RandGaussianNoised, RandScaleIntensityd
 from torch.utils.data import Dataset
 
-from app.ml.preprocessing import decode_png, prepare, prepare_mask, exclusive_mask
+from app.ml.preprocessing import decode_png, prepare, prepare_mask, exclusive_mask, pixel_digest
 
 
 def validate_pair(image, mask, config):
@@ -29,7 +29,10 @@ def snapshot(store, config):
         digest = validate_pair(image, mask, config)
         if digest != r["image_sha256"] or hashlib.sha256(mask.read_bytes()).hexdigest() != r["mask_sha256"]:
             raise ValueError(f"Case integrity check failed: {r['case_id']}")
-        hashes.add(digest)
+        pixels = pixel_digest(decode_png(image.read_bytes(), config["limits"]))
+        if pixels in hashes:
+            raise ValueError("Duplicate decoded image in training pool; consolidate its annotations")
+        hashes.add(pixels)
         training.append((image, mask))
     root = Path(config["paths"]["data"]) / "validation"
     images = {p.name: p for p in (root / "images").glob("*.png")}
@@ -37,9 +40,15 @@ def snapshot(store, config):
     if images.keys() != labels.keys():
         raise ValueError("Validation images and labels must have matching filenames")
     validation = []
+    validation_hashes = set()
     for name in sorted(images):
-        if validate_pair(images[name], labels[name], config) in hashes:
+        validate_pair(images[name], labels[name], config)
+        pixels = pixel_digest(decode_png(images[name].read_bytes(), config["limits"]))
+        if pixels in hashes:
             raise ValueError("Validation image also exists in training pool")
+        if pixels in validation_hashes:
+            raise ValueError("Duplicate decoded image in validation set")
+        validation_hashes.add(pixels)
         validation.append((images[name], labels[name]))
     if not training or not validation:
         raise ValueError("At least one approved training case and one fixed validation case are required")
@@ -53,10 +62,10 @@ class XrayDataset(Dataset):
         if augment:
             a = config["training"]["augmentation"]
             self.transform = Compose([
-                RandAffined(keys=["image", "label"], prob=a["probability"],
+                RandAffined(keys=["image", "label", "valid"], prob=a["probability"],
                             rotate_range=a["rotation_radians"], scale_range=(a["scale"], a["scale"]),
                             translate_range=(a["translation_pixels"], a["translation_pixels"]),
-                            mode=("bilinear", "nearest"), padding_mode="zeros"),
+                            mode=("bilinear", "nearest", "nearest"), padding_mode="zeros"),
                 RandScaleIntensityd(keys="image", factors=a["intensity"], prob=a["probability"]),
                 RandGaussianNoised(keys="image", std=a["noise_std"], prob=a["probability"]),
             ])
@@ -69,15 +78,18 @@ class XrayDataset(Dataset):
         x = decode_png(image.read_bytes(), self.config["limits"])
         y = decode_png(mask.read_bytes(), self.config["limits"], mask=True)
         x, geom = prepare(x, self.config)
-        sample = {"image": x, "label": prepare_mask(y, geom)}
+        valid = np.zeros_like(x)
+        valid[:, :geom.resized[0], :geom.resized[1]] = 1
+        sample = {"image": x, "label": prepare_mask(y, geom), "valid": valid}
         if self.transform:
             sample = self.transform(sample)
         return {"image": torch.as_tensor(np.asarray(sample["image"]), dtype=torch.float32),
-                "label": torch.as_tensor(np.asarray(sample["label"]), dtype=torch.long)}
+                "label": torch.as_tensor(np.asarray(sample["label"]), dtype=torch.long),
+                "valid": torch.as_tensor(np.asarray(sample["valid"]), dtype=torch.float32)}
 
 
 def pad_batch(samples):
     h = max(s["image"].shape[-2] for s in samples)
     w = max(s["image"].shape[-1] for s in samples)
     return {key: torch.stack([torch.nn.functional.pad(s[key],
-            (0, w-s[key].shape[-1], 0, h-s[key].shape[-2])) for s in samples]) for key in ("image", "label")}
+            (0, w-s[key].shape[-1], 0, h-s[key].shape[-2])) for s in samples]) for key in ("image", "label", "valid")}

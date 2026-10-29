@@ -1,4 +1,5 @@
 import io
+import hashlib
 import logging
 from dataclasses import dataclass
 
@@ -42,6 +43,12 @@ def decode_png(data, limits, mask=False):
     if mask:
         validate_mask(arr)
     return arr
+
+
+def pixel_digest(arr):
+    """Encoding-independent identity; shape and pixel values, not PNG metadata."""
+    canonical = np.ascontiguousarray(arr, dtype='<u2')
+    return hashlib.sha256(str(canonical.shape).encode() + b':' + canonical.tobytes()).hexdigest()
 
 
 def validate_mask(arr):
